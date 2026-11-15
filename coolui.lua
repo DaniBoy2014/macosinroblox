@@ -223,8 +223,25 @@ for _, container in ipairs(containersToCheck) do
 end
 
 local oldSky = game.Lighting:FindFirstChildOfClass("Sky")
-if oldSky then 
-	oldSky.Parent = tempfolder 
+if oldSky then
+	oldSky.Parent = tempfolder
+end
+
+-- The game's own haze, clouds and screen effects would tint the scene
+-- differently in every game (and the desktop's Liquid Glass is matched to the
+-- plain scene), so they're switched off until the end
+local oldAtmosphere = game.Lighting:FindFirstChildOfClass("Atmosphere")
+if oldAtmosphere then
+	oldAtmosphere.Parent = tempfolder
+end
+local disabledEffects = {}
+for _, container in {game.Lighting, workspace.CurrentCamera, workspace.Terrain} do
+	for _, effect in container:GetChildren() do
+		if (effect:IsA("PostEffect") or effect:IsA("Clouds")) and effect.Enabled then
+			effect.Enabled = false
+			table.insert(disabledEffects, effect)
+		end
+	end
 end
 
 -- ==========================================
@@ -1566,7 +1583,9 @@ local MAC_WALL = {
 	},
 }
 
-local function buildMacWallpaper(parent, glowId, imageId)
+-- `offsetScale` (optional): a function giving the UIScale the wallpaper sits
+-- under, for small previews inside the scaled desktop
+local function buildMacWallpaper(parent, glowId, imageId, offsetScale)
 	local wall = Instance.new("Frame")
 	wall.Name = "Wallpaper"
 	wall.Size = UDim2.fromScale(1, 1)
@@ -1645,7 +1664,7 @@ local function buildMacWallpaper(parent, glowId, imageId)
 
 	local w = MAC_WALL.wave
 	local function layout()
-		local h = wall.AbsoluteSize.Y
+		local h = wall.AbsoluteSize.Y / (if offsetScale then offsetScale() else 1)
 		local center = UDim2.fromOffset(w.centerX * h, w.centerY * h)
 		wave.Size = UDim2.fromOffset(2 * w.radius * h, 2 * w.radius * h)
 		wave.Position = center
@@ -1777,11 +1796,13 @@ local function macSamplerFor(width, height)
 	return macSamplers[key]
 end
 
--- The shared glass shader. `shapeAt(px, py)` gives, for pixel (px, py) of the
--- w x h image, how deep inside the shape it is (negative outside) and the
--- outward surface normal. `p` holds pixel lengths (see the wrappers below).
--- Returns the PNG file contents.
-local function renderMacGlass(x0, y0, w, h, shapeAt, sample, p)
+-- The optics of one glass pixel, shared by the baked glass and the live glass
+-- on the 3D scene. Returns optics(depth, nx, ny, reach) -> bend, light:
+-- how far (px) the rim shifts what's seen through it, and how much rim light
+-- (fresnel glow plus glare glints, 0-1) it catches. `depth` is how deep the
+-- pixel is inside the shape, (nx, ny) its outward normal, and `reach` how far
+-- a fetch may go (see p.reach). `p` holds pixel lengths (see macRoundedRectGlass).
+local function macGlassOptics(p)
 	local invRefraction = 1 / p.refraction
 	local thickness = p.thickness
 	local function edgeFactor(depth)
@@ -1803,6 +1824,36 @@ local function renderMacGlass(x0, y0, w, h, shapeAt, sample, p)
 	end
 	local glareExponent = 0.1 + p.glareConvergence * 2
 	local glareBias = math.rad(p.glareAngle) - math.pi / 4
+	return function(depth, nx, ny, reach)
+		local scale = edgeFactor(depth) * MAC_GLASS_DISPLACEMENT
+		if maxScale > reach then
+			scale = scale * math.max(0, reach) / maxScale
+		end
+		local wf = if p.fresnelK then rimFactor(depth, p.fresnelK, p.fresnelHardness) * p.fresnelIntensity * 0.7 else 0
+		local wg = 0
+		if p.glareK and (nx ~= 0 or ny ~= 0) then
+			local geo = rimFactor(depth, p.glareK, p.glareHardness)
+			if geo > 0 then
+				local angle = math.atan2(-ny, nx)
+				if angle < 0 then
+					angle += 2 * math.pi
+				end
+				local a = (angle + glareBias) * 2
+				local farside = (a > 1.5 * math.pi and a < 3.5 * math.pi) or a < -0.5 * math.pi
+				local af = (0.5 + math.sin(a) * 0.5) * 1.2 * (if farside then p.glareOpposite else 1) * p.glareIntensity
+				wg = math.clamp(af ^ glareExponent, 0, 1) * geo
+			end
+		end
+		return scale, wf + wg - wf * wg
+	end
+end
+
+-- The shared glass shader. `shapeAt(px, py)` gives, for pixel (px, py) of the
+-- w x h image, how deep inside the shape it is (negative outside) and the
+-- outward surface normal. `p` holds pixel lengths (see the wrappers below).
+-- Returns the PNG file contents.
+local function renderMacGlass(x0, y0, w, h, shapeAt, sample, p)
+	local optics = macGlassOptics(p)
 	local tintR, tintG, tintB = p.tint.R * p.tintAlpha, p.tint.G * p.tintAlpha, p.tint.B * p.tintAlpha
 	local keep = 1 - p.tintAlpha
 
@@ -1882,11 +1933,7 @@ local function renderMacGlass(x0, y0, w, h, shapeAt, sample, p)
 				row[px + 2] = "\255\255\255\0"
 			else
 				-- Refraction: rim pixels show content from further inside
-				local scale = edgeFactor(depth) * MAC_GLASS_DISPLACEMENT
-				local reach = p.reach(px, py, nx, ny)
-				if maxScale > reach then
-					scale = scale * math.max(0, reach) / maxScale
-				end
+				local scale, white = optics(depth, nx, ny, p.reach(px, py, nx, ny))
 				local x, y = x0 + px + 0.5, y0 + py + 0.5
 				local r, g, b
 				if scale > 0 then
@@ -1899,22 +1946,6 @@ local function renderMacGlass(x0, y0, w, h, shapeAt, sample, p)
 				end
 				r, g, b = r * keep + tintR, g * keep + tintG, b * keep + tintB
 				-- Rim light: fresnel glow plus two glare glints, mixed toward white
-				local wf = if p.fresnelK then rimFactor(depth, p.fresnelK, p.fresnelHardness) * p.fresnelIntensity * 0.7 else 0
-				local wg = 0
-				if p.glareK and (nx ~= 0 or ny ~= 0) then
-					local geo = rimFactor(depth, p.glareK, p.glareHardness)
-					if geo > 0 then
-						local angle = math.atan2(-ny, nx)
-						if angle < 0 then
-							angle += 2 * math.pi
-						end
-						local a = (angle + glareBias) * 2
-						local farside = (a > 1.5 * math.pi and a < 3.5 * math.pi) or a < -0.5 * math.pi
-						local af = (0.5 + math.sin(a) * 0.5) * 1.2 * (if farside then p.glareOpposite else 1) * p.glareIntensity
-						wg = math.clamp(af ^ glareExponent, 0, 1) * geo
-					end
-				end
-				local white = wf + wg - wf * wg
 				r, g, b = r + (1 - r) * white, g + (1 - g) * white, b + (1 - b) * white
 				row[px + 2] = char(
 					floor(math.clamp(r, 0, 1) * 255 + 0.5),
@@ -1929,9 +1960,9 @@ local function renderMacGlass(x0, y0, w, h, shapeAt, sample, p)
 	return macMakePng(w, h, 6, table.concat(rows)) -- 6 = RGBA
 end
 
--- Glass for a rounded rect (a pill by default) at x0, y0, size w x h
-local function renderMacGlassPng(x0, y0, w, h, sample, opts)
-	opts = opts or MAC_GLASS
+-- Shape and pixel lengths of a w x h rounded-rect glass (a pill by default):
+-- returns shapeAt, p for renderMacGlass / macGlassOptics
+local function macRoundedRectGlass(w, h, opts)
 	local minAxis = math.min(w, h)
 	local halfMin = minAxis / 2
 	local radius = math.min(opts.cornerRadius or halfMin, halfMin)
@@ -1941,7 +1972,7 @@ local function renderMacGlassPng(x0, y0, w, h, sample, opts)
 	local function rimK(size)
 		return if size > 0 then (500 / size) ^ 2 / 1500 else nil
 	end
-	return renderMacGlass(x0, y0, w, h, function(px, py)
+	return function(px, py)
 		local lx, ly = px + 0.5 - halfW, py + 0.5 - halfH
 		local sx, sy = if lx < 0 then -1 else 1, if ly < 0 then -1 else 1
 		local qx, qy = math.abs(lx) - innerX, math.abs(ly) - innerY
@@ -1952,7 +1983,7 @@ local function renderMacGlassPng(x0, y0, w, h, sample, opts)
 			return radius - qx, sx, 0
 		end
 		return radius - qy, 0, sy
-	end, sample, {
+	end, {
 		thickness = math.clamp(opts.thickness * minAxis, 1, minAxis),
 		refraction = opts.refraction, aberration = opts.aberration,
 		blur = opts.frost * minAxis,
@@ -1966,7 +1997,44 @@ local function renderMacGlassPng(x0, y0, w, h, sample, opts)
 		fresnelK = rimK(opts.fresnelSize * minAxis), fresnelHardness = opts.fresnelHardness, fresnelIntensity = opts.fresnelIntensity,
 		glareK = rimK(opts.glareSize * minAxis), glareHardness = opts.glareHardness, glareIntensity = opts.glareIntensity,
 		glareConvergence = opts.glareConvergence, glareOpposite = opts.glareOpposite, glareAngle = opts.glareAngle,
-	})
+	}
+end
+
+-- Glass for a rounded rect (a pill by default) at x0, y0, size w x h
+local function renderMacGlassPng(x0, y0, w, h, sample, opts)
+	local shapeAt, p = macRoundedRectGlass(w, h, opts or MAC_GLASS)
+	return renderMacGlass(x0, y0, w, h, shapeAt, sample, p)
+end
+
+-- Just the rim light of a w x h rounded-rect glass, as white with alpha. The
+-- live glass on the 3D scene only redraws what's behind it; this sharp layer
+-- goes on top. Cached by size, since it doesn't depend on the backdrop.
+local function bakeMacGlassRim(name, w, h, opts)
+	w, h = math.max(2, math.round(w)), math.max(2, math.round(h))
+	local path = string.format("%s/glassrim_v%d_%s_%dx%d_r%d.png", MACOS_FOLDER, MAC_GLASS_VERSION, name, w, h, math.round((opts.cornerRadius or 0) * 10))
+	if not isfile(path) then
+		local shapeAt, p = macRoundedRectGlass(w, h, opts)
+		local optics = macGlassOptics(p)
+		local rows = table.create(h)
+		for py = 0, h - 1 do
+			local row = table.create(w + 1)
+			row[1] = "\0"
+			for px = 0, w - 1 do
+				local depth, nx, ny = shapeAt(px, py)
+				local coverage = math.clamp(depth + 0.5, 0, 1)
+				local alpha = 0
+				if coverage > 0 then
+					local _, white = optics(depth, nx, ny, p.reach(px, py, nx, ny))
+					alpha = math.floor(white * coverage * 255 + 0.5)
+				end
+				row[px + 2] = "\255" .. string.char(alpha)
+			end
+			rows[py + 1] = table.concat(row)
+		end
+		ensureMacFolder()
+		writefile(path, macMakePng(w, h, 4, table.concat(rows))) -- 4 = gray + alpha
+	end
+	return getcustomasset(path)
 end
 
 -- Renders glass for a rect of a width x height wallpaper and returns an asset
@@ -2413,28 +2481,22 @@ end
 
 -- ---------- Lock screen ----------
 -- Shows the lock screen and yields until it's unlocked.
-local function showMacLockScreen(assets)
-	local gui = Instance.new("ScreenGui")
-	gui.Name = "macOS"
-	gui.IgnoreGuiInset = true
-	gui.ResetOnSpawn = false
-	gui.DisplayOrder = 1001
-	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	gui.Parent = player:WaitForChild("PlayerGui")
+-- Shows the lock screen on the session's ScreenGui (see createMacSession) and
+-- returns once it's unlocked. `boot`: fade in from black (first start, Restart).
+local function showMacLockScreen(session, boot)
+	local gui = session.gui
+	local assets = session.assets
 
 	local alive = true
 	local connections = {}
 
-	local backgroundMode = loadMacBackgroundChoice()
-	local wall = buildMacWallpaper(gui, assets.glow, assets.wallpaper)
-	local wallScale = Instance.new("UIScale")
-	wallScale.Parent = wall
+	local backgroundMode = session.mode
 
 	local ui = Instance.new("Frame")
 	ui.Name = "LockScreen"
 	ui.BackgroundTransparency = 1
 	ui.Size = UDim2.fromScale(1, 1)
-	ui.ZIndex = 2
+	ui.ZIndex = 3
 	ui.Parent = gui
 
 	local function label(text, weight, centerY, height, width)
@@ -2882,54 +2944,30 @@ local function showMacLockScreen(assets)
 	})
 	shadeGradient.Parent = sceneShade
 
-	local switching = false
-	local backgroundFade = TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
-	local function setBackground(mode, animate)
+	-- The session swaps the wallpaper and the 3D scene; the lock screen restyles
+	-- its clock, password field and shade to match (halfway through a crossfade)
+	local function applyBackground(mode, animate)
 		backgroundMode = mode
 		updateSwitch()
-		local showWall = mode == "wallpaper"
-		-- The Lithora backdrop in the main UI would dim the 3D scene, so clear it
-		local backdropTransparency = if showWall then 0.1 else 1
-		local shadeTransparency = if showWall then 1 else 0
+		local shadeTransparency = if mode == "wallpaper" then 1 else 0
 		if not animate then
-			wall.Visible = showWall
-			background.ImageTransparency = backdropTransparency
 			sceneShade.BackgroundTransparency = shadeTransparency
 			applyClockStyle()
 			applyFieldStyle()
 			return
 		end
-		TweenService:Create(sceneShade, backgroundFade, {BackgroundTransparency = shadeTransparency}):Play()
-		switching = true
-		-- Crossfade: the wallpaper rides in a CanvasGroup just for the fade
-		local fader = Instance.new("CanvasGroup")
-		fader.BackgroundTransparency = 1
-		fader.Size = UDim2.fromScale(1, 1)
-		fader.GroupTransparency = if showWall then 1 else 0
-		fader.Parent = gui
-		wall.Visible = true
-		wall.Parent = fader
-		TweenService:Create(background, backgroundFade, {ImageTransparency = backdropTransparency}):Play()
-		local fade = TweenService:Create(fader, backgroundFade, {GroupTransparency = if showWall then 0 else 1})
-		fade:Play()
-		task.delay(backgroundFade.Time / 2, function()
-			if alive then
-				applyClockStyle()
-				applyFieldStyle()
-			end
-		end)
-		fade.Completed:Wait()
-		wall.Parent = gui
-		wall.Visible = showWall
-		fader:Destroy()
-		switching = false
+		TweenService:Create(sceneShade, TweenInfo.new(session.fadeTime, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {BackgroundTransparency = shadeTransparency}):Play()
+		task.wait(session.fadeTime / 2)
+		if alive then
+			applyClockStyle()
+			applyFieldStyle()
+		end
 	end
-	setBackground(backgroundMode, false)
+	applyBackground(backgroundMode, false)
+	local stopBackground = session.onBackground(applyBackground)
 	table.insert(connections, switch.MouseButton1Click:Connect(function()
-		if switching or unlocked then return end
-		local mode = if backgroundMode == "wallpaper" then "scene" else "wallpaper"
-		saveMacBackgroundChoice(mode)
-		setBackground(mode, true)
+		if unlocked then return end
+		task.spawn(session.setBackground, if backgroundMode == "wallpaper" then "scene" else "wallpaper", true)
 	end))
 
 	table.insert(connections, UserInputService.InputBegan:Connect(function(input, processed)
@@ -2951,18 +2989,15 @@ local function showMacLockScreen(assets)
 	end))
 
 	-- Boot in: fade up from black while the date and clock settle into place
-	local overlay = Instance.new("Frame")
-	overlay.BackgroundColor3 = Color3.new(0, 0, 0)
-	overlay.BorderSizePixel = 0
-	overlay.Size = UDim2.fromScale(1, 1)
-	overlay.ZIndex = 10
-	overlay.Parent = gui
+	if boot then
+		session.cover.BackgroundTransparency = 0
+		TweenService:Create(session.cover, TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {BackgroundTransparency = 1}):Play()
+	end
 	local settle = TweenInfo.new(1.1, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
 	local clockHome, dateHome = clock.Position, dateLabel.Position
 	clock.Position = clockHome - UDim2.fromScale(0, 0.02)
 	dateLabel.Position = dateHome - UDim2.fromScale(0, 0.02)
 	glassClock.Position = UDim2.fromScale(0, -0.02)
-	TweenService:Create(overlay, TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {BackgroundTransparency = 1}):Play()
 	TweenService:Create(clock, settle, {Position = clockHome}):Play()
 	TweenService:Create(dateLabel, settle, {Position = dateHome}):Play()
 	TweenService:Create(glassClock, settle, {Position = UDim2.fromScale(0, 0)}):Play()
@@ -2971,7 +3006,8 @@ local function showMacLockScreen(assets)
 		task.wait()
 	until unlocked or not gui.Parent
 
-	-- Unlock: the lock screen lifts away, the wallpaper eases forward, then fade out
+	-- Unlock: the lock screen lifts away and the wallpaper eases forward; the
+	-- desktop then settles it back as the menu bar and Dock slide in
 	local lift = TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
 	for _, l in ipairs({dateLabel, clock, nameLabel, hint}) do
 		TweenService:Create(l, lift, {TextTransparency = 1, Position = l.Position - UDim2.fromScale(0, 0.03)}):Play()
@@ -2992,22 +3028,2565 @@ local function showMacLockScreen(assets)
 	TweenService:Create(switchRim, lift, {Transparency = 1}):Play()
 	TweenService:Create(switchIcon, lift, {ImageTransparency = 1}):Play()
 	TweenService:Create(switchLabel, lift, {TextTransparency = 1}):Play()
-	TweenService:Create(wallScale, TweenInfo.new(0.9, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {Scale = 1.06}):Play()
-	task.wait(0.35)
-	local fadeOut = TweenService:Create(overlay, TweenInfo.new(0.55, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {BackgroundTransparency = 0})
-	fadeOut:Play()
-	fadeOut.Completed:Wait()
+	TweenService:Create(session.wallScale, TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1.03}):Play()
+	task.wait(0.45)
 
 	alive = false
+	stopBackground()
 	for _, connection in ipairs(connections) do
 		connection:Disconnect()
 	end
-	gui:Destroy()
+	ui:Destroy()
+end
+
+-- ==========================================
+-- MACOS DESKTOP
+-- After unlocking: a menu bar, a Liquid Glass Dock and working apps (Finder
+-- for the executor's workspace folder, Notes, Terminal, Music, System
+-- Settings). Works on both backgrounds: on the wallpaper the Dock's glass is
+-- rendered once; over the 3D scene it is redrawn live as the camera moves.
+-- ==========================================
+local AssetService = game:GetService("AssetService")
+
+local MAC_DESKTOP_ICONS = {
+	apple = "rbxassetid://10709761889",
+	finder = "rbxassetid://10734964441", -- Lucide "smile"
+	folder = "rbxassetid://10723387563",
+	file = "rbxassetid://10723374641",
+	fileText = "rbxassetid://10723367380",
+	fileImage = "rbxassetid://10723357790",
+	fileAudio = "rbxassetid://10723355148",
+	fileCode = "rbxassetid://10723356507",
+	music = "rbxassetid://10734905958",
+	play = "rbxassetid://10734923549",
+	pause = "rbxassetid://10734919336",
+	skipForward = "rbxassetid://10734961809",
+	skipBack = "rbxassetid://10734961526",
+	settings = "rbxassetid://10734950309",
+	terminal = "rbxassetid://10734982144",
+	notes = "rbxassetid://10734972463", -- Lucide "sticky-note"
+	trash = "rbxassetid://10747362241", -- Lucide "trash-2"
+	close = "rbxassetid://10747384394", -- Lucide "x"
+	minus = "rbxassetid://10734896206",
+	plus = "rbxassetid://10734924532",
+	back = "rbxassetid://10709791281", -- Lucide "chevron-left"
+	forward = "rbxassetid://10709791437", -- Lucide "chevron-right"
+	home = "rbxassetid://10723407389",
+	laptop = "rbxassetid://10723423881",
+	image = "rbxassetid://10723415040",
+	search = "rbxassetid://10734943674",
+	check = "rbxassetid://10709790644",
+	info = "rbxassetid://10723415903",
+	wifi = MACOS_ICONS.wifi,
+	battery = MACOS_ICONS.battery,
+}
+
+local MAC_COLORS = {
+	ink = Color3.fromRGB(29, 29, 31),
+	inkSoft = Color3.fromRGB(118, 118, 124),
+	accent = Color3.fromRGB(0, 122, 255),
+	window = Color3.fromRGB(247, 247, 249),
+	sidebar = Color3.fromRGB(233, 234, 238),
+	menu = Color3.fromRGB(240, 240, 243),
+	zebra = Color3.fromRGB(244, 245, 247),
+	terminalText = Color3.fromRGB(232, 232, 232),
+	terminalError = Color3.fromRGB(255, 120, 110),
+	terminalAccent = Color3.fromRGB(120, 220, 140),
+}
+
+-- The desktop is laid out in points for a screen this many points tall,
+-- then scaled to the real screen
+local MAC_DESK = {
+	height = 1080,
+	menuHeight = 30,
+	dockIcon = 56, dockPadding = 8, dockGap = 6, dockSeparator = 17, dockBottom = 8, dockRadius = 22,
+	titleBar = 52, windowRadius = 16, shadowBlur = 44,
+}
+
+-- Dock apps, left to right (the Trash goes after a separator)
+local MAC_APPS = {
+	{id = "finder", name = "Finder", icon = MAC_DESKTOP_ICONS.finder, top = Color3.fromRGB(110, 198, 255), bottom = Color3.fromRGB(18, 110, 238)},
+	{id = "notes", name = "Notes", icon = MAC_DESKTOP_ICONS.notes, top = Color3.fromRGB(255, 228, 120), bottom = Color3.fromRGB(247, 184, 34)},
+	{id = "music", name = "Music", icon = MAC_DESKTOP_ICONS.music, top = Color3.fromRGB(255, 110, 132), bottom = Color3.fromRGB(236, 34, 76)},
+	{id = "terminal", name = "Terminal", icon = MAC_DESKTOP_ICONS.terminal, top = Color3.fromRGB(76, 76, 82), bottom = Color3.fromRGB(26, 26, 30)},
+	{id = "settings", name = "System Settings", icon = MAC_DESKTOP_ICONS.settings, top = Color3.fromRGB(178, 180, 188), bottom = Color3.fromRGB(110, 112, 122)},
+}
+local MAC_TRASH = {
+	id = "trash", name = "Trash", icon = MAC_DESKTOP_ICONS.trash,
+	top = Color3.fromRGB(238, 240, 244), bottom = Color3.fromRGB(196, 200, 210), glyph = Color3.fromRGB(88, 92, 102),
+}
+-- Menu bar names for windows that aren't Dock apps
+local MAC_APP_NAMES = {about = "Finder", preview = "Preview"}
+for _, app in ipairs(MAC_APPS) do
+	MAC_APP_NAMES[app.id] = app.name
+end
+
+-- Where the Dock sits on a width x height screen, in pixels, plus its corner
+-- radius (mirrors the Dock in createMacDesktop, so the loader can pre-render
+-- its glass)
+local function macDockRect(width, height)
+	local d = MAC_DESK
+	local s = height / d.height
+	local w = (2 * d.dockPadding + (#MAC_APPS + 1) * d.dockIcon + (#MAC_APPS - 1) * d.dockGap + d.dockSeparator) * s
+	local h = (d.dockIcon + 2 * d.dockPadding) * s
+	return (width - w) / 2, height - d.dockBottom * s - h, w, h, d.dockRadius * s
+end
+
+-- ---------- Small UI helpers ----------
+local function macNew(className, props)
+	local instance = Instance.new(className)
+	for key, value in pairs(props) do
+		if key ~= "Parent" then
+			instance[key] = value
+		end
+	end
+	instance.Parent = props.Parent
+	return instance
+end
+
+local function macCorner(parent, radius)
+	return macNew("UICorner", {CornerRadius = if typeof(radius) == "UDim" then radius else UDim.new(0, radius), Parent = parent})
+end
+
+local function macStroke(parent, color, transparency, thickness)
+	return macNew("UIStroke", {
+		Color = color, Transparency = transparency, Thickness = thickness or 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = parent,
+	})
+end
+
+local function macLabel(parent, text, size, weight, color, props)
+	local label = macNew("TextLabel", {
+		BackgroundTransparency = 1, Text = text, TextSize = size, FontFace = macFont(weight or Enum.FontWeight.Regular),
+		TextColor3 = color or MAC_COLORS.ink, TextXAlignment = Enum.TextXAlignment.Left, Parent = parent,
+	})
+	for key, value in pairs(props or {}) do
+		label[key] = value
+	end
+	return label
+end
+
+local function macButton(parent, props)
+	local button = macNew("TextButton", {AutoButtonColor = false, Text = "", BackgroundTransparency = 1, BorderSizePixel = 0, Parent = parent})
+	for key, value in pairs(props or {}) do
+		button[key] = value
+	end
+	return button
+end
+
+local function macImage(parent, image, size, color, props)
+	local icon = macNew("ImageLabel", {
+		BackgroundTransparency = 1, Image = image, ImageColor3 = color or Color3.new(1, 1, 1),
+		Size = UDim2.fromOffset(size, size), Parent = parent,
+	})
+	for key, value in pairs(props or {}) do
+		icon[key] = value
+	end
+	return icon
+end
+
+-- A macOS-style app icon: a rounded square with a gradient and a glyph
+local function macAppTile(parent, app, size)
+	local tile = macNew("Frame", {Size = UDim2.fromOffset(size, size), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Parent = parent})
+	macCorner(tile, UDim.new(0.24, 0))
+	macNew("UIGradient", {Rotation = 90, Color = ColorSequence.new(app.top, app.bottom), Parent = tile})
+	macStroke(tile, Color3.new(0, 0, 0), 0.88, 1)
+	macImage(tile, app.icon, math.round(size * 0.56), app.glyph or Color3.new(1, 1, 1), {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+	})
+	return tile
+end
+
+-- ---------- Live glass on the 3D scene ----------
+-- Everything in the world is hidden while this UI is up, so the 3D scene is
+-- just the skybox seen through the moving camera (plus blur and color
+-- effects). That makes real Liquid Glass over it cheap: each glass pixel
+-- looks up the sky in its own view direction, no screen capture needed. The
+-- six sky images are read once (EditableImage), shrunk, and color-graded to
+-- match the scene's effects.
+local MAC_SKY_FACE_SIZE = 256
+-- Approximates the scene's ColorCorrection and exposure on the raw sky
+-- How the skybox looks once Roblox has rendered it with the scene's lighting,
+-- fitted to screenshots. The bloom brightens the bright sky a lot; here it's
+-- approximated per pixel (brightness above `bloomThreshold` is boosted).
+local MAC_SCENE_GRADE = {exposure = 0.52, brightness = -0.15, contrast = 0.02, saturation = -0.07, bloom = 1.17, bloomThreshold = 0.3}
+local macSky = nil -- {size = n, Ft = buffer, ...}: RGB bytes per face
+
+local function macGradeSceneColor(r, g, b)
+	local grade = MAC_SCENE_GRADE
+	local gain = 2 ^ grade.exposure
+	r, g, b = r * gain, g * gain, b * gain
+	local gray = r * 0.299 + g * 0.587 + b * 0.114
+	local saturation = 1 + grade.saturation
+	r, g, b = gray + (r - gray) * saturation, gray + (g - gray) * saturation, gray + (b - gray) * saturation
+	local contrast = 1 + grade.contrast
+	r = (r - 0.5) * contrast + 0.5 + grade.brightness
+	g = (g - 0.5) * contrast + 0.5 + grade.brightness
+	b = (b - 0.5) * contrast + 0.5 + grade.brightness
+	r, g, b = math.clamp(r, 0, 1), math.clamp(g, 0, 1), math.clamp(b, 0, 1)
+	local glow = grade.bloom * math.max(0, r * 0.299 + g * 0.587 + b * 0.114 - grade.bloomThreshold)
+	return math.min(1, r + glow), math.min(1, g + glow), math.min(1, b + glow)
+end
+
+-- Reads the six images of `skyInstance` (a Sky) into macSky
+local function loadMacSky(skyInstance)
+	local n = MAC_SKY_FACE_SIZE
+	local faces = {size = n}
+	local readu8, writeu8 = buffer.readu8, buffer.writeu8
+	for _, name in ipairs({"Ft", "Bk", "Lf", "Rt", "Up", "Dn"}) do
+		local image = AssetService:CreateEditableImageAsync(Content.fromUri(skyInstance["Skybox" .. name]))
+		local size = image.Size
+		local source = image:ReadPixelsBuffer(Vector2.zero, size)
+		image:Destroy()
+		local w, h = size.X, size.Y
+		local stepX, stepY = w / n, h / n
+		local out = buffer.create(n * n * 3)
+		for j = 0, n - 1 do
+			-- Average 2x2 samples spread over each source block
+			local y0 = math.floor(j * stepY)
+			local y1 = math.min(h - 1, math.floor((j + 0.5) * stepY))
+			for i = 0, n - 1 do
+				local x0 = math.floor(i * stepX)
+				local x1 = math.min(w - 1, math.floor((i + 0.5) * stepX))
+				local a, b, c, d = (y0 * w + x0) * 4, (y0 * w + x1) * 4, (y1 * w + x0) * 4, (y1 * w + x1) * 4
+				local r = (readu8(source, a) + readu8(source, b) + readu8(source, c) + readu8(source, d)) / 1020
+				local g = (readu8(source, a + 1) + readu8(source, b + 1) + readu8(source, c + 1) + readu8(source, d + 1)) / 1020
+				local bl = (readu8(source, a + 2) + readu8(source, b + 2) + readu8(source, c + 2) + readu8(source, d + 2)) / 1020
+				r, g, bl = macGradeSceneColor(r, g, bl)
+				local o = (j * n + i) * 3
+				writeu8(out, o, r * 255 + 0.5)
+				writeu8(out, o + 1, g * 255 + 0.5)
+				writeu8(out, o + 2, bl * 255 + 0.5)
+			end
+			if j % 64 == 63 then
+				task.wait()
+			end
+		end
+		faces[name] = out
+	end
+	macSky = faces
+end
+
+-- Sky color (0-255 per channel) in world direction (x, y, z). Roblox's
+-- skybox layout, measured in game: Ft faces -Z, Bk +Z, Lf +X, Rt -X; Up and
+-- Dn have their image's right edge toward -Z.
+local function macSkyColor(sky, x, y, z)
+	local ax, ay, az = math.abs(x), math.abs(y), math.abs(z)
+	local face, s, t
+	if ax >= ay and ax >= az then
+		if x > 0 then
+			face, s, t = sky.Lf, z / x, y / x
+		else
+			face, s, t = sky.Rt, z / x, -y / x
+		end
+	elseif ay >= az then
+		if y > 0 then
+			face, s, t = sky.Up, -z / y, x / y
+		else
+			face, s, t = sky.Dn, z / y, x / y
+		end
+	elseif z < 0 then
+		face, s, t = sky.Ft, -x / z, -y / z
+	else
+		face, s, t = sky.Bk, -x / z, y / z
+	end
+	local n = sky.size
+	local fx = (s + 1) * 0.5 * n - 0.5
+	local fy = (1 - t) * 0.5 * n - 0.5
+	if fx < 0 then fx = 0 elseif fx > n - 1.001 then fx = n - 1.001 end
+	if fy < 0 then fy = 0 elseif fy > n - 1.001 then fy = n - 1.001 end
+	local ix, iy = fx // 1, fy // 1
+	local tx, ty = fx - ix, fy - iy
+	local o = (iy * n + ix) * 3
+	local o2 = o + n * 3
+	local readu8 = buffer.readu8
+	local a, b = readu8(face, o), readu8(face, o2)
+	local top = a + (readu8(face, o + 3) - a) * tx
+	local red = top + (b + (readu8(face, o2 + 3) - b) * tx - top) * ty
+	a, b = readu8(face, o + 1), readu8(face, o2 + 1)
+	top = a + (readu8(face, o + 4) - a) * tx
+	local green = top + (b + (readu8(face, o2 + 4) - b) * tx - top) * ty
+	a, b = readu8(face, o + 2), readu8(face, o2 + 2)
+	top = a + (readu8(face, o + 5) - a) * tx
+	local blue = top + (b + (readu8(face, o2 + 5) - b) * tx - top) * ty
+	return red, green, blue
+end
+
+local MAC_LIVE_GLASS = {
+	resolution = 0.35, -- of screen pixels: what's behind the glass is soft, so this is plenty
+	gridStep = 8, -- screen pixels between sky lookups (interpolated in between)
+	minTurn = math.rad(0.03), -- camera turn that triggers a redraw
+	maxRate = 40, -- redraws per second, at most
+}
+
+-- Live Liquid Glass drawn into `target` (an ImageLabel with a UICorner for
+-- its outline). Only the bent, frosted backdrop is drawn here; the tint and
+-- the sharp rim light are separate layers on top. The optics are worked out
+-- once per size, so a redraw is just sky lookups and interpolation.
+local function createMacLiveGlass(target, opts)
+	local live = {enabled = false}
+	local editable, pixels, ow, oh
+	local model = nil
+	local R, G, B, T = {}, {}, {}, {}
+	local lastLook, lastFov, lastOrigin, lastRender = nil, nil, nil, 0
+	local minTurnCos = math.cos(MAC_LIVE_GLASS.minTurn)
+	local dirty = true
+
+	function live.layout(newOpts)
+		opts = newOpts or opts
+		local size = target.AbsoluteSize
+		local w, h = math.max(2, math.round(size.X)), math.max(2, math.round(size.Y))
+		local nw = math.max(2, math.ceil(w * MAC_LIVE_GLASS.resolution))
+		local nh = math.max(2, math.ceil(h * MAC_LIVE_GLASS.resolution))
+		if not editable or nw ~= ow or nh ~= oh then
+			if editable then
+				editable:Destroy()
+			end
+			editable = AssetService:CreateEditableImage({Size = Vector2.new(nw, nh)})
+			target.ImageContent = Content.fromObject(editable)
+			ow, oh = nw, nh
+			pixels = buffer.create(ow * oh * 4)
+			for k = 0, ow * oh - 1 do
+				buffer.writeu8(pixels, k * 4 + 3, 255)
+			end
+		end
+		local shapeAt, p = macRoundedRectGlass(w, h, opts)
+		local optics = macGlassOptics(p)
+		local step = MAC_LIVE_GLASS.gridStep
+		local blur = math.max(1, p.blur)
+		local margin = math.ceil(blur) + 2 * step
+		local gw = math.ceil((w + 2 * margin) / step) + 1
+		local gh = math.ceil((h + 2 * margin) / step) + 1
+		-- Where each output pixel reads the backdrop grid, per color channel
+		-- (the channels bend by slightly different amounts: color fringing)
+		local count = ow * oh
+		local index, fracX, fracY = {}, {}, {}
+		for c = 1, 3 do
+			index[c], fracX[c], fracY[c] = table.create(count), table.create(count), table.create(count)
+		end
+		local bends = {1 + p.aberration, 1, 1 - p.aberration}
+		for j = 0, oh - 1 do
+			for i = 0, ow - 1 do
+				local px, py = (i + 0.5) / ow * w, (j + 0.5) / oh * h
+				local depth, nx, ny = shapeAt(px - 0.5, py - 0.5)
+				local scale = 0
+				if depth > -0.5 then
+					scale = optics(depth, nx, ny, p.reach(px - 0.5, py - 0.5, nx, ny))
+				end
+				local k = j * ow + i + 1
+				for c = 1, 3 do
+					local gx = math.clamp((px - nx * scale * bends[c] + margin) / step, 0, gw - 1.001)
+					local gy = math.clamp((py - ny * scale * bends[c] + margin) / step, 0, gh - 1.001)
+					local ix, iy = math.floor(gx), math.floor(gy)
+					index[c][k] = iy * gw + ix + 1
+					fracX[c][k] = gx - ix
+					fracY[c][k] = gy - iy
+				end
+			end
+		end
+		-- Gaussian weights for the frost, in grid steps (skipped when tiny)
+		local weights, radius = nil, 0
+		local sigma = blur / 3 / step
+		if sigma > 0.3 then
+			radius = math.ceil(sigma * 3)
+			weights = {}
+			local total = 0
+			for k = -radius, radius do
+				weights[k] = math.exp(-(k * k) / (2 * sigma * sigma))
+				total += weights[k]
+			end
+			for k = -radius, radius do
+				weights[k] /= total
+			end
+		end
+		model = {gw = gw, gh = gh, margin = margin, step = step, index = index, fracX = fracX, fracY = fracY, weights = weights, radius = radius}
+		dirty = true
+	end
+
+	local function frost(channel)
+		local m = model
+		local weights, radius, gw, gh = m.weights, m.radius, m.gw, m.gh
+		for j = 0, gh - 1 do
+			local row = j * gw
+			for i = 0, gw - 1 do
+				local sum = 0
+				for k = -radius, radius do
+					local x = i + k
+					if x < 0 then x = 0 elseif x >= gw then x = gw - 1 end
+					sum += channel[row + x + 1] * weights[k]
+				end
+				T[row + i + 1] = sum
+			end
+		end
+		for j = 0, gh - 1 do
+			for i = 0, gw - 1 do
+				local sum = 0
+				for k = -radius, radius do
+					local y = j + k
+					if y < 0 then y = 0 elseif y >= gh then y = gh - 1 end
+					sum += T[y * gw + i + 1] * weights[k]
+				end
+				channel[j * gw + i + 1] = sum
+			end
+		end
+	end
+
+	local function render(camera)
+		local m = model
+		local cf = camera.CFrame
+		local viewport = camera.ViewportSize
+		local tanY = math.tan(math.rad(camera.FieldOfView) / 2)
+		local tanX = tanY * viewport.X / viewport.Y
+		local look, right, up = cf.LookVector, cf.RightVector, cf.UpVector
+		local lx, ly, lz = look.X, look.Y, look.Z
+		local rx, ry, rz = right.X, right.Y, right.Z
+		local ux, uy, uz = up.X, up.Y, up.Z
+		local origin = target.AbsolutePosition
+		local x0, y0 = origin.X - m.margin, origin.Y - m.margin
+		local sky, step, gw = macSky, m.step, m.gw
+		-- The sky behind each grid point, from the camera ray through it
+		local n = 0
+		for j = 0, m.gh - 1 do
+			local v = (1 - 2 * (y0 + j * step) / viewport.Y) * tanY
+			local bx, by, bz = lx + ux * v, ly + uy * v, lz + uz * v
+			for i = 0, gw - 1 do
+				local u = (2 * (x0 + i * step) / viewport.X - 1) * tanX
+				n += 1
+				R[n], G[n], B[n] = macSkyColor(sky, bx + rx * u, by + ry * u, bz + rz * u)
+			end
+		end
+		if m.weights then
+			frost(R)
+			frost(G)
+			frost(B)
+		end
+		local iR, iG, iB = m.index[1], m.index[2], m.index[3]
+		local xR, xG, xB = m.fracX[1], m.fracX[2], m.fracX[3]
+		local yR, yG, yB = m.fracY[1], m.fracY[2], m.fracY[3]
+		local writeu8 = buffer.writeu8
+		local buf = pixels
+		for k = 1, ow * oh do
+			local i, tx, ty = iR[k], xR[k], yR[k]
+			local a, c = R[i], R[i + gw]
+			local top = a + (R[i + 1] - a) * tx
+			local red = top + (c + (R[i + gw + 1] - c) * tx - top) * ty
+			i, tx, ty = iG[k], xG[k], yG[k]
+			a, c = G[i], G[i + gw]
+			top = a + (G[i + 1] - a) * tx
+			local green = top + (c + (G[i + gw + 1] - c) * tx - top) * ty
+			i, tx, ty = iB[k], xB[k], yB[k]
+			a, c = B[i], B[i + gw]
+			top = a + (B[i + 1] - a) * tx
+			local blue = top + (c + (B[i + gw + 1] - c) * tx - top) * ty
+			local o = (k - 1) * 4
+			writeu8(buf, o, red + 0.5)
+			writeu8(buf, o + 1, green + 0.5)
+			writeu8(buf, o + 2, blue + 0.5)
+		end
+		editable:WritePixelsBuffer(Vector2.zero, Vector2.new(ow, oh), buf)
+	end
+
+	-- Call every frame; redraws only when the camera turned or the glass moved
+	function live.update(camera)
+		if not live.enabled or not macSky or not model then
+			return
+		end
+		local look = camera.CFrame.LookVector
+		local fov = camera.FieldOfView
+		local origin = target.AbsolutePosition
+		local now = os.clock()
+		if not dirty and lastLook then
+			if now - lastRender < 1 / MAC_LIVE_GLASS.maxRate then
+				return
+			end
+			if look:Dot(lastLook) > minTurnCos and fov == lastFov and origin == lastOrigin then
+				return
+			end
+		end
+		dirty = false
+		lastLook, lastFov, lastOrigin, lastRender = look, fov, origin, now
+		render(camera)
+	end
+
+	function live.invalidate()
+		dirty = true
+	end
+
+	function live.destroy()
+		live.enabled = false
+		model = nil
+		if editable then
+			editable:Destroy()
+			editable = nil
+		end
+	end
+
+	live.layout()
+	return live
+end
+
+-- ---------- Session ----------
+-- One ScreenGui shared by the lock screen and the desktop, plus the
+-- background (wallpaper or 3D scene) that both sit on
+local function createMacSession(assets)
+	local gui = macNew("ScreenGui", {
+		Name = "macOS", IgnoreGuiInset = true, ResetOnSpawn = false, DisplayOrder = 1001,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Parent = player:WaitForChild("PlayerGui"),
+	})
+	local session = {gui = gui, assets = assets, mode = loadMacBackgroundChoice(), fadeTime = 0.45}
+	local listeners = {}
+	session.wall = buildMacWallpaper(gui, assets.glow, assets.wallpaper)
+	session.wallScale = macNew("UIScale", {Parent = session.wall})
+	-- Black cover for booting, restarting and shutting down
+	session.cover = macNew("Frame", {
+		BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1, ZIndex = 50, Parent = gui,
+	})
+
+	-- fn(mode, animate) runs whenever the background changes. When animated,
+	-- the crossfade takes session.fadeTime.
+	function session.onBackground(fn)
+		table.insert(listeners, fn)
+		return function()
+			local i = table.find(listeners, fn)
+			if i then
+				table.remove(listeners, i)
+			end
+		end
+	end
+
+	local switching = false
+	function session.setBackground(mode, animate)
+		if switching then
+			return
+		end
+		if mode ~= session.mode then
+			saveMacBackgroundChoice(mode)
+		end
+		session.mode = mode
+		local showWall = mode == "wallpaper"
+		-- The Lithora backdrop in the main UI would dim the 3D scene, so clear it
+		local backdropTransparency = if showWall then 0.1 else 1
+		for _, fn in ipairs(table.clone(listeners)) do
+			task.spawn(fn, mode, animate)
+		end
+		if not animate then
+			session.wall.Visible = showWall
+			background.ImageTransparency = backdropTransparency
+			return
+		end
+		switching = true
+		-- Crossfade: the wallpaper rides in a CanvasGroup just for the fade
+		local info = TweenInfo.new(session.fadeTime, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
+		local fader = macNew("CanvasGroup", {
+			BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
+			GroupTransparency = if showWall then 1 else 0, Parent = gui,
+		})
+		session.wall.Visible = true
+		session.wall.Parent = fader
+		TweenService:Create(background, info, {ImageTransparency = backdropTransparency}):Play()
+		local fade = TweenService:Create(fader, info, {GroupTransparency = if showWall then 0 else 1})
+		fade:Play()
+		fade.Completed:Wait()
+		session.wall.Parent = gui
+		session.wall.Visible = showWall
+		fader:Destroy()
+		switching = false
+	end
+
+	function session.fadeCover(transparency, time)
+		local fade = TweenService:Create(session.cover, TweenInfo.new(time, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {BackgroundTransparency = transparency})
+		fade:Play()
+		fade.Completed:Wait()
+	end
+
+	session.setBackground(session.mode, false)
+	return session
+end
+
+-- ---------- Desktop ----------
+local MAC_NOTES_FILE = MACOS_FOLDER .. "/Notes.txt"
+local MAC_TRASH_PATH = "::trash"
+local MAC_TEXT_EXTENSIONS = {
+	txt = true, lua = true, luau = true, json = true, md = true, log = true, cfg = true, ini = true,
+	csv = true, xml = true, html = true, css = true, js = true, toml = true, yaml = true, yml = true,
+}
+local MAC_IMAGE_EXTENSIONS = {png = true, jpg = true, jpeg = true}
+local MAC_AUDIO_EXTENSIONS = {mp3 = true, ogg = true, wav = true}
+
+local function macExtension(name)
+	return (name:match("%.([%w]+)$") or ""):lower()
+end
+
+-- Kind text and icon for a file in Finder
+local function macFileKind(name, isFolder)
+	if isFolder then
+		return "Folder", MAC_DESKTOP_ICONS.folder
+	end
+	local ext = macExtension(name)
+	if MAC_IMAGE_EXTENSIONS[ext] then
+		return ext:upper() .. " image", MAC_DESKTOP_ICONS.fileImage
+	elseif MAC_AUDIO_EXTENSIONS[ext] then
+		return ext:upper() .. " audio", MAC_DESKTOP_ICONS.fileAudio
+	elseif ext == "lua" or ext == "luau" then
+		return "Luau script", MAC_DESKTOP_ICONS.fileCode
+	elseif ext == "ttf" or ext == "otf" then
+		return "Font", MAC_DESKTOP_ICONS.file
+	elseif MAC_TEXT_EXTENSIONS[ext] then
+		return "Plain text", MAC_DESKTOP_ICONS.fileText
+	end
+	return if ext ~= "" then ext:upper() .. " file" else "Document", MAC_DESKTOP_ICONS.file
+end
+
+-- Entries of a workspace folder ("" = the workspace itself), folders first
+local function macListFolder(path)
+	local entries = {}
+	for _, item in ipairs(listfiles(path)) do
+		local itemPath = item:gsub("\\", "/"):gsub("^%./", ""):gsub("/$", "")
+		local ok, folder = pcall(isfolder, itemPath)
+		table.insert(entries, {name = itemPath:match("([^/]+)$") or itemPath, path = itemPath, folder = ok and folder == true})
+	end
+	table.sort(entries, function(a, b)
+		if a.folder ~= b.folder then
+			return a.folder
+		end
+		return a.name:lower() < b.name:lower()
+	end)
+	return entries
+end
+
+local function createMacDesktop(session)
+	local gui, assets = session.gui, session.assets
+	local D, C, I = MAC_DESK, MAC_COLORS, MAC_DESKTOP_ICONS
+	local desktop = {}
+	local alive = true
+	local connections = {}
+	local pendingAction = nil
+	local function connect(signal, fn)
+		local connection = signal:Connect(fn)
+		table.insert(connections, connection)
+		return connection
+	end
+	local function tween(instance, time, props, style, direction)
+		local t = TweenService:Create(instance, TweenInfo.new(time, style or Enum.EasingStyle.Quart, direction or Enum.EasingDirection.Out), props)
+		t:Play()
+		return t
+	end
+	local function finish(action)
+		pendingAction = action
+	end
+
+	-- Laid out in points (see MAC_DESK.height) and scaled to the real screen
+	local root = macNew("Frame", {Name = "Desktop", BackgroundTransparency = 1, ZIndex = 2, Visible = false, Parent = gui})
+	local rootScale = macNew("UIScale", {Parent = root})
+	local s = 1 -- screen pixels per point
+	local screenW = 0 -- screen width in points (the height is always D.height)
+	local layoutCallbacks = {}
+	local function relayout()
+		local size = gui.AbsoluteSize
+		if size.Y < 1 then
+			return
+		end
+		s = size.Y / D.height
+		screenW = size.X / s
+		rootScale.Scale = s
+		root.Size = UDim2.fromOffset(screenW, D.height)
+		for _, fn in ipairs(layoutCallbacks) do
+			task.spawn(fn)
+		end
+	end
+	local function getScale()
+		return s
+	end
+
+	-- Over the bright 3D sky, a soft shade keeps the white menu bar readable
+	local shade = macNew("Frame", {
+		Name = "SceneShade", BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 120), BackgroundTransparency = 1, Parent = root,
+	})
+	macNew("UIGradient", {
+		Rotation = 90, Parent = shade,
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.45), NumberSequenceKeypoint.new(0.5, 0.82), NumberSequenceKeypoint.new(1, 1),
+		}),
+	})
+	local windowLayer = macNew("Frame", {Name = "Windows", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = root})
+	local overlay = macNew("Frame", {Name = "Overlay", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 5, Parent = root})
+
+	local refreshDock, refreshMenuBar, openApp, dockIconCenter, closeMenu
+	local dock
+	local openMenu = nil -- {panel, catcher, button}
+
+	local dockHeight = D.dockIcon + 2 * D.dockPadding
+	local dockWidth = 2 * D.dockPadding + (#MAC_APPS + 1) * D.dockIcon + (#MAC_APPS - 1) * D.dockGap + D.dockSeparator
+	local function dockTop()
+		return D.height - D.dockBottom - dockHeight
+	end
+	-- Free area between the menu bar and the Dock, in points
+	local function workArea()
+		return 10, D.menuHeight + 8, screenW - 20, dockTop() - D.menuHeight - 18
+	end
+	local function pointIn(object, point)
+		local p, size = object.AbsolutePosition, object.AbsoluteSize
+		return point.X >= p.X and point.Y >= p.Y and point.X <= p.X + size.X and point.Y <= p.Y + size.Y
+	end
+
+	-- ---------- Windows ----------
+	local windows = {} -- open windows, back to front
+	local frontWindow = nil
+	local zCounter = 10
+	local cascade = 0
+	local drag = nil -- {win, start, origin} while a title bar is dragged
+
+	local function windowsOf(appId)
+		local list = {}
+		for _, win in ipairs(windows) do
+			if win.app == appId then
+				table.insert(list, win)
+			end
+		end
+		return list
+	end
+
+	local function topVisibleWindow()
+		for i = #windows, 1, -1 do
+			if not windows[i].minimized then
+				return windows[i]
+			end
+		end
+		return nil
+	end
+
+	local function setWindowActive(win, active)
+		win.active = active
+		win.shadow.ImageTransparency = if active then 0.5 else 0.72
+		win.paintLights()
+	end
+
+	local function focusWindow(win)
+		if win.closed then
+			return
+		end
+		if frontWindow and frontWindow ~= win and not frontWindow.closed then
+			setWindowActive(frontWindow, false)
+		end
+		local i = table.find(windows, win)
+		if i then
+			table.remove(windows, i)
+		end
+		table.insert(windows, win)
+		zCounter += 1
+		win.frame.ZIndex = zCounter
+		frontWindow = win
+		setWindowActive(win, true)
+		refreshMenuBar()
+	end
+
+	-- Fades, scales and moves a window as one piece by riding it in a
+	-- CanvasGroup; it goes back to a plain frame afterwards so text stays sharp.
+	-- `from`/`to`: {scale, transparency, center (points)}; center defaults to
+	-- the window's own.
+	local function animateWindow(win, info, from, to)
+		local frame = win.frame
+		local pad = D.shadowBlur + 24
+		local size = Vector2.new(frame.Size.X.Offset, frame.Size.Y.Offset)
+		local home = Vector2.new(frame.Position.X.Offset, frame.Position.Y.Offset) + size / 2
+		local start = from.center or home
+		local group = macNew("CanvasGroup", {
+			BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
+			Size = UDim2.fromOffset(size.X + 2 * pad, size.Y + 2 * pad), Position = UDim2.fromOffset(start.X, start.Y),
+			GroupTransparency = from.transparency or 0, ZIndex = frame.ZIndex, Parent = windowLayer,
+		})
+		local scale = macNew("UIScale", {Scale = from.scale or 1, Parent = group})
+		frame.Position = UDim2.fromOffset(pad, pad)
+		frame.Parent = group
+		frame.Visible = true
+		TweenService:Create(scale, info, {Scale = to.scale or 1}):Play()
+		local target = to.center or home
+		local motion = TweenService:Create(group, info, {GroupTransparency = to.transparency or 0, Position = UDim2.fromOffset(target.X, target.Y)})
+		motion:Play()
+		motion.Completed:Wait()
+		if frame.Parent == group then
+			frame.Parent = windowLayer
+			frame.Position = UDim2.fromOffset(home.X - size.X / 2, home.Y - size.Y / 2)
+		end
+		group:Destroy()
+	end
+
+	-- spec: {app, title, width, height, build(win), background?, dark?,
+	-- sidebarWidth?, titleLeft?, fixedSize?, onClose?}
+	local function openWindow(spec)
+		local win = {app = spec.app, minimized = false, zoomed = false, closed = false, active = false, cleanup = {}}
+		local ax, ay, aw, ah = workArea()
+		local width, height = math.min(spec.width, aw), math.min(spec.height, ah)
+		local x = math.floor(ax + (aw - width) / 2 + cascade * 24)
+		local y = math.floor(ay + math.max(0, (ah - height) / 2 - 30) + cascade * 24)
+		cascade = (cascade + 1) % 5
+
+		local frame = macNew("Frame", {
+			Name = spec.title, BackgroundTransparency = 1, Position = UDim2.fromOffset(x, y),
+			Size = UDim2.fromOffset(width, height), Parent = windowLayer,
+		})
+		-- Soft drop shadow: the glow image as a 9-slice
+		local blur = D.shadowBlur
+		local shadow = macNew("ImageLabel", {
+			Name = "Shadow", BackgroundTransparency = 1, Image = assets.glow or "", ImageColor3 = Color3.new(0, 0, 0),
+			ScaleType = Enum.ScaleType.Slice, SliceCenter = Rect.new(63, 63, 65, 65), SliceScale = blur / 63,
+			Position = UDim2.fromOffset(12 - blur, 26 - blur), Size = UDim2.new(1, 2 * blur - 24, 1, 2 * blur - 24),
+			ImageTransparency = 0.5, Parent = frame,
+		})
+		-- The body is a button so clicks on empty parts of the window don't fall through
+		local body = macButton(frame, {
+			Name = "Body", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 0,
+			BackgroundColor3 = spec.background or C.window, ZIndex = 2,
+		})
+		macCorner(body, D.windowRadius)
+		macStroke(body, Color3.new(0, 0, 0), if spec.dark then 0.4 else 0.86, 1)
+		win.frame, win.body, win.shadow = frame, body, shadow
+
+		-- Title bar: drag to move, double-click to zoom
+		local handle = macButton(body, {Name = "TitleBar", Size = UDim2.new(1, 0, 0, D.titleBar), ZIndex = 1})
+		local lastTitleClick = 0
+		handle.MouseButton1Down:Connect(function()
+			focusWindow(win)
+			local now = os.clock()
+			if now - lastTitleClick < 0.35 and not spec.fixedSize then
+				lastTitleClick = 0
+				win.zoom()
+				return
+			end
+			lastTitleClick = now
+			drag = {win = win, start = UserInputService:GetMouseLocation(), origin = Vector2.new(frame.Position.X.Offset, frame.Position.Y.Offset)}
+		end)
+
+		local titleLabel = macLabel(body, spec.title, 14, Enum.FontWeight.SemiBold,
+			if spec.dark then Color3.fromRGB(205, 205, 210) else C.ink, {ZIndex = 3, TextTruncate = Enum.TextTruncate.AtEnd})
+		if spec.titleLeft then
+			titleLabel.Position = UDim2.fromOffset(spec.titleLeft, 0)
+			titleLabel.Size = UDim2.new(1, -spec.titleLeft - 16, 0, D.titleBar)
+		else
+			titleLabel.Position = UDim2.fromOffset(84, 0)
+			titleLabel.Size = UDim2.new(1, -168, 0, D.titleBar)
+			titleLabel.TextXAlignment = Enum.TextXAlignment.Center
+		end
+		function win.setTitle(text)
+			titleLabel.Text = text
+		end
+
+		-- Traffic lights: close, minimize, zoom (symbols show on hover)
+		local lightsFrame = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(20, 19), Size = UDim2.fromOffset(54, 14), ZIndex = 6, Parent = body})
+		local lightDefs = {
+			{Color3.fromRGB(255, 95, 87), I.close, Color3.fromRGB(110, 10, 6), true},
+			{Color3.fromRGB(254, 188, 46), I.minus, Color3.fromRGB(140, 80, 0), true},
+			{Color3.fromRGB(40, 200, 64), I.plus, Color3.fromRGB(0, 100, 10), not spec.fixedSize},
+		}
+		local lights = {}
+		local hoveringLights = false
+		for i, def in ipairs(lightDefs) do
+			local light = macButton(lightsFrame, {
+				Position = UDim2.fromOffset((i - 1) * 20, 0), Size = UDim2.fromOffset(14, 14),
+				BackgroundTransparency = 0, BackgroundColor3 = def[1], ZIndex = 6,
+			})
+			macCorner(light, UDim.new(1, 0))
+			macStroke(light, Color3.new(0, 0, 0), 0.86, 1)
+			local glyph = macImage(light, def[2], 10, def[3], {
+				AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), ImageTransparency = 1, ZIndex = 7,
+			})
+			lights[i] = {button = light, glyph = glyph, color = def[1], enabled = def[4]}
+		end
+		function win.paintLights()
+			for _, light in ipairs(lights) do
+				local lit = light.enabled and (win.active or hoveringLights)
+				light.button.BackgroundColor3 = if lit then light.color else Color3.fromRGB(206, 206, 210)
+				light.glyph.ImageTransparency = if hoveringLights and light.enabled then 0.25 else 1
+			end
+		end
+		lightsFrame.MouseEnter:Connect(function()
+			hoveringLights = true
+			win.paintLights()
+		end)
+		lightsFrame.MouseLeave:Connect(function()
+			hoveringLights = false
+			win.paintLights()
+		end)
+		lights[1].button.MouseButton1Click:Connect(function()
+			win.close()
+		end)
+		lights[2].button.MouseButton1Click:Connect(function()
+			win.minimize()
+		end)
+		lights[3].button.MouseButton1Click:Connect(function()
+			if lights[3].enabled then
+				win.zoom()
+			end
+		end)
+
+		-- Content sits under the title bar; a sidebar (Tahoe: a rounded panel
+		-- floating inside the window) takes the left side from the top
+		win.content = macNew("Frame", {
+			Name = "Content", BackgroundTransparency = 1, Position = UDim2.fromOffset(0, D.titleBar),
+			Size = UDim2.new(1, 0, 1, -D.titleBar), ZIndex = 2, Parent = body,
+		})
+		if spec.sidebarWidth then
+			win.sidebar = macNew("Frame", {
+				Name = "Sidebar", BackgroundColor3 = C.sidebar, BorderSizePixel = 0, Position = UDim2.fromOffset(8, 8),
+				Size = UDim2.new(0, spec.sidebarWidth, 1, -16), ZIndex = 2, Parent = body,
+			})
+			macCorner(win.sidebar, D.windowRadius - 6)
+			win.content.Position = UDim2.fromOffset(spec.sidebarWidth + 16, D.titleBar)
+			win.content.Size = UDim2.new(1, -(spec.sidebarWidth + 16), 1, -D.titleBar)
+		end
+
+		local function forget()
+			if drag and drag.win == win then
+				drag = nil
+			end
+			local i = table.find(windows, win)
+			if i then
+				table.remove(windows, i)
+			end
+		end
+
+		function win.close(instant)
+			if win.closed then
+				return
+			end
+			win.closed = true
+			for _, item in ipairs(win.cleanup) do
+				if typeof(item) == "RBXScriptConnection" then
+					item:Disconnect()
+				else
+					pcall(item)
+				end
+			end
+			if spec.onClose then
+				task.spawn(spec.onClose)
+			end
+			forget()
+			if frontWindow == win then
+				frontWindow = nil
+				local nextWindow = topVisibleWindow()
+				if nextWindow then
+					focusWindow(nextWindow)
+				end
+			end
+			refreshDock()
+			refreshMenuBar()
+			if instant or win.minimized or not root.Visible then
+				frame:Destroy()
+				return
+			end
+			task.spawn(function()
+				animateWindow(win, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {}, {scale = 0.92, transparency = 1})
+				frame:Destroy()
+			end)
+		end
+
+		function win.minimize()
+			if win.minimized or win.closed then
+				return
+			end
+			win.minimized = true
+			if drag and drag.win == win then
+				drag = nil
+			end
+			if frontWindow == win then
+				frontWindow = nil
+				setWindowActive(win, false)
+				local nextWindow = topVisibleWindow()
+				if nextWindow then
+					focusWindow(nextWindow)
+				else
+					refreshMenuBar()
+				end
+			end
+			refreshDock()
+			local target = dockIconCenter(win.app)
+			task.spawn(function()
+				animateWindow(win, TweenInfo.new(0.32, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {}, {scale = 0.08, transparency = 1, center = target})
+				if win.minimized and not win.closed then
+					frame.Visible = false
+				end
+			end)
+		end
+
+		function win.restore()
+			if not win.minimized or win.closed then
+				return
+			end
+			win.minimized = false
+			focusWindow(win)
+			refreshDock()
+			task.spawn(animateWindow, win, TweenInfo.new(0.32, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {scale = 0.08, transparency = 1, center = dockIconCenter(win.app)}, {})
+		end
+
+		function win.zoom()
+			if win.closed or spec.fixedSize then
+				return
+			end
+			if win.zoomed then
+				win.zoomed = false
+				tween(frame, 0.3, {Position = win.normalPosition, Size = win.normalSize})
+			else
+				win.zoomed = true
+				win.normalPosition, win.normalSize = frame.Position, frame.Size
+				local zx, zy, zw, zh = workArea()
+				tween(frame, 0.3, {Position = UDim2.fromOffset(zx, zy), Size = UDim2.fromOffset(zw, zh)})
+			end
+		end
+
+		table.insert(windows, win)
+		focusWindow(win)
+		local ok, err = pcall(spec.build, win)
+		if not ok then
+			warn("[coolui] " .. tostring(spec.title) .. " failed to open: " .. tostring(err))
+			macLabel(win.content, "Something went wrong opening this window.", 14, Enum.FontWeight.Medium, C.inkSoft, {
+				Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center,
+			})
+		end
+		refreshDock()
+		task.spawn(animateWindow, win, TweenInfo.new(0.24, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {scale = 0.94, transparency = 1}, {})
+		return win
+	end
+
+	-- Dragging windows by the title bar
+	connect(UserInputService.InputChanged, function(input)
+		if not drag or input.UserInputType ~= Enum.UserInputType.MouseMovement then
+			return
+		end
+		local win = drag.win
+		if win.closed or win.minimized or win.frame.Parent ~= windowLayer then
+			return
+		end
+		local delta = (UserInputService:GetMouseLocation() - drag.start) / s
+		local x = math.clamp(drag.origin.X + delta.X, 80 - win.frame.Size.X.Offset, screenW - 80)
+		local y = math.clamp(drag.origin.Y + delta.Y, D.menuHeight, D.height - 60)
+		win.frame.Position = UDim2.fromOffset(x, y)
+	end)
+	connect(UserInputService.InputEnded, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			drag = nil
+		end
+	end)
+	-- Clicking anywhere on a window brings it to the front
+	connect(UserInputService.InputBegan, function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 or not root.Visible then
+			return
+		end
+		local point = UserInputService:GetMouseLocation()
+		if openMenu or point.Y <= D.menuHeight * s or pointIn(dock, point) then
+			return
+		end
+		for i = #windows, 1, -1 do
+			local win = windows[i]
+			if not win.minimized and win.frame.Parent == windowLayer and pointIn(win.body, point) then
+				if win ~= frontWindow then
+					focusWindow(win)
+				end
+				return
+			end
+		end
+	end)
+
+	-- ---------- Menu bar ----------
+	local white = Color3.new(1, 1, 1)
+	local menuBar = macNew("Frame", {Name = "MenuBar", BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, D.menuHeight), ZIndex = 4, Parent = root})
+	local menuLeft = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(0.7, 0, 1, 0), Parent = menuBar})
+	macNew("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center,
+		SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2), Parent = menuLeft,
+	})
+	-- Roblox's own buttons stay in the top-left corner (they can't be hidden),
+	-- so the Apple menu starts just to the right of them
+	local robloxGui = game:GetService("GuiService")
+	local function layoutMenuLeft()
+		local inset = robloxGui.TopbarInset
+		menuLeft.Position = UDim2.fromOffset(if inset.Min.X > 0 then inset.Min.X / s + 8 else 10, 0)
+	end
+	table.insert(layoutCallbacks, layoutMenuLeft)
+	connect(robloxGui:GetPropertyChangedSignal("TopbarInset"), layoutMenuLeft)
+
+	function closeMenu()
+		if not openMenu then
+			return
+		end
+		openMenu.panel:Destroy()
+		openMenu.catcher:Destroy()
+		if openMenu.button.Parent then
+			openMenu.button.BackgroundTransparency = 1
+		end
+		openMenu = nil
+	end
+
+	-- items: list of {text, action (nil = greyed out), checked = bool} or "-"
+	local function showMenu(button, items)
+		closeMenu()
+		local catcher = macButton(overlay, {Size = UDim2.fromScale(1, 1), ZIndex = 1})
+		catcher.MouseButton1Down:Connect(closeMenu)
+		local x = math.min(button.AbsolutePosition.X / s - 4, screenW - 266)
+		local panel = macNew("Frame", {
+			BackgroundColor3 = C.menu, BackgroundTransparency = 0.04, BorderSizePixel = 0,
+			Position = UDim2.fromOffset(x, D.menuHeight + 3), Size = UDim2.fromOffset(260, 0),
+			AutomaticSize = Enum.AutomaticSize.Y, ZIndex = 2, Parent = overlay,
+		})
+		macCorner(panel, 11)
+		macStroke(panel, Color3.new(0, 0, 0), 0.86, 1)
+		macNew("UIPadding", {
+			PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5), PaddingLeft = UDim.new(0, 5),
+			PaddingRight = UDim.new(0, 5), Parent = panel,
+		})
+		macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Parent = panel})
+		for i, item in ipairs(items) do
+			if item == "-" then
+				local separator = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 11), LayoutOrder = i, Parent = panel})
+				macNew("Frame", {
+					BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.88, BorderSizePixel = 0,
+					AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(1, -18, 0, 1), Parent = separator,
+				})
+			else
+				local action = item[2]
+				local row = macButton(panel, {Size = UDim2.new(1, 0, 0, 26), LayoutOrder = i, BackgroundColor3 = C.accent, ZIndex = 3})
+				macCorner(row, 6)
+				local text = macLabel(row, item[1], 14, Enum.FontWeight.Regular, C.ink, {
+					Position = UDim2.fromOffset(26, 0), Size = UDim2.new(1, -32, 1, 0), ZIndex = 4,
+					TextTransparency = if action then 0 else 0.6, TextTruncate = Enum.TextTruncate.AtEnd,
+				})
+				local check = nil
+				if item.checked then
+					check = macImage(row, I.check, 14, C.ink, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 7, 0.5, 0), ZIndex = 4})
+				end
+				if action then
+					row.MouseEnter:Connect(function()
+						row.BackgroundTransparency = 0
+						text.TextColor3 = white
+						if check then
+							check.ImageColor3 = white
+						end
+					end)
+					row.MouseLeave:Connect(function()
+						row.BackgroundTransparency = 1
+						text.TextColor3 = C.ink
+						if check then
+							check.ImageColor3 = C.ink
+						end
+					end)
+					row.MouseButton1Click:Connect(function()
+						closeMenu()
+						task.spawn(action)
+					end)
+				end
+			end
+		end
+		button.BackgroundTransparency = 0.72
+		openMenu = {panel = panel, catcher = catcher, button = button}
+	end
+
+	local menuTitles = {}
+	local function menuTitle(text, weight, order, items, icon)
+		local button = macButton(menuLeft, {
+			Size = UDim2.fromOffset(if icon then 38 else 0, 24), AutomaticSize = if icon then Enum.AutomaticSize.None else Enum.AutomaticSize.X,
+			BackgroundColor3 = white, LayoutOrder = order, FontFace = macFont(weight), TextSize = 14,
+			TextColor3 = white, Text = text,
+		})
+		macCorner(button, 6)
+		if icon then
+			macImage(button, icon, 17, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.48)})
+		else
+			macNew("UIPadding", {PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10), Parent = button})
+		end
+		button.MouseButton1Down:Connect(function()
+			if openMenu and openMenu.button == button then
+				closeMenu()
+			else
+				showMenu(button, items())
+			end
+		end)
+		-- Like macOS: with a menu open, moving across the titles opens the others
+		button.MouseEnter:Connect(function()
+			if openMenu and openMenu.button ~= button then
+				showMenu(button, items())
+			end
+		end)
+		return button
+	end
+
+	local function frontAction(method)
+		local win = frontWindow
+		if not win then
+			return nil
+		end
+		return function()
+			if not win.closed then
+				win[method]()
+			end
+		end
+	end
+
+	menuTitle("", Enum.FontWeight.Bold, 1, function()
+		return {
+			{"About This Mac", function()
+				openApp("about")
+			end},
+			"-",
+			{"System Settings…", function()
+				openApp("settings")
+			end},
+			"-",
+			{"Restart…", function()
+				finish("restart")
+			end},
+			{"Shut Down…", function()
+				finish("shutdown")
+			end},
+			"-",
+			{"Lock Screen", function()
+				finish("lock")
+			end},
+			{"Log Out " .. player.DisplayName .. "…", function()
+				finish("logout")
+			end},
+		}
+	end, I.apple)
+
+	local standardMenus = {
+		{"File", function()
+			return {
+				{"New Finder Window", function()
+					openApp("finder", {newWindow = true})
+				end},
+				{"Open Notes", function()
+					openApp("notes")
+				end},
+				"-",
+				{"Close Window", frontAction("close")},
+			}
+		end},
+		{"Edit", function()
+			return {{"Undo"}, {"Redo"}, "-", {"Cut"}, {"Copy"}, {"Paste"}, {"Select All"}}
+		end},
+		{"View", function()
+			return {
+				{"Tahoe Wallpaper", function()
+					session.setBackground("wallpaper", true)
+				end, checked = session.mode == "wallpaper"},
+				{"3D Scene", function()
+					session.setBackground("scene", true)
+				end, checked = session.mode == "scene"},
+			}
+		end},
+		{"Window", function()
+			local items = {
+				{"Minimize", frontAction("minimize")},
+				{"Zoom", frontAction("zoom")},
+				"-",
+				{"Bring All to Front", if #windows > 0 then function()
+					for _, win in ipairs(table.clone(windows)) do
+						if win.minimized then
+							win.restore()
+						else
+							focusWindow(win)
+						end
+					end
+				end else nil},
+			}
+			if #windows > 0 then
+				table.insert(items, "-")
+				for _, win in ipairs(windows) do
+					table.insert(items, {win.frame.Name, function()
+						if win.minimized then
+							win.restore()
+						elseif not win.closed then
+							focusWindow(win)
+						end
+					end, checked = win == frontWindow})
+				end
+			end
+			return items
+		end},
+		{"Help", function()
+			return {{"macOS Help"}}
+		end},
+	}
+
+	function refreshMenuBar()
+		-- The titles are rebuilt, so close a menu that hangs off one of them
+		if openMenu and table.find(menuTitles, openMenu.button) then
+			closeMenu()
+		end
+		for _, button in ipairs(menuTitles) do
+			button:Destroy()
+		end
+		table.clear(menuTitles)
+		local appId = if frontWindow then frontWindow.app else "finder"
+		local appName = MAC_APP_NAMES[appId] or "Finder"
+		table.insert(menuTitles, menuTitle(appName, Enum.FontWeight.Bold, 2, function()
+			local items = {{"About " .. appName, function()
+				openApp("about")
+			end}}
+			if appId ~= "finder" and appId ~= "about" then
+				table.insert(items, "-")
+				table.insert(items, {"Quit " .. appName, function()
+					for _, win in ipairs(windowsOf(appId)) do
+						win.close()
+					end
+				end})
+			end
+			return items
+		end))
+		for i, menu in ipairs(standardMenus) do
+			table.insert(menuTitles, menuTitle(menu[1], Enum.FontWeight.Medium, 2 + i, menu[2]))
+		end
+	end
+
+	-- Right side: battery, Wi-Fi, Spotlight, date and time
+	local menuRight = macNew("Frame", {
+		BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -16, 0, 0),
+		Size = UDim2.new(0.4, 0, 1, 0), Parent = menuBar,
+	})
+	macNew("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Right,
+		VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, 18), Parent = menuRight,
+	})
+	macImage(menuRight, I.battery, 19, white, {LayoutOrder = 1})
+	macImage(menuRight, I.wifi, 16, white, {LayoutOrder = 2})
+	macImage(menuRight, I.search, 15, white, {LayoutOrder = 3})
+	local clockLabel = macLabel(menuRight, "", 14, Enum.FontWeight.Medium, white, {
+		AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 20), LayoutOrder = 4,
+	})
+
+	-- ---------- Dock ----------
+	dock = macNew("Frame", {
+		Name = "Dock", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -D.dockBottom),
+		Size = UDim2.fromOffset(dockWidth, dockHeight), BackgroundColor3 = white, BackgroundTransparency = 0.78,
+		ZIndex = 3, Parent = root,
+	})
+	macCorner(dock, D.dockRadius)
+	local dockRim = macStroke(dock, white, 0.6, 1)
+	-- Glass layers: rendered once on the wallpaper, or live on the 3D scene
+	-- (backdrop + tint + rim light). Frosted fill and rim when neither works.
+	local bakedPane = macNew("ImageLabel", {Name = "Glass", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ImageTransparency = 1, ZIndex = 1, Parent = dock})
+	local livePane = macNew("ImageLabel", {Name = "LiveGlass", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ImageTransparency = 1, ZIndex = 1, Parent = dock})
+	macCorner(livePane, D.dockRadius)
+	local liveTint = macNew("Frame", {BackgroundColor3 = MAC_GLASS.tint, BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = dock})
+	macCorner(liveTint, D.dockRadius)
+	local liveRim = macNew("ImageLabel", {Name = "Rim", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ImageTransparency = 1, ZIndex = 3, Parent = dock})
+	local bakedReady = false
+	local glassKey = nil
+	local liveGlass = nil
+
+	local function glassOpts()
+		local opts = table.clone(MAC_GLASS)
+		opts.cornerRadius = D.dockRadius * s
+		return opts
+	end
+
+	local function applyDockStyle()
+		local useBaked = session.mode == "wallpaper" and bakedReady
+		local useLive = session.mode == "scene" and liveGlass ~= nil
+		local glass = useBaked or useLive
+		dock.BackgroundTransparency = if glass then 1 else 0.78
+		dockRim.Transparency = if glass then 1 else 0.6
+		bakedPane.ImageTransparency = if useBaked then 0 else 1
+		livePane.ImageTransparency = if useLive then 0 else 1
+		liveTint.BackgroundTransparency = if useLive then 1 - MAC_GLASS.tintAlpha else 1
+		liveRim.ImageTransparency = if useLive then 0 else 1
+		if liveGlass then
+			liveGlass.enabled = useLive
+			liveGlass.invalidate()
+		end
+	end
+
+	local function layoutDockGlass()
+		local size = gui.AbsoluteSize
+		local key = size.X .. "x" .. size.Y
+		if key == glassKey or not root.Visible then
+			return
+		end
+		glassKey = key
+		local x, y, w, h = macDockRect(size.X, size.Y)
+		if not assets.wallpaper and assets.glow then
+			local ok, id = pcall(function()
+				if assets.dockGlass and assets.dockGlass.size == size then
+					return assets.dockGlass.id
+				end
+				return bakeMacGlass("dock", x, y, w, h, size.X, size.Y, glassOpts())
+			end)
+			if ok then
+				bakedPane.Image = id
+				bakedReady = true
+			else
+				warn("[coolui] dock glass failed: " .. tostring(id))
+			end
+		end
+		if macSky then
+			local ok, err = pcall(function()
+				liveRim.Image = bakeMacGlassRim("dock", w, h, glassOpts())
+				if liveGlass then
+					liveGlass.layout(glassOpts())
+				else
+					liveGlass = createMacLiveGlass(livePane, glassOpts())
+				end
+			end)
+			if not ok then
+				warn("[coolui] live dock glass failed: " .. tostring(err))
+				if liveGlass then
+					liveGlass.destroy()
+					liveGlass = nil
+				end
+			end
+		end
+		applyDockStyle()
+	end
+	table.insert(layoutCallbacks, layoutDockGlass)
+
+	-- App name tooltip above the Dock
+	local tooltip = macNew("Frame", {
+		BackgroundColor3 = C.menu, BackgroundTransparency = 0.04, AnchorPoint = Vector2.new(0.5, 1),
+		Size = UDim2.fromOffset(0, 28), AutomaticSize = Enum.AutomaticSize.X, Visible = false, ZIndex = 6, Parent = root,
+	})
+	macCorner(tooltip, 8)
+	macStroke(tooltip, Color3.new(0, 0, 0), 0.88, 1)
+	macNew("UIPadding", {PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12), Parent = tooltip})
+	local tooltipText = macLabel(tooltip, "", 14, Enum.FontWeight.Medium, C.ink, {
+		AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 28), ZIndex = 7,
+	})
+
+	local dockItems = {}
+	function dockIconCenter(appId)
+		local item = dockItems[appId] or dockItems.finder
+		local p, size = item.button.AbsolutePosition, item.button.AbsoluteSize
+		return Vector2.new((p.X + size.X / 2) / s, (p.Y + size.Y / 2) / s)
+	end
+
+	-- The launch bounce
+	local function bounce(appId)
+		local item = dockItems[appId]
+		if not item or item.bouncing then
+			return
+		end
+		item.bouncing = true
+		task.spawn(function()
+			for _ = 1, 2 do
+				local up = TweenService:Create(item.holder, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Position = UDim2.new(0.5, 0, 1, -18)})
+				up:Play()
+				up.Completed:Wait()
+				local down = TweenService:Create(item.holder, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Position = UDim2.new(0.5, 0, 1, 0)})
+				down:Play()
+				down.Completed:Wait()
+			end
+			item.bouncing = false
+		end)
+	end
+
+	local function addDockItem(app, x)
+		local button = macButton(dock, {Name = app.id, Position = UDim2.fromOffset(x, D.dockPadding), Size = UDim2.fromOffset(D.dockIcon, D.dockIcon), ZIndex = 4})
+		local holder = macNew("Frame", {
+			BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, 0),
+			Size = UDim2.fromScale(1, 1), Parent = button,
+		})
+		local scale = macNew("UIScale", {Parent = holder})
+		macAppTile(holder, app, D.dockIcon)
+		-- Running indicator
+		local dot = macNew("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 1, 2), Size = UDim2.fromOffset(4, 4),
+			BackgroundColor3 = Color3.fromRGB(36, 36, 42), BackgroundTransparency = 0.1, BorderSizePixel = 0,
+			Visible = false, Parent = button,
+		})
+		macCorner(dot, UDim.new(1, 0))
+		button.MouseEnter:Connect(function()
+			TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1.08}):Play()
+			tooltipText.Text = app.name
+			local center = dockIconCenter(app.id)
+			tooltip.Position = UDim2.fromOffset(center.X, dockTop() - 10)
+			tooltip.Visible = true
+		end)
+		button.MouseLeave:Connect(function()
+			TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1}):Play()
+			if tooltipText.Text == app.name then
+				tooltip.Visible = false
+			end
+		end)
+		button.MouseButton1Click:Connect(function()
+			tooltip.Visible = false
+			closeMenu()
+			openApp(app.id)
+		end)
+		dockItems[app.id] = {button = button, holder = holder, dot = dot}
+	end
+
+	do
+		local x = D.dockPadding
+		for i, app in ipairs(MAC_APPS) do
+			addDockItem(app, x)
+			x += D.dockIcon + (if i < #MAC_APPS then D.dockGap else 0)
+		end
+		-- Two points wide and faint: one point is under a pixel on most screens and doesn't draw
+		macNew("Frame", {
+			BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.84, BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, x + math.floor(D.dockSeparator / 2), 0.5, 0),
+			Size = UDim2.new(0, 2, 0, D.dockIcon - 14), ZIndex = 4, Parent = dock,
+		})
+		addDockItem(MAC_TRASH, x + D.dockSeparator)
+	end
+
+	function refreshDock()
+		for id, item in pairs(dockItems) do
+			item.dot.Visible = id ~= "trash" and #windowsOf(id) > 0
+		end
+	end
+
+	-- ---------- Apps ----------
+	local appBuilders = {}
+
+	function openApp(appId, args)
+		args = args or {}
+		if appId == "trash" then
+			openApp("finder", {path = MAC_TRASH_PATH, newWindow = true})
+			return
+		end
+		local existing = windowsOf(appId)
+		if #existing > 0 and not args.newWindow then
+			-- Already open: bring it forward (restoring it if it's minimized)
+			local shown = {}
+			for _, win in ipairs(existing) do
+				if not win.minimized then
+					table.insert(shown, win)
+				end
+			end
+			if #shown == 0 then
+				existing[#existing].restore()
+			else
+				for _, win in ipairs(shown) do
+					focusWindow(win)
+				end
+			end
+			local win = existing[#existing]
+			if args.path and win.openPath then
+				win.openPath(args.path)
+			end
+			return
+		end
+		bounce(appId)
+		local builder = appBuilders[appId]
+		if builder then
+			builder(args)
+		end
+	end
+
+	-- Finder: browses the executor's workspace folder
+	appBuilders.finder = function(args)
+		local sidebarWidth = 190
+		openWindow({
+			app = "finder", title = "Workspace", width = 820, height = 500, background = white,
+			sidebarWidth = sidebarWidth, titleLeft = sidebarWidth + 92,
+			build = function(win)
+				local current = nil
+				local history, future = {}, {}
+				local sidebarButtons = {}
+				local navigate
+
+				local list = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 46), Size = UDim2.new(1, -20, 1, -56), Parent = win.sidebar})
+				macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 1), Parent = list})
+				local function sidebarHeader(text, order)
+					macLabel(list, text, 12, Enum.FontWeight.Bold, C.inkSoft, {Size = UDim2.new(1, 0, 0, 26), LayoutOrder = order, TextYAlignment = Enum.TextYAlignment.Bottom})
+				end
+				local function sidebarItem(text, icon, path, order)
+					local button = macButton(list, {Size = UDim2.new(1, 0, 0, 30), LayoutOrder = order, BackgroundColor3 = Color3.new(0, 0, 0)})
+					macCorner(button, 8)
+					macImage(button, icon, 17, C.accent, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 8, 0.5, 0)})
+					macLabel(button, text, 14, Enum.FontWeight.Medium, C.ink, {
+						Position = UDim2.fromOffset(34, 0), Size = UDim2.new(1, -40, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+					})
+					button.MouseButton1Click:Connect(function()
+						navigate(path)
+					end)
+					sidebarButtons[path] = button
+				end
+				sidebarHeader("Favorites", 1)
+				sidebarItem("Workspace", I.home, "", 2)
+				local ok, rootEntries = pcall(macListFolder, "")
+				if ok then
+					local shown = 0
+					for _, entry in ipairs(rootEntries) do
+						if entry.folder and shown < 6 then
+							shown += 1
+							sidebarItem(entry.name, I.folder, entry.path, 2 + shown)
+						end
+					end
+				end
+				sidebarHeader("Locations", 20)
+				sidebarItem("Trash", I.trash, MAC_TRASH_PATH, 21)
+
+				-- Back / forward
+				local function toolButton(icon, x)
+					local button = macButton(win.body, {
+						Position = UDim2.fromOffset(x, 12), Size = UDim2.fromOffset(30, 28),
+						BackgroundColor3 = Color3.new(0, 0, 0), ZIndex = 5,
+					})
+					macCorner(button, 8)
+					local image = macImage(button, icon, 18, C.ink, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), ZIndex = 6})
+					button.MouseEnter:Connect(function()
+						button.BackgroundTransparency = 0.94
+					end)
+					button.MouseLeave:Connect(function()
+						button.BackgroundTransparency = 1
+					end)
+					return button, image
+				end
+				local backButton, backIcon = toolButton(I.back, sidebarWidth + 26)
+				local forwardButton, forwardIcon = toolButton(I.forward, sidebarWidth + 58)
+
+				-- File list
+				local content = win.content
+				local header = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(4, 0), Size = UDim2.new(1, -16, 0, 24), Parent = content})
+				macLabel(header, "Name", 12, Enum.FontWeight.SemiBold, C.inkSoft, {Position = UDim2.fromOffset(36, 0), Size = UDim2.new(0.6, -36, 1, 0)})
+				macLabel(header, "Kind", 12, Enum.FontWeight.SemiBold, C.inkSoft, {Position = UDim2.fromScale(0.62, 0), Size = UDim2.fromScale(0.38, 1)})
+				macNew("Frame", {
+					BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.9, BorderSizePixel = 0,
+					Position = UDim2.new(0, 4, 0, 24), Size = UDim2.new(1, -20, 0, 1), Parent = content,
+				})
+				local scroller = macNew("ScrollingFrame", {
+					BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(4, 27), Size = UDim2.new(1, -12, 1, -35),
+					CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 5,
+					ScrollBarImageColor3 = Color3.new(0, 0, 0), ScrollBarImageTransparency = 0.6,
+					ScrollingDirection = Enum.ScrollingDirection.Y, Parent = content,
+				})
+				macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Parent = scroller})
+				local emptyLabel = macLabel(content, "", 15, Enum.FontWeight.Medium, C.inkSoft, {
+					AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(300, 30),
+					TextXAlignment = Enum.TextXAlignment.Center, Visible = false,
+				})
+
+				local selected = nil
+				local function paintRow(row, on)
+					row.button.BackgroundColor3 = if on then C.accent else row.base
+					row.button.BackgroundTransparency = if on or row.striped then 0 else 1
+					row.name.TextColor3 = if on then white else C.ink
+					row.kind.TextColor3 = if on then white else C.inkSoft
+					row.icon.ImageColor3 = if on then white else row.iconColor
+				end
+				local function openEntry(entry)
+					if entry.folder then
+						navigate(entry.path)
+						return
+					end
+					local ext = macExtension(entry.name)
+					if MAC_IMAGE_EXTENSIONS[ext] then
+						openApp("preview", {path = entry.path, newWindow = true})
+					elseif MAC_AUDIO_EXTENSIONS[ext] then
+						openApp("music", {path = entry.path})
+					elseif MAC_TEXT_EXTENSIONS[ext] then
+						openApp("notes", {path = entry.path, newWindow = true})
+					end
+				end
+
+				function navigate(path, fromHistory)
+					if path == current then
+						return
+					end
+					if current ~= nil and not fromHistory then
+						table.insert(history, current)
+						table.clear(future)
+					end
+					current = path
+					selected = nil
+					for _, child in ipairs(scroller:GetChildren()) do
+						if child:IsA("GuiObject") then
+							child:Destroy()
+						end
+					end
+					win.setTitle(if path == "" then "Workspace" elseif path == MAC_TRASH_PATH then "Trash" else path:match("([^/]+)$") or path)
+					for buttonPath, button in pairs(sidebarButtons) do
+						button.BackgroundTransparency = if buttonPath == path then 0.91 else 1
+					end
+					backIcon.ImageTransparency = if #history > 0 then 0 else 0.65
+					forwardIcon.ImageTransparency = if #future > 0 then 0 else 0.65
+					if path == MAC_TRASH_PATH then
+						emptyLabel.Text = "Trash is empty"
+						emptyLabel.Visible = true
+						return
+					end
+					local listed, entries = pcall(macListFolder, path)
+					if not listed then
+						emptyLabel.Text = "Can't open this folder"
+						emptyLabel.Visible = true
+						return
+					end
+					emptyLabel.Text = "This folder is empty"
+					emptyLabel.Visible = #entries == 0
+					for i, entry in ipairs(entries) do
+						if i > 400 then
+							break
+						end
+						local kind, icon = macFileKind(entry.name, entry.folder)
+						local striped = i % 2 == 0
+						local button = macButton(scroller, {
+							Size = UDim2.new(1, -6, 0, 28), LayoutOrder = i, BackgroundColor3 = C.zebra,
+							BackgroundTransparency = if striped then 0 else 1,
+						})
+						macCorner(button, 6)
+						local iconColor = if entry.folder then Color3.fromRGB(64, 156, 255) else C.inkSoft
+						local row = {
+							button = button, base = C.zebra, striped = striped, iconColor = iconColor,
+							icon = macImage(button, icon, 17, iconColor, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0)}),
+							name = macLabel(button, entry.name, 14, Enum.FontWeight.Regular, C.ink, {
+								Position = UDim2.fromOffset(36, 0), Size = UDim2.new(0.6, -36, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+							}),
+							kind = macLabel(button, kind, 14, Enum.FontWeight.Regular, C.inkSoft, {
+								Position = UDim2.fromScale(0.62, 0), Size = UDim2.new(0.38, -8, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+							}),
+						}
+						local lastClick = 0
+						button.MouseButton1Click:Connect(function()
+							local now = os.clock()
+							if selected == row and now - lastClick < 0.4 then
+								openEntry(entry)
+								return
+							end
+							lastClick = now
+							if selected then
+								paintRow(selected, false)
+							end
+							selected = row
+							paintRow(row, true)
+						end)
+					end
+					scroller.CanvasPosition = Vector2.zero
+				end
+
+				backButton.MouseButton1Click:Connect(function()
+					if #history > 0 then
+						table.insert(future, current)
+						navigate(table.remove(history), true)
+					end
+				end)
+				forwardButton.MouseButton1Click:Connect(function()
+					if #future > 0 then
+						table.insert(history, current)
+						navigate(table.remove(future), true)
+					end
+				end)
+				navigate(args.path or "")
+			end,
+		})
+	end
+
+	-- Notes: a plain text editor that saves as you type
+	appBuilders.notes = function(args)
+		local path = args.path or MAC_NOTES_FILE
+		local name = path:match("([^/]+)$") or path
+		openWindow({
+			app = "notes", title = name, width = 580, height = 440, background = white,
+			build = function(win)
+				local text = ""
+				local ok, data = pcall(function()
+					return if isfile(path) then readfile(path) else ""
+				end)
+				if ok then
+					text = data
+				end
+				-- Very long files open read-only (a huge TextBox gets slow)
+				local readOnly = #text > 60000
+				if readOnly then
+					text = text:sub(1, 60000)
+					win.setTitle(name .. " (read only)")
+				end
+				local scroller = macNew("ScrollingFrame", {
+					BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(22, 0), Size = UDim2.new(1, -30, 1, -12),
+					CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 5,
+					ScrollBarImageColor3 = Color3.new(0, 0, 0), ScrollBarImageTransparency = 0.6,
+					ScrollingDirection = Enum.ScrollingDirection.Y, Parent = win.content,
+				})
+				local box = macNew("TextBox", {
+					BackgroundTransparency = 1, MultiLine = true, ClearTextOnFocus = false, TextWrapped = true,
+					Text = text, PlaceholderText = "Start typing…", PlaceholderColor3 = C.inkSoft, TextColor3 = C.ink,
+					FontFace = macFont(Enum.FontWeight.Regular), TextSize = 16, TextXAlignment = Enum.TextXAlignment.Left,
+					TextYAlignment = Enum.TextYAlignment.Top, Size = UDim2.new(1, -10, 1, 0), AutomaticSize = Enum.AutomaticSize.Y,
+					TextEditable = not readOnly, Parent = scroller,
+				})
+				local saveId = 0
+				box:GetPropertyChangedSignal("Text"):Connect(function()
+					if readOnly then
+						return
+					end
+					saveId += 1
+					local id = saveId
+					win.setTitle(name .. " — Edited")
+					task.delay(0.8, function()
+						if id ~= saveId then
+							return
+						end
+						local saved = pcall(function()
+							ensureMacFolder()
+							writefile(path, box.Text)
+						end)
+						win.setTitle(if saved then name else name .. " — Can't save")
+					end)
+				end)
+				if text == "" and not readOnly then
+					task.defer(function()
+						box:CaptureFocus()
+					end)
+				end
+			end,
+		})
+	end
+
+	-- Terminal: a few shell commands for the workspace, and Luau for the rest
+	appBuilders.terminal = function()
+		openWindow({
+			app = "terminal", title = player.Name .. " — zsh — 80×24", width = 660, height = 420, dark = true,
+			background = Color3.fromRGB(30, 30, 32),
+			build = function(win)
+				local mono = Font.new("rbxasset://fonts/families/RobotoMono.json")
+				local cwd = ""
+				local scroller = macNew("ScrollingFrame", {
+					BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(16, 0), Size = UDim2.new(1, -22, 1, -12),
+					CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 5,
+					ScrollBarImageColor3 = white, ScrollBarImageTransparency = 0.7,
+					ScrollingDirection = Enum.ScrollingDirection.Y, Parent = win.content,
+				})
+				macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Parent = scroller})
+				local order = 0
+				local lineCount = 0
+				local function line(text, color)
+					order += 1
+					lineCount += 1
+					macNew("TextLabel", {
+						BackgroundTransparency = 1, Text = if text == "" then " " else text, TextColor3 = color or C.terminalText,
+						FontFace = mono, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true,
+						Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = order, Parent = scroller,
+					})
+					-- Keep the scrollback bounded
+					if lineCount > 400 then
+						for _, child in ipairs(scroller:GetChildren()) do
+							if child:IsA("TextLabel") then
+								child:Destroy()
+								lineCount -= 1
+								break
+							end
+						end
+					end
+				end
+				local function joinArgs(...)
+					local parts = table.pack(...)
+					for i = 1, parts.n do
+						parts[i] = tostring(parts[i])
+					end
+					return table.concat(parts, " ", 1, parts.n)
+				end
+
+				local inputRow = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, -8, 0, 20), LayoutOrder = 1e9, Parent = scroller})
+				local prompt = macNew("TextLabel", {
+					BackgroundTransparency = 1, FontFace = mono, TextSize = 14, TextColor3 = C.terminalAccent,
+					TextXAlignment = Enum.TextXAlignment.Left, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromScale(0, 1), Parent = inputRow,
+				})
+				local input = macNew("TextBox", {
+					BackgroundTransparency = 1, ClearTextOnFocus = false, Text = "", PlaceholderText = "", FontFace = mono, TextSize = 14,
+					TextColor3 = C.terminalText, TextXAlignment = Enum.TextXAlignment.Left, Size = UDim2.fromScale(1, 1), Parent = inputRow,
+				})
+				local function promptText()
+					return player.Name .. "@Roblox " .. (if cwd == "" then "~" else cwd:match("([^/]+)$") or cwd) .. " %"
+				end
+				local function updatePrompt()
+					prompt.Text = promptText()
+				end
+				prompt:GetPropertyChangedSignal("TextBounds"):Connect(function()
+					local width = prompt.TextBounds.X + 8
+					input.Position = UDim2.fromOffset(width, 0)
+					input.Size = UDim2.new(1, -width, 1, 0)
+				end)
+				updatePrompt()
+
+				local function resolve(arg)
+					if not arg or arg == "" or arg == "~" then
+						return ""
+					elseif arg == "." then
+						return cwd
+					elseif arg == ".." then
+						return cwd:match("^(.*)/[^/]+$") or ""
+					elseif arg:sub(1, 2) == "~/" then
+						return arg:sub(3)
+					end
+					return if cwd == "" then arg else cwd .. "/" .. arg
+				end
+
+				local commands = {}
+				function commands.help()
+					line("Commands: ls, cd, pwd, cat, echo, clear, date, whoami, open, neofetch, exit")
+					line("Anything else runs as Luau, e.g.  workspace.Gravity", C.inkSoft)
+				end
+				function commands.clear()
+					for _, child in ipairs(scroller:GetChildren()) do
+						if child:IsA("TextLabel") then
+							child:Destroy()
+						end
+					end
+					lineCount = 0
+				end
+				function commands.pwd()
+					line(if cwd == "" then "~" else "~/" .. cwd)
+				end
+				function commands.ls(argv)
+					local listed, entries = pcall(macListFolder, resolve(argv[1]))
+					if not listed then
+						line("ls: " .. (argv[1] or ".") .. ": No such file or directory", C.terminalError)
+						return
+					end
+					local names = {}
+					for _, entry in ipairs(entries) do
+						table.insert(names, entry.name .. (if entry.folder then "/" else ""))
+					end
+					line(table.concat(names, "    "))
+				end
+				function commands.cd(argv)
+					local target = resolve(argv[1])
+					if target ~= "" then
+						local exists, folder = pcall(isfolder, target)
+						if not (exists and folder) then
+							line("cd: no such file or directory: " .. argv[1], C.terminalError)
+							return
+						end
+					end
+					cwd = target
+					updatePrompt()
+				end
+				function commands.cat(argv)
+					if not argv[1] then
+						line("usage: cat <file>")
+						return
+					end
+					local read, data = pcall(readfile, resolve(argv[1]))
+					if not read then
+						line("cat: " .. argv[1] .. ": No such file or directory", C.terminalError)
+						return
+					end
+					local shown = 0
+					for text in (data:sub(1, 6000) .. "\n"):gmatch("(.-)\n") do
+						shown += 1
+						if shown > 120 then
+							line("… (" .. #data .. " bytes)", C.inkSoft)
+							break
+						end
+						line(text)
+					end
+				end
+				function commands.echo(_, rest)
+					line(rest)
+				end
+				function commands.date()
+					line(DateTime.now():FormatLocalTime("ddd MMM D HH:mm:ss YYYY", "en-us"))
+				end
+				function commands.whoami()
+					line(player.Name)
+				end
+				function commands.open(argv)
+					local id = (argv[1] or ""):lower()
+					for appId, appName in pairs(MAC_APP_NAMES) do
+						if id == appId or id == appName:lower() then
+							openApp(appId)
+							return
+						end
+					end
+					line("open: unknown app: " .. (argv[1] or ""), C.terminalError)
+				end
+				function commands.neofetch()
+					local viewport = workspace.CurrentCamera.ViewportSize
+					line(player.Name .. "@Roblox", C.terminalAccent)
+					line(string.rep("-", #player.Name + 7))
+					line("OS: macOS Tahoe 26.1 (Roblox)")
+					line("Host: Roblox " .. version())
+					line("Shell: zsh (Luau)")
+					line(string.format("Resolution: %dx%d", math.floor(viewport.X), math.floor(viewport.Y)))
+					line(string.format("Memory: %d MB", math.floor(game:GetService("Stats"):GetTotalMemoryUsageMb())))
+					line("Players: " .. #Players:GetPlayers())
+				end
+				function commands.exit()
+					win.close()
+				end
+
+				local function runLuau(source)
+					-- Try it as an expression first, so `workspace.Gravity` prints a value
+					local fn = loadstring("return " .. source)
+					if not fn then
+						local compileError
+						fn, compileError = loadstring(source)
+						if not fn then
+							line(tostring(compileError), C.terminalError)
+							return
+						end
+					end
+					local env = setmetatable({
+						print = function(...)
+							line(joinArgs(...))
+						end,
+						warn = function(...)
+							line(joinArgs(...), Color3.fromRGB(255, 200, 90))
+						end,
+					}, {__index = getfenv(0)})
+					pcall(setfenv, fn, env)
+					local results = table.pack(pcall(fn))
+					if not results[1] then
+						line(tostring(results[2]), C.terminalError)
+					elseif results.n > 1 then
+						local parts = {}
+						for i = 2, results.n do
+							table.insert(parts, tostring(results[i]))
+						end
+						line(table.concat(parts, "  "))
+					end
+				end
+
+				local history, historyIndex = {}, 1
+				local function submit(value)
+					line(promptText() .. " " .. value, C.terminalText)
+					local trimmed = value:match("^%s*(.-)%s*$")
+					if trimmed == "" then
+						return
+					end
+					table.insert(history, trimmed)
+					historyIndex = #history + 1
+					local name, rest = trimmed:match("^(%S+)%s*(.*)$")
+					local handler = commands[name]
+					if handler then
+						local argv = {}
+						for arg in rest:gmatch("%S+") do
+							table.insert(argv, arg)
+						end
+						local ran, err = pcall(handler, argv, rest)
+						if not ran then
+							line(tostring(err), C.terminalError)
+						end
+					else
+						runLuau(trimmed)
+					end
+				end
+
+				input.FocusLost:Connect(function(enterPressed)
+					if not enterPressed then
+						return
+					end
+					local value = input.Text
+					input.Text = ""
+					submit(value)
+					task.defer(function()
+						if not win.closed then
+							input:CaptureFocus()
+							scroller.CanvasPosition = Vector2.new(0, scroller.AbsoluteCanvasSize.Y)
+						end
+					end)
+				end)
+				-- Up/down arrows: command history
+				table.insert(win.cleanup, UserInputService.InputBegan:Connect(function(key)
+					if not input:IsFocused() then
+						return
+					end
+					if key.KeyCode == Enum.KeyCode.Up and historyIndex > 1 then
+						historyIndex -= 1
+					elseif key.KeyCode == Enum.KeyCode.Down and historyIndex <= #history then
+						historyIndex += 1
+					else
+						return
+					end
+					input.Text = history[historyIndex] or ""
+					input.CursorPosition = #input.Text + 1
+				end))
+				scroller.InputBegan:Connect(function(event)
+					if event.UserInputType == Enum.UserInputType.MouseButton1 then
+						input:CaptureFocus()
+					end
+				end)
+
+				line("Last login: " .. DateTime.now():FormatLocalTime("ddd MMM D HH:mm:ss", "en-us") .. " on ttys000")
+				line("Type help for commands. Anything else runs as Luau.", C.inkSoft)
+				task.defer(function()
+					input:CaptureFocus()
+				end)
+			end,
+		})
+	end
+
+	-- Music: plays the mp3s in coolui_music (and any audio opened from Finder)
+	appBuilders.music = function(args)
+		openWindow({
+			app = "music", title = "Music", width = 600, height = 340,
+			build = function(win)
+				local sound = macNew("Sound", {Name = "coolui_mac_music", Volume = 0.8, Parent = game:GetService("SoundService")})
+				table.insert(win.cleanup, function()
+					sound:Destroy()
+				end)
+				local tracks = {}
+				local function addTrack(path)
+					for i, track in ipairs(tracks) do
+						if track.path == path then
+							return i
+						end
+					end
+					local fileName = path:match("([^/]+)$") or path
+					table.insert(tracks, {path = path, title = fileName:gsub("%.%w+$", "")})
+					return #tracks
+				end
+				pcall(function()
+					for _, entry in ipairs(macListFolder(MUSIC_FOLDER)) do
+						if not entry.folder and MAC_AUDIO_EXTENSIONS[macExtension(entry.name)] then
+							addTrack(entry.path)
+						end
+					end
+				end)
+
+				local content = win.content
+				local art = macNew("Frame", {Position = UDim2.fromOffset(24, 4), Size = UDim2.fromOffset(170, 170), BackgroundColor3 = white, Parent = content})
+				macCorner(art, 14)
+				macNew("UIGradient", {Rotation = 45, Color = ColorSequence.new(Color3.fromRGB(255, 96, 140), Color3.fromRGB(140, 70, 235)), Parent = art})
+				macImage(art, I.music, 84, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
+
+				local titleLabel = macLabel(content, "Not Playing", 20, Enum.FontWeight.Bold, C.ink, {
+					Position = UDim2.fromOffset(214, 8), Size = UDim2.new(1, -234, 0, 26), TextTruncate = Enum.TextTruncate.AtEnd,
+				})
+				macLabel(content, "coolui", 15, Enum.FontWeight.Regular, C.inkSoft, {Position = UDim2.fromOffset(214, 36), Size = UDim2.new(1, -234, 0, 20)})
+
+				-- Progress bar (click to seek)
+				local bar = macButton(content, {
+					Position = UDim2.fromOffset(214, 76), Size = UDim2.new(1, -238, 0, 6),
+					BackgroundTransparency = 0, BackgroundColor3 = Color3.fromRGB(222, 222, 226),
+				})
+				macCorner(bar, UDim.new(1, 0))
+				local fill = macNew("Frame", {BackgroundColor3 = Color3.fromRGB(120, 120, 126), BorderSizePixel = 0, Size = UDim2.fromScale(0, 1), Parent = bar})
+				macCorner(fill, UDim.new(1, 0))
+				local elapsedLabel = macLabel(content, "0:00", 12, Enum.FontWeight.Medium, C.inkSoft, {Position = UDim2.fromOffset(214, 86), Size = UDim2.fromOffset(60, 16)})
+				local lengthLabel = macLabel(content, "0:00", 12, Enum.FontWeight.Medium, C.inkSoft, {
+					AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -24, 0, 86), Size = UDim2.fromOffset(60, 16),
+					TextXAlignment = Enum.TextXAlignment.Right,
+				})
+
+				local function controlButton(icon, size, x)
+					local button = macButton(content, {
+						AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, x, 0, 134), Size = UDim2.fromOffset(size + 14, size + 14),
+						BackgroundColor3 = Color3.new(0, 0, 0),
+					})
+					macCorner(button, UDim.new(1, 0))
+					local image = macImage(button, icon, size, C.ink, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
+					button.MouseEnter:Connect(function()
+						button.BackgroundTransparency = 0.94
+					end)
+					button.MouseLeave:Connect(function()
+						button.BackgroundTransparency = 1
+					end)
+					return button, image
+				end
+				local prevButton = controlButton(I.skipBack, 22, 300)
+				local playButton, playIcon = controlButton(I.play, 30, 356)
+				local nextButton = controlButton(I.skipForward, 22, 412)
+
+				local trackList = macNew("ScrollingFrame", {
+					BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(16, 186), Size = UDim2.new(1, -32, 1, -194),
+					CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 5,
+					ScrollBarImageColor3 = Color3.new(0, 0, 0), ScrollBarImageTransparency = 0.6,
+					ScrollingDirection = Enum.ScrollingDirection.Y, Parent = content,
+				})
+				macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Parent = trackList})
+
+				local index = 0
+				local rows = {}
+				local function paintRows()
+					for i, row in ipairs(rows) do
+						local on = i == index
+						row.button.BackgroundTransparency = if on then 0 else 1
+						row.label.TextColor3 = if on then white else C.ink
+					end
+				end
+				local function play(i)
+					local track = tracks[i]
+					if not track then
+						return
+					end
+					local ok, id = pcall(getcustomasset, track.path)
+					if not ok then
+						titleLabel.Text = "Can't play " .. track.title
+						return
+					end
+					index = i
+					sound:Stop()
+					sound.SoundId = id
+					sound.TimePosition = 0
+					sound:Play()
+					titleLabel.Text = track.title
+					paintRows()
+				end
+				local function rebuildRows()
+					for _, row in ipairs(rows) do
+						row.button:Destroy()
+					end
+					table.clear(rows)
+					for i, track in ipairs(tracks) do
+						local button = macButton(trackList, {Size = UDim2.new(1, -6, 0, 28), LayoutOrder = i, BackgroundColor3 = C.accent})
+						macCorner(button, 6)
+						local label = macLabel(button, track.title, 14, Enum.FontWeight.Regular, C.ink, {
+							Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -24, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+						})
+						button.MouseButton1Click:Connect(function()
+							play(i)
+						end)
+						rows[i] = {button = button, label = label}
+					end
+					paintRows()
+				end
+				rebuildRows()
+
+				playButton.MouseButton1Click:Connect(function()
+					if sound.IsPlaying then
+						sound:Pause()
+					elseif index == 0 then
+						play(1)
+					else
+						sound:Resume()
+					end
+				end)
+				prevButton.MouseButton1Click:Connect(function()
+					if #tracks > 0 then
+						play((index - 2) % #tracks + 1)
+					end
+				end)
+				nextButton.MouseButton1Click:Connect(function()
+					if #tracks > 0 then
+						play(index % #tracks + 1)
+					end
+				end)
+				sound.Ended:Connect(function()
+					if #tracks > 0 then
+						play(index % #tracks + 1)
+					end
+				end)
+				bar.MouseButton1Down:Connect(function(x)
+					if sound.TimeLength > 0 then
+						local fraction = math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+						sound.TimePosition = fraction * sound.TimeLength
+					end
+				end)
+
+				local function clockText(seconds)
+					seconds = math.max(0, math.floor(seconds))
+					return string.format("%d:%02d", seconds // 60, seconds % 60)
+				end
+				task.spawn(function()
+					while not win.closed do
+						local length = sound.TimeLength
+						fill.Size = UDim2.fromScale(if length > 0 then math.clamp(sound.TimePosition / length, 0, 1) else 0, 1)
+						elapsedLabel.Text = clockText(sound.TimePosition)
+						lengthLabel.Text = clockText(length)
+						playIcon.Image = if sound.IsPlaying then I.pause else I.play
+						task.wait(0.2)
+					end
+				end)
+
+				function win.openPath(path)
+					local i = addTrack(path)
+					rebuildRows()
+					play(i)
+				end
+				if args.path then
+					win.openPath(args.path)
+				end
+			end,
+		})
+	end
+
+	-- About This Mac (also the About pane in System Settings)
+	local function buildAbout(parent)
+		local viewport = workspace.CurrentCamera.ViewportSize
+		macImage(parent, I.laptop, 96, Color3.fromRGB(96, 98, 106), {AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 0)})
+		macLabel(parent, "MacBook Pro", 24, Enum.FontWeight.Bold, C.ink, {
+			Position = UDim2.fromOffset(0, 104), Size = UDim2.new(1, 0, 0, 30), TextXAlignment = Enum.TextXAlignment.Center,
+		})
+		macLabel(parent, "Roblox, " .. DateTime.now():FormatLocalTime("YYYY", "en-us"), 13, Enum.FontWeight.Regular, C.inkSoft, {
+			Position = UDim2.fromOffset(0, 134), Size = UDim2.new(1, 0, 0, 18), TextXAlignment = Enum.TextXAlignment.Center,
+		})
+		local rows = {
+			{"Chip", "Roblox " .. (version():match("^%d+%.%d+") or version())},
+			{"Memory", string.format("%d MB in use", math.floor(game:GetService("Stats"):GetTotalMemoryUsageMb()))},
+			{"Display", string.format("Built-in (%d × %d)", math.floor(viewport.X), math.floor(viewport.Y))},
+			{"Serial number", if game.JobId ~= "" then game.JobId:sub(1, 8):upper() else "STUDIO"},
+			{"macOS", "Tahoe 26.1"},
+		}
+		for i, row in ipairs(rows) do
+			local y = 170 + (i - 1) * 22
+			macLabel(parent, row[1], 13, Enum.FontWeight.Medium, C.ink, {
+				Position = UDim2.fromOffset(0, y), Size = UDim2.new(0.5, -6, 0, 18), TextXAlignment = Enum.TextXAlignment.Right,
+			})
+			macLabel(parent, row[2], 13, Enum.FontWeight.Regular, C.inkSoft, {
+				Position = UDim2.new(0.5, 6, 0, y), Size = UDim2.new(0.5, -6, 0, 18), TextTruncate = Enum.TextTruncate.AtEnd,
+			})
+		end
+	end
+
+	appBuilders.about = function()
+		openWindow({
+			app = "about", title = "", width = 320, height = 360, fixedSize = true,
+			build = function(win)
+				local holder = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(16, -8), Size = UDim2.new(1, -32, 1, 0), Parent = win.content})
+				buildAbout(holder)
+			end,
+		})
+	end
+
+	-- Preview: shows an image from the workspace
+	appBuilders.preview = function(args)
+		local name = args.path:match("([^/]+)$") or args.path
+		openWindow({
+			app = "preview", title = name, width = 560, height = 440, background = Color3.fromRGB(236, 236, 240),
+			build = function(win)
+				local ok, id = pcall(getcustomasset, args.path)
+				if ok then
+					macNew("ImageLabel", {
+						BackgroundTransparency = 1, Image = id, ScaleType = Enum.ScaleType.Fit,
+						Position = UDim2.fromOffset(16, 0), Size = UDim2.new(1, -32, 1, -16), Parent = win.content,
+					})
+				else
+					macLabel(win.content, "Can't open this image.", 14, Enum.FontWeight.Medium, C.inkSoft, {
+						Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center,
+					})
+				end
+			end,
+		})
+	end
+
+	-- System Settings: wallpaper and about
+	appBuilders.settings = function()
+		local sidebarWidth = 210
+		openWindow({
+			app = "settings", title = "Wallpaper", width = 720, height = 470,
+			sidebarWidth = sidebarWidth, titleLeft = sidebarWidth + 32,
+			build = function(win)
+				-- Account card
+				local avatar = macNew("ImageLabel", {
+					BackgroundColor3 = Color3.fromRGB(190, 196, 206), Image = assets.avatar or "",
+					Position = UDim2.fromOffset(12, 50), Size = UDim2.fromOffset(38, 38), Parent = win.sidebar,
+				})
+				macCorner(avatar, UDim.new(1, 0))
+				macLabel(win.sidebar, player.DisplayName, 14, Enum.FontWeight.SemiBold, C.ink, {
+					Position = UDim2.fromOffset(58, 50), Size = UDim2.new(1, -66, 0, 20), TextTruncate = Enum.TextTruncate.AtEnd,
+				})
+				macLabel(win.sidebar, "Roblox Account", 12, Enum.FontWeight.Regular, C.inkSoft, {
+					Position = UDim2.fromOffset(58, 70), Size = UDim2.new(1, -66, 0, 16),
+				})
+
+				local panes = {}
+				local paneButtons = {}
+				local currentPane = nil
+				local function showPane(name)
+					if currentPane then
+						currentPane:Destroy()
+					end
+					currentPane = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Parent = win.content})
+					win.setTitle(name)
+					for paneName, button in pairs(paneButtons) do
+						local on = paneName == name
+						button.BackgroundTransparency = if on then 0 else 1
+						button:FindFirstChildOfClass("TextLabel").TextColor3 = if on then white else C.ink
+					end
+					panes[name](currentPane)
+				end
+				local function paneButton(name, icon, top, bottom, order)
+					local button = macButton(win.sidebar, {
+						Position = UDim2.fromOffset(8, 100 + (order - 1) * 32), Size = UDim2.new(1, -16, 0, 30),
+						BackgroundColor3 = C.accent,
+					})
+					macCorner(button, 8)
+					macAppTile(button, {icon = icon, top = top, bottom = bottom}, 22).Position = UDim2.fromOffset(6, 4)
+					macLabel(button, name, 14, Enum.FontWeight.Medium, C.ink, {Position = UDim2.fromOffset(38, 0), Size = UDim2.new(1, -44, 1, 0)})
+					button.MouseButton1Click:Connect(function()
+						showPane(name)
+					end)
+					paneButtons[name] = button
+				end
+
+				panes.Wallpaper = function(pane)
+					macLabel(pane, "Choose the background for your desktop and lock screen.", 14, Enum.FontWeight.Regular, C.inkSoft, {
+						Position = UDim2.fromOffset(16, 0), Size = UDim2.new(1, -32, 0, 20),
+					})
+					local rings = {}
+					local function card(mode, title, x, buildPreview)
+						local holder = macButton(pane, {Position = UDim2.fromOffset(x, 36), Size = UDim2.fromOffset(220, 168)})
+						local preview = macNew("CanvasGroup", {BackgroundColor3 = Color3.new(0, 0, 0), Size = UDim2.fromOffset(220, 138), Parent = holder})
+						macCorner(preview, 12)
+						buildPreview(preview)
+						local ring = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.fromOffset(220, 138), Parent = holder})
+						macCorner(ring, 12)
+						rings[mode] = macStroke(ring, C.accent, 1, 3)
+						macLabel(holder, title, 14, Enum.FontWeight.Medium, C.ink, {
+							Position = UDim2.fromOffset(0, 146), Size = UDim2.new(1, 0, 0, 20), TextXAlignment = Enum.TextXAlignment.Center,
+						})
+						holder.MouseButton1Click:Connect(function()
+							if session.mode ~= mode then
+								session.setBackground(mode, true)
+							end
+						end)
+					end
+					card("wallpaper", "Tahoe", 16, function(preview)
+						buildMacWallpaper(preview, assets.glow, assets.wallpaper, getScale)
+					end)
+					card("scene", "3D Scene", 256, function(preview)
+						macNew("ImageLabel", {
+							BackgroundTransparency = 1, Image = assets.scenePreview or "", ScaleType = Enum.ScaleType.Crop,
+							Size = UDim2.fromScale(1, 1), Parent = preview,
+						})
+					end)
+					local function paint()
+						for mode, stroke in pairs(rings) do
+							stroke.Transparency = if session.mode == mode then 0 else 1
+						end
+					end
+					paint()
+					local stop = session.onBackground(function()
+						task.defer(paint)
+					end)
+					pane.Destroying:Connect(stop)
+				end
+				panes.About = function(pane)
+					local holder = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(16, 8), Size = UDim2.new(1, -32, 1, -8), Parent = pane})
+					buildAbout(holder)
+				end
+
+				paneButton("Wallpaper", I.image, Color3.fromRGB(90, 200, 250), Color3.fromRGB(0, 122, 255), 1)
+				paneButton("About", I.info, Color3.fromRGB(176, 178, 186), Color3.fromRGB(112, 114, 124), 2)
+				showPane("Wallpaper")
+			end,
+		})
+	end
+
+	-- ---------- Background, live glass, clock ----------
+	local stopListening = session.onBackground(function(mode, animate)
+		local shadeTarget = if mode == "scene" then 0 else 1
+		if not root.Visible then
+			shade.BackgroundTransparency = shadeTarget
+			applyDockStyle()
+			return
+		end
+		tween(shade, session.fadeTime, {BackgroundTransparency = shadeTarget}, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
+		if animate then
+			task.wait(session.fadeTime / 2)
+		end
+		applyDockStyle()
+	end)
+
+	RunService:BindToRenderStep("coolui_mac_glass", Enum.RenderPriority.Camera.Value + 5, function()
+		if liveGlass and root.Visible then
+			liveGlass.update(workspace.CurrentCamera)
+		end
+	end)
+
+	task.spawn(function()
+		while alive do
+			clockLabel.Text = DateTime.now():FormatLocalTime("ddd MMM D  h:mm A", "en-us")
+			task.wait(1)
+		end
+	end)
+
+	connect(gui:GetPropertyChangedSignal("AbsoluteSize"), relayout)
+	refreshMenuBar()
+	refreshDock()
+
+	-- Shows the desktop and waits for Lock Screen, Log Out, Restart or Shut
+	-- Down; returns which one
+	function desktop.run()
+		pendingAction = nil
+		root.Visible = true
+		relayout()
+		local hiddenMenu = UDim2.fromOffset(0, -D.menuHeight - 4)
+		local hiddenDock = UDim2.new(0.5, 0, 1, dockHeight + 12)
+		menuBar.Position = hiddenMenu
+		dock.Position = hiddenDock
+		shade.BackgroundTransparency = 1
+		tween(menuBar, 0.55, {Position = UDim2.fromOffset(0, 0)})
+		task.delay(0.08, function()
+			tween(dock, 0.65, {Position = UDim2.new(0.5, 0, 1, -D.dockBottom)})
+		end)
+		tween(shade, 0.6, {BackgroundTransparency = if session.mode == "scene" then 0 else 1})
+		tween(session.wallScale, 0.9, {Scale = 1}, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		for _, win in ipairs(windows) do
+			if not win.minimized then
+				task.spawn(animateWindow, win, TweenInfo.new(0.35, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {scale = 0.97, transparency = 1}, {})
+			end
+		end
+
+		repeat
+			task.wait()
+		until pendingAction or not alive
+
+		local action = pendingAction or "shutdown"
+		closeMenu()
+		tooltip.Visible = false
+		drag = nil
+		local out = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		TweenService:Create(menuBar, out, {Position = hiddenMenu}):Play()
+		TweenService:Create(dock, out, {Position = hiddenDock}):Play()
+		TweenService:Create(shade, out, {BackgroundTransparency = 1}):Play()
+		for _, win in ipairs(windows) do
+			if not win.minimized then
+				task.spawn(animateWindow, win, out, {}, {scale = 0.97, transparency = 1})
+			end
+		end
+		task.wait(0.32)
+		root.Visible = false
+		return action
+	end
+
+	function desktop.closeAllWindows()
+		for i = #windows, 1, -1 do
+			windows[i].close(true)
+		end
+		cascade = 0
+	end
+
+	function desktop.destroy()
+		alive = false
+		desktop.closeAllWindows()
+		stopListening()
+		pcall(function()
+			RunService:UnbindFromRenderStep("coolui_mac_glass")
+		end)
+		for _, connection in ipairs(connections) do
+			connection:Disconnect()
+		end
+		if liveGlass then
+			liveGlass.destroy()
+		end
+		root:Destroy()
+	end
+
+	return desktop
+end
+
+-- Lock screen, then the desktop, until Shut Down
+local function runMacOS(assets)
+	local session = createMacSession(assets)
+	local desktop = nil
+	local boot = true
+	while true do
+		showMacLockScreen(session, boot)
+		boot = false
+		desktop = desktop or createMacDesktop(session)
+		local action = desktop.run()
+		if action == "shutdown" then
+			break
+		elseif action == "restart" then
+			session.fadeCover(0, 0.6)
+			desktop.closeAllWindows()
+			task.wait(1.2)
+			boot = true
+		elseif action == "logout" then
+			desktop.closeAllWindows()
+		end
+	end
+	session.fadeCover(0, 0.7)
+	desktop.destroy()
+	session.gui:Destroy()
 end
 
 -- ---------- Load macOS ----------
--- "Downloading assets" screen (spinner + status text), then the lock screen.
--- Returns once the lock screen is unlocked.
+-- "Downloading assets" screen (spinner + status text), then macOS (lock
+-- screen and desktop). Returns after Shut Down.
 local function runMacOSLoader()
 	stopMusic(1.5)
 
@@ -3061,8 +5640,39 @@ local function runMacOSLoader()
 			end
 			assets.clockFont = true
 		end},
-		{"Status icons", function()
-			ContentProvider:PreloadAsync({MACOS_ICONS.wifi, MACOS_ICONS.battery, MACOS_ICONS.submit, MACOS_ICONS.wallpaper, MACOS_ICONS.scene})
+		{"Dock glass", function()
+			-- Render the Dock's glass now, so the desktop opens instantly
+			local size = ScreenGui.AbsoluteSize
+			local x, y, w, h, radius = macDockRect(size.X, size.Y)
+			local opts = table.clone(MAC_GLASS)
+			opts.cornerRadius = radius
+			bakeMacGlassRim("dock", w, h, opts)
+			if assets.wallpaper or not assets.glow then return end
+			assets.dockGlass = {size = size, id = bakeMacGlass("dock", x, y, w, h, size.X, size.Y, opts)}
+		end},
+		{"3D scene glass", function()
+			-- Read the scene's sky so the Dock can be live glass over it
+			assets.scenePreview = sky.SkyboxFt
+			loadMacSky(sky)
+		end},
+		{"Icons", function()
+			local icons = {}
+			for _, id in pairs(MACOS_ICONS) do
+				table.insert(icons, id)
+			end
+			for _, id in pairs(MAC_DESKTOP_ICONS) do
+				table.insert(icons, id)
+			end
+			-- Don't let one slow icon hold up the loader; they finish in the background
+			local done = false
+			task.spawn(function()
+				pcall(ContentProvider.PreloadAsync, ContentProvider, icons)
+				done = true
+			end)
+			local started = os.clock()
+			repeat
+				task.wait()
+			until done or os.clock() - started > 4
 		end},
 		{"Fonts", function()
 			local probes = {}
@@ -3111,7 +5721,7 @@ local function runMacOSLoader()
 	status:Destroy()
 	detail:Destroy()
 
-	showMacLockScreen(assets)
+	runMacOS(assets)
 end
 
 -- ==========================================
@@ -3456,7 +6066,7 @@ if chosenAction == "load" then
 		platform:Destroy()
 	end
 elseif chosenAction == "macos" then
-	-- Downloading assets, then the lock screen; unlocking leads to the goodbye
+	-- Downloading assets, then macOS; Shut Down leads to the goodbye
 	runMacOSLoader()
 	showGoodbye()
 else
@@ -3501,10 +6111,15 @@ for propName, propValue in pairs(originalLighting) do
 end
 
 for _, v in tempfolder:GetChildren() do
-	if v:IsA("Sky") then
+	if v:IsA("Sky") or v:IsA("Atmosphere") then
 		v.Parent = game.Lighting
 	else
 		v.Parent = workspace
+	end
+end
+for _, effect in disabledEffects do
+	if effect.Parent then
+		effect.Enabled = true
 	end
 end
 
