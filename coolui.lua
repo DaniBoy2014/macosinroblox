@@ -1289,9 +1289,13 @@ local function refreshRankList(animate)
 		-- Pop rows in top to bottom so a refresh is easy to see
 		table.sort(shown, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
 		for i, row in ipairs(shown) do
-			row.popScale.Scale = 0.92
+			local scale = row.popScale
+			scale.Scale = 0.92
 			task.delay((i - 1) * 0.04, function()
-				TweenService:Create(row.popScale, rowPopTweenInfo, {Scale = 1}):Play()
+				-- A newer refresh may have replaced this row already
+				if scale.Parent then
+					TweenService:Create(scale, rowPopTweenInfo, {Scale = 1}):Play()
+				end
 			end)
 		end
 	end
@@ -1421,8 +1425,13 @@ local MACOS_FOLDER = "coolui_assets"
 -- Roboto is the closest Roblox font to Apple's San Francisco
 local MACOS_FONT = "rbxasset://fonts/families/Roboto.json"
 local MACOS_ICONS = {
-	wifi = "rbxassetid://10747382504", -- Lucide "wifi"
-	battery = "rbxassetid://10709774206", -- Lucide "battery-full"
+	wifi = "rbxassetid://103207294085786", -- full signal
+	wifi2 = "rbxassetid://129119142020935", -- 2 bars
+	wifi1 = "rbxassetid://72640587060825", -- 1 bar
+	wifi0 = "rbxassetid://75345813057180", -- no bars
+	wifiOff = "rbxassetid://78076709917160", -- off, or not connected
+	ethernet = "rbxassetid://89943686239470",
+	batteryUnknown = "rbxassetid://114344327318728",
 	submit = "rbxassetid://10709768226", -- Lucide "arrow-right-circle"
 	wallpaper = "rbxassetid://10723415040", -- Lucide "image"
 	scene = "rbxassetid://10734897956", -- Lucide "mountain"
@@ -1450,6 +1459,100 @@ end
 local function macFont(weight)
 	return Font.new(MACOS_FONT, weight)
 end
+
+-- ---------- Wi-Fi and battery status ----------
+-- Roblox can't see the computer's real network or battery. The "Wi-Fi
+-- network" is the game you're in, its signal bars follow your ping to the
+-- server, and the battery shows as unknown. The Wi-Fi switch is just for
+-- show: with it off you're "on Ethernet", since the game is still connected.
+local macNetwork = {wifiOn = true, gameName = nil, listeners = {}}
+task.spawn(function()
+	local ok, info = pcall(function()
+		return game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId)
+	end)
+	macNetwork.gameName = if ok and type(info) == "table" and info.Name and info.Name ~= "" then info.Name else nil
+end)
+
+local function macGameName()
+	return macNetwork.gameName or "Roblox"
+end
+
+-- {wifiOn, connected, ping (ms or nil), bars (0-3)}
+local function macReadNetwork()
+	local connected = true
+	pcall(function()
+		connected = game:GetService("NetworkClient"):FindFirstChildOfClass("ClientReplicator") ~= nil
+	end)
+	local ping = nil
+	local ok, seconds = pcall(function()
+		return player:GetNetworkPing()
+	end)
+	if ok and type(seconds) == "number" then
+		ping = math.round(seconds * 1000)
+	end
+	local bars = 0
+	if ping then
+		bars = if ping <= 120 then 3 elseif ping <= 250 then 2 elseif ping <= 500 then 1 else 0
+	end
+	return {wifiOn = macNetwork.wifiOn, connected = connected, ping = ping, bars = bars}
+end
+
+local function macWifiIcon(state)
+	if not state.wifiOn or not state.connected then
+		return MACOS_ICONS.wifiOff
+	end
+	return ({[0] = MACOS_ICONS.wifi0, MACOS_ICONS.wifi1, MACOS_ICONS.wifi2, MACOS_ICONS.wifi})[state.bars]
+end
+
+-- fn() runs when the Wi-Fi switch changes; returns a function that stops it
+local function macOnNetwork(fn)
+	table.insert(macNetwork.listeners, fn)
+	return function()
+		local i = table.find(macNetwork.listeners, fn)
+		if i then
+			table.remove(macNetwork.listeners, i)
+		end
+	end
+end
+
+local function macSetWifi(on)
+	if macNetwork.wifiOn == on then
+		return
+	end
+	macNetwork.wifiOn = on
+	for _, fn in ipairs(table.clone(macNetwork.listeners)) do
+		task.spawn(fn)
+	end
+end
+
+-- The Wi-Fi icon, filling `holder`: the lit bars over a faint full icon, so
+-- unlit bars show greyed out like on a Mac. set(state, showEthernet) updates
+-- it; with showEthernet, Wi-Fi off but still connected shows Ethernet.
+local function macWifiGlyph(holder, color)
+	local back = Instance.new("ImageLabel")
+	back.BackgroundTransparency = 1
+	back.Size = UDim2.fromScale(1, 1)
+	back.Image = MACOS_ICONS.wifi
+	back.ImageColor3 = color
+	back.ImageTransparency = 0.68
+	back.Parent = holder
+	local front = back:Clone()
+	front.ImageTransparency = 0
+	front.Parent = holder
+	local glyph = {}
+	function glyph.set(state, showEthernet)
+		local ethernet = showEthernet and not state.wifiOn and state.connected
+		front.Image = if ethernet then MACOS_ICONS.ethernet else macWifiIcon(state)
+		back.Visible = not ethernet and state.wifiOn and state.connected and state.bars < 3
+	end
+	function glyph.setColor(value)
+		back.ImageColor3 = value
+		front.ImageColor3 = value
+	end
+	glyph.set(macReadNetwork())
+	return glyph
+end
+
 
 -- ---------- Soft glow image, generated as a PNG at runtime ----------
 -- Roblox has no radial gradients, so the wallpaper's soft shapes use this
@@ -1796,6 +1899,28 @@ local MAC_TEXT_GLASS = {
 	tint = Color3.new(1, 1, 1), tintAlpha = 0.42,
 	fresnelReach = 0.035, fresnelHardness = 0.4, fresnelIntensity = 0.5,
 	glareReach = 0.055, glareHardness = 0.4, glareIntensity = 0.9,
+	glareConvergence = 0.9, glareOpposite = 0.5, glareAngle = -50,
+}
+-- Glass for the Wi-Fi and battery menus: the Dock's clear glass, with the
+-- lengths scaled down so the rim is about as wide as the Dock's (the menus
+-- are about twice as tall), plus a little more frost behind the text
+local MAC_MENU_GLASS = {
+	thickness = 0.18, refraction = 2.1, aberration = 0.2,
+	frost = 0.05,
+	tint = Color3.new(1, 1, 1), tintAlpha = 0.12,
+	fresnelSize = 0.05, fresnelHardness = 0.4, fresnelIntensity = 0.25,
+	glareSize = 0.1, glareHardness = 0.4, glareIntensity = 0.7,
+	glareConvergence = 0.9, glareOpposite = 0.5, glareAngle = -50,
+}
+-- Over the bright 3D sky clear glass all but disappears, so there the menus
+-- use the frosted glass macOS gives its menus: a light tint, more blur, and
+-- dark text
+local MAC_MENU_FROSTED_GLASS = {
+	thickness = 0.18, refraction = 2.1, aberration = 0.2,
+	frost = 0.1,
+	tint = Color3.fromRGB(246, 246, 248), tintAlpha = 0.55,
+	fresnelSize = 0.05, fresnelHardness = 0.4, fresnelIntensity = 0.3,
+	glareSize = 0.1, glareHardness = 0.4, glareIntensity = 0.6,
 	glareConvergence = 0.9, glareOpposite = 0.5, glareAngle = -50,
 }
 local MAC_GLASS_DISPLACEMENT = 0.05 * math.sqrt(2) * 1000 -- px per unit of bend
@@ -2697,18 +2822,30 @@ local function showMacLockScreen(session, boot)
 	inputSource.TextColor3 = Color3.new(1, 1, 1)
 	inputSource.LayoutOrder = 1
 	inputSource.Parent = statusBar
-	local function statusIcon(image, order)
-		local icon = Instance.new("ImageLabel")
-		icon.BackgroundTransparency = 1
-		icon.Image = image
-		icon.ImageColor3 = Color3.new(1, 1, 1)
-		icon.Size = UDim2.fromScale(1, 1)
-		icon.SizeConstraint = Enum.SizeConstraint.RelativeYY
-		icon.LayoutOrder = order
-		icon.Parent = statusBar
-	end
-	statusIcon(MACOS_ICONS.wifi, 2)
-	statusIcon(MACOS_ICONS.battery, 3)
+	local wifiHolder = Instance.new("Frame")
+	wifiHolder.BackgroundTransparency = 1
+	wifiHolder.Size = UDim2.fromScale(0.78, 0.78)
+	wifiHolder.SizeConstraint = Enum.SizeConstraint.RelativeYY
+	wifiHolder.LayoutOrder = 2
+	wifiHolder.Parent = statusBar
+	local wifiGlyph = macWifiGlyph(wifiHolder, Color3.new(1, 1, 1))
+	-- Roblox can't read the battery, so it's always the "unknown" battery
+	local battery = Instance.new("ImageLabel")
+	battery.BackgroundTransparency = 1
+	battery.Image = MACOS_ICONS.batteryUnknown
+	battery.ImageColor3 = Color3.new(1, 1, 1)
+	battery.Size = UDim2.fromScale(1.1, 1.1)
+	battery.SizeConstraint = Enum.SizeConstraint.RelativeYY
+	battery.LayoutOrder = 3
+	battery.Parent = statusBar
+	task.spawn(function()
+		while alive do
+			task.wait(1)
+			if alive then
+				wifiGlyph.set(macReadNetwork())
+			end
+		end
+	end)
 	local function layoutStatus()
 		inputSource.TextSize = math.max(10, math.floor(gui.AbsoluteSize.Y * 0.016))
 	end
@@ -3111,7 +3248,7 @@ local function showMacLockScreen(session, boot)
 	TweenService:Create(switchIcon, lift, {ImageTransparency = 1}):Play()
 	TweenService:Create(switchLabel, lift, {TextTransparency = 1}):Play()
 	-- The status icons fade too; the desktop's menu bar brings its own
-	for _, item in ipairs(statusBar:GetChildren()) do
+	for _, item in ipairs(statusBar:GetDescendants()) do
 		if item:IsA("TextLabel") then
 			TweenService:Create(item, lift, {TextTransparency = 1}):Play()
 		elseif item:IsA("ImageLabel") then
@@ -3168,7 +3305,7 @@ local MAC_DESKTOP_ICONS = {
 	check = "rbxassetid://10709790644",
 	info = "rbxassetid://10723415903",
 	wifi = MACOS_ICONS.wifi,
-	battery = MACOS_ICONS.battery,
+	battery = "rbxassetid://10709774206", -- Lucide "battery-full" (the Battery settings icon)
 }
 
 local MAC_COLORS = {
@@ -3285,6 +3422,37 @@ local function macAppTile(parent, app, size)
 		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
 	})
 	return tile
+end
+
+-- A macOS switch; onChange(on) runs when it's clicked
+local function macToggle(parent, on, onChange)
+	local offColor = Color3.fromRGB(214, 214, 220)
+	local track = macButton(parent, {
+		Size = UDim2.fromOffset(34, 20), BackgroundTransparency = 0,
+		BackgroundColor3 = if on then MAC_COLORS.accent else offColor,
+	})
+	macCorner(track, UDim.new(1, 0))
+	local knob = macNew("Frame", {
+		BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, if on then 16 else 2, 0.5, 0), Size = UDim2.fromOffset(16, 16), Parent = track,
+	})
+	macCorner(knob, UDim.new(1, 0))
+	macStroke(knob, Color3.new(0, 0, 0), 0.9, 1)
+	local toggle = {button = track, on = on}
+	function toggle.set(value)
+		if value == toggle.on then
+			return
+		end
+		toggle.on = value
+		local info = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		TweenService:Create(track, info, {BackgroundColor3 = if value then MAC_COLORS.accent else offColor}):Play()
+		TweenService:Create(knob, info, {Position = UDim2.new(0, if value then 16 else 2, 0.5, 0)}):Play()
+	end
+	track.MouseButton1Click:Connect(function()
+		toggle.set(not toggle.on)
+		onChange(toggle.on)
+	end)
+	return toggle
 end
 
 -- ---------- Live glass on the 3D scene ----------
@@ -3521,6 +3689,15 @@ local function createMacLiveGlass(target, opts)
 		end
 	end
 
+	-- Where the glass is on screen. AbsolutePosition is measured from below
+	-- Roblox's top bar, but the camera's viewport starts at the very top, so
+	-- go by the ScreenGui's origin (which sits at -inset when it ignores the
+	-- inset)
+	local function screenPosition()
+		local screenGui = target:FindFirstAncestorOfClass("ScreenGui")
+		return if screenGui then target.AbsolutePosition - screenGui.AbsolutePosition else target.AbsolutePosition
+	end
+
 	local function render(camera)
 		local m = model
 		local cf = camera.CFrame
@@ -3531,7 +3708,7 @@ local function createMacLiveGlass(target, opts)
 		local lx, ly, lz = look.X, look.Y, look.Z
 		local rx, ry, rz = right.X, right.Y, right.Z
 		local ux, uy, uz = up.X, up.Y, up.Z
-		local origin = target.AbsolutePosition
+		local origin = screenPosition()
 		local x0, y0 = origin.X - m.margin, origin.Y - m.margin
 		local sky, step, gw = macSky, m.step, m.gw
 		-- The sky behind each grid point, from the camera ray through it
@@ -3583,7 +3760,7 @@ local function createMacLiveGlass(target, opts)
 		end
 		local look = camera.CFrame.LookVector
 		local fov = camera.FieldOfView
-		local origin = target.AbsolutePosition
+		local origin = screenPosition()
 		local now = os.clock()
 		if not dirty and lastLook then
 			if now - lastRender < 1 / MAC_LIVE_GLASS.maxRate then
@@ -3822,8 +3999,14 @@ local function createMacDesktop(session)
 	local function workArea()
 		return 10, D.menuHeight + 8, screenW - 20, dockTop() - D.menuHeight - 18
 	end
+	-- Where an object is on screen, in pixels from the very top. Its
+	-- AbsolutePosition is measured from below Roblox's top bar, which this
+	-- gui covers (it ignores the inset), as does the mouse location.
+	local function screenPos(object)
+		return object.AbsolutePosition - gui.AbsolutePosition
+	end
 	local function pointIn(object, point)
-		local p, size = object.AbsolutePosition, object.AbsoluteSize
+		local p, size = screenPos(object), object.AbsoluteSize
 		return point.X >= p.X and point.Y >= p.Y and point.X <= p.X + size.X and point.Y <= p.Y + size.Y
 	end
 
@@ -4238,67 +4421,96 @@ local function createMacDesktop(session)
 		openMenu = nil
 	end
 
-	-- items: list of {text, action (nil = greyed out), checked = bool} or "-"
-	local function showMenu(button, items)
+	-- Opens an empty dropdown under a menu bar item. Returns the frame its
+	-- rows go in (they stack top to bottom) and the dropdown itself.
+	local function openPanel(button, width, radius)
 		closeMenu()
 		local catcher = macButton(overlay, {Size = UDim2.fromScale(1, 1), ZIndex = 1})
 		catcher.MouseButton1Down:Connect(closeMenu)
-		local x = math.min(button.AbsolutePosition.X / s - 4, screenW - 266)
+		local x = math.max(6, math.min(button.AbsolutePosition.X / s - 4, screenW - width - 6))
 		local panel = macNew("Frame", {
 			BackgroundColor3 = C.menu, BackgroundTransparency = 0.04, BorderSizePixel = 0,
-			Position = UDim2.fromOffset(x, D.menuHeight + 3), Size = UDim2.fromOffset(260, 0),
-			AutomaticSize = Enum.AutomaticSize.Y, ZIndex = 2, Parent = overlay,
+			Position = UDim2.fromOffset(x, D.menuHeight + 3), Size = UDim2.fromOffset(width, 0),
+			AutomaticSize = Enum.AutomaticSize.Y, ZIndex = 2, Active = true, Parent = overlay,
 		})
-		macCorner(panel, 11)
+		macCorner(panel, radius or 11)
 		macStroke(panel, Color3.new(0, 0, 0), 0.86, 1)
+		local rows = macNew("Frame", {
+			Name = "Rows", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 0), AutomaticSize = Enum.AutomaticSize.Y,
+			ZIndex = 3, Parent = panel,
+		})
 		macNew("UIPadding", {
 			PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5), PaddingLeft = UDim.new(0, 5),
-			PaddingRight = UDim.new(0, 5), Parent = panel,
+			PaddingRight = UDim.new(0, 5), Parent = rows,
 		})
-		macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Parent = panel})
-		for i, item in ipairs(items) do
-			if item == "-" then
-				local separator = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 11), LayoutOrder = i, Parent = panel})
-				macNew("Frame", {
-					BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.88, BorderSizePixel = 0,
-					AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(1, -18, 0, 1), Parent = separator,
-				})
-			else
-				local action = item[2]
-				local row = macButton(panel, {Size = UDim2.new(1, 0, 0, 26), LayoutOrder = i, BackgroundColor3 = C.accent, ZIndex = 3})
-				macCorner(row, 6)
-				local text = macLabel(row, item[1], 14, Enum.FontWeight.Regular, C.ink, {
-					Position = UDim2.fromOffset(26, 0), Size = UDim2.new(1, -32, 1, 0), ZIndex = 4,
-					TextTransparency = if action then 0 else 0.6, TextTruncate = Enum.TextTruncate.AtEnd,
-				})
-				local check = nil
-				if item.checked then
-					check = macImage(row, I.check, 14, C.ink, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 7, 0.5, 0), ZIndex = 4})
-				end
-				if action then
-					row.MouseEnter:Connect(function()
-						row.BackgroundTransparency = 0
-						text.TextColor3 = white
-						if check then
-							check.ImageColor3 = white
-						end
-					end)
-					row.MouseLeave:Connect(function()
-						row.BackgroundTransparency = 1
-						text.TextColor3 = C.ink
-						if check then
-							check.ImageColor3 = C.ink
-						end
-					end)
-					row.MouseButton1Click:Connect(function()
-						closeMenu()
-						task.spawn(action)
-					end)
-				end
-			end
-		end
+		macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Parent = rows})
 		button.BackgroundTransparency = 0.72
 		openMenu = {panel = panel, catcher = catcher, button = button}
+		return rows, panel
+	end
+
+	-- Colors for a dropdown's contents: dark on the frosted menus, white on
+	-- the clear glass ones (like the menu bar)
+	local MENU_STYLE = {ink = C.ink, soft = C.inkSoft, softFade = 0, line = Color3.new(0, 0, 0), lineFade = 0.88}
+	local CLEAR_STYLE = {ink = white, soft = white, softFade = 0.3, line = white, lineFade = 0.7}
+
+	local function menuSeparator(parent, order, style)
+		style = style or MENU_STYLE
+		local separator = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 11), LayoutOrder = order, Parent = parent})
+		macNew("Frame", {
+			BackgroundColor3 = style.line, BackgroundTransparency = style.lineFade, BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(1, -18, 0, 1), Parent = separator,
+		})
+	end
+
+	-- item: {text, action (nil = greyed out), checked = bool}. `textLeft`
+	-- leaves room for the check mark (status menus have none).
+	local function menuItem(parent, item, order, textLeft, style)
+		textLeft = textLeft or 26
+		style = style or MENU_STYLE
+		local action = item[2]
+		local row = macButton(parent, {Size = UDim2.new(1, 0, 0, 26), LayoutOrder = order, BackgroundColor3 = C.accent, ZIndex = 3})
+		macCorner(row, 6)
+		local text = macLabel(row, item[1], 14, Enum.FontWeight.Regular, style.ink, {
+			Position = UDim2.fromOffset(textLeft, 0), Size = UDim2.new(1, -textLeft - 6, 1, 0), ZIndex = 4,
+			TextTransparency = if action then 0 else 0.6, TextTruncate = Enum.TextTruncate.AtEnd,
+		})
+		local check = nil
+		if item.checked then
+			check = macImage(row, I.check, 14, style.ink, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 7, 0.5, 0), ZIndex = 4})
+		end
+		if action then
+			row.MouseEnter:Connect(function()
+				row.BackgroundTransparency = 0
+				text.TextColor3 = white
+				if check then
+					check.ImageColor3 = white
+				end
+			end)
+			row.MouseLeave:Connect(function()
+				row.BackgroundTransparency = 1
+				text.TextColor3 = style.ink
+				if check then
+					check.ImageColor3 = style.ink
+				end
+			end)
+			row.MouseButton1Click:Connect(function()
+				closeMenu()
+				task.spawn(action)
+			end)
+		end
+	end
+
+	-- items: list of {text, action (nil = greyed out), checked = bool} or "-"
+	local function showMenu(button, items)
+		local panel = openPanel(button, 260)
+		for i, item in ipairs(items) do
+			if item == "-" then
+				menuSeparator(panel, i)
+			else
+				menuItem(panel, item, i)
+			end
+		end
 	end
 
 	local menuTitles = {}
@@ -4458,22 +4670,305 @@ local function createMacDesktop(session)
 		end
 	end
 
+	-- ---------- Status menus (battery, Wi-Fi) ----------
+	local function panelHeader(parent, title, order, style)
+		local row = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 30), LayoutOrder = order, Parent = parent})
+		macLabel(row, title, 14, Enum.FontWeight.Bold, style.ink, {Position = UDim2.fromOffset(9, 0), Size = UDim2.new(1, -18, 1, 0)})
+		return row
+	end
+
+	-- (12, not 13: at 13 Roblox clips the tail of a final "y")
+	local function panelText(parent, text, order, style, size, weight)
+		local row = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 22), LayoutOrder = order, Parent = parent})
+		return macLabel(row, text, size or 12, weight or Enum.FontWeight.Regular, style.soft, {
+			Position = UDim2.fromOffset(9, 0), Size = UDim2.new(1, -18, 1, 0), TextTransparency = style.softFade,
+		})
+	end
+
+	-- The current network: its icon in a circle (blue while connected), its
+	-- name and status. update() refreshes it.
+	local function panelNetwork(parent, order, style)
+		local row = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 40), LayoutOrder = order, Parent = parent})
+		local circle = macNew("Frame", {
+			BackgroundColor3 = C.accent, BorderSizePixel = 0, Position = UDim2.fromOffset(7, 6), Size = UDim2.fromOffset(28, 28), Parent = row,
+		})
+		macCorner(circle, UDim.new(1, 0))
+		local holder = macNew("Frame", {
+			BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(16, 16), Parent = circle,
+		})
+		local glyph = macWifiGlyph(holder, white)
+		local title = macLabel(row, "", 14, Enum.FontWeight.Medium, style.ink, {
+			Position = UDim2.fromOffset(44, 4), Size = UDim2.new(1, -52, 0, 18), TextTruncate = Enum.TextTruncate.AtEnd,
+		})
+		local status = macLabel(row, "", 12, Enum.FontWeight.Regular, style.soft, {
+			Position = UDim2.fromOffset(44, 21), Size = UDim2.new(1, -52, 0, 15), TextTransparency = style.softFade,
+		})
+		local network = {}
+		function network.update()
+			local state = macReadNetwork()
+			glyph.set(state, true)
+			circle.BackgroundColor3 = if state.connected then C.accent else Color3.fromRGB(150, 150, 158)
+			title.Text = if state.wifiOn then macGameName() else "Ethernet"
+			status.Text = if not state.connected then "Not Connected"
+				elseif state.ping then "Connected · " .. state.ping .. " ms"
+				else "Connected"
+		end
+		network.update()
+		return network
+	end
+
+	-- Clear Liquid Glass behind a status menu, like the Dock: rendered against
+	-- the wallpaper (cached per size and place, so only the very first opening
+	-- renders it) or drawn live over the 3D scene. Returns the colors for the
+	-- menu's contents: white on the glass, dark on the frosted menu used when
+	-- there's no glass (a custom wallpaper image).
+	local STATUS_RADIUS = 14
+	local STATUS_HEIGHT = 150 -- about how tall the status menus are, in points
+	local menuGlass = nil -- the open status menu's live glass
+
+	-- How see-through (0-1) the shade under the menu bar is, `y` points from
+	-- the top of the screen
+	local function shadeAt(y)
+		local f = math.clamp(y / shade.Size.Y.Offset, 0, 1)
+		local points = shade:FindFirstChildOfClass("UIGradient").Transparency.Keypoints
+		for i = 1, #points - 1 do
+			local a, b = points[i], points[i + 1]
+			if f <= b.Time then
+				return a.Value + (b.Value - a.Value) * (f - a.Time) / (b.Time - a.Time)
+			end
+		end
+		return points[#points].Value
+	end
+
+	-- How bright (0-1) the backdrop is behind a rect (pixels from the top of
+	-- the screen). Clear glass over something bright gets dark text, like on
+	-- a Mac, since white text would vanish into a bright sky.
+	local function backdropBrightness(x, y, w, h)
+		local camera = workspace.CurrentCamera
+		local sample = if session.mode == "wallpaper" then macSamplerFor(gui.AbsoluteSize.X, gui.AbsoluteSize.Y) else nil
+		local total, count = 0, 0
+		for j = 0, 4 do
+			for i = 0, 6 do
+				local px, py = x + w * (i + 0.5) / 7, y + h * (j + 0.5) / 5
+				local r, g, b
+				if sample then
+					r, g, b = sample(px, py)
+				else
+					-- The 3D sky, darkened by the shade under the menu bar
+					local d = camera:ViewportPointToRay(px, py).Direction
+					local dim = shadeAt(py / s) / 255
+					r, g, b = macSkyColor(macSky, d.X, d.Y, d.Z)
+					r, g, b = r * dim, g * dim, b * dim
+				end
+				total += r * 0.299 + g * 0.587 + b * 0.114
+				count += 1
+			end
+		end
+		return total / count
+	end
+
+	local function addMenuGlass(panel, name)
+		local baked = session.mode == "wallpaper" and not assets.wallpaper and assets.glow ~= nil
+		local live = session.mode == "scene" and macSky ~= nil
+		if not baked and not live then
+			return MENU_STYLE
+		end
+		-- Over the 3D scene: frosted glass (always dark text) with a faint
+		-- outline against the bright sky. On the wallpaper: clear glass.
+		local bright = live
+		if not live then
+			pcall(function()
+				bright = backdropBrightness(panel.Position.X.Offset * s, panel.Position.Y.Offset * s, panel.Size.X.Offset * s, STATUS_HEIGHT * s) > 0.6
+			end)
+		end
+		local stroke = panel:FindFirstChildOfClass("UIStroke")
+		panel.BackgroundTransparency = 1
+		stroke.Transparency = if live then 0.9 else 1
+		task.spawn(function()
+			RunService.RenderStepped:Wait() -- let the menu size itself first
+			if not panel.Parent then
+				return
+			end
+			local layers = {}
+			local ok, err = pcall(function()
+				-- AbsolutePosition starts below the top bar; the wallpaper starts at the top
+				local pos, size = panel.AbsolutePosition - gui.AbsolutePosition, panel.AbsoluteSize
+				local opts = table.clone(if live then MAC_MENU_FROSTED_GLASS else MAC_MENU_GLASS)
+				opts.cornerRadius = STATUS_RADIUS * s
+				local pane = macNew("ImageLabel", {BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ImageTransparency = 1, ZIndex = 1, Parent = panel})
+				macCorner(pane, STATUS_RADIUS)
+				table.insert(layers, {pane, "ImageTransparency", 0})
+				if baked then
+					local screen = gui.AbsoluteSize
+					pane.Image = bakeMacGlass("clearmenu_" .. name, pos.X, pos.Y, size.X, size.Y, screen.X, screen.Y, opts)
+				else
+					local tint = macNew("Frame", {
+						BackgroundColor3 = opts.tint, BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1),
+						ZIndex = 2, Parent = panel,
+					})
+					macCorner(tint, STATUS_RADIUS)
+					local rim = macNew("ImageLabel", {
+						BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ImageTransparency = 1, ZIndex = 2,
+						Image = bakeMacGlassRim("frostedmenu", size.X, size.Y, opts), Parent = panel,
+					})
+					table.insert(layers, {tint, "BackgroundTransparency", 1 - opts.tintAlpha})
+					table.insert(layers, {rim, "ImageTransparency", 0})
+					-- The live glass draws the bare sky, but behind the menu the
+					-- sky is darkened by the shade under the menu bar: copy the
+					-- part of that shade the menu covers
+					local top, height = panel.Position.Y.Offset, size.Y / s
+					local keypoints = {}
+					for i = 0, 10 do
+						table.insert(keypoints, NumberSequenceKeypoint.new(i / 10, shadeAt(top + height * i / 10)))
+					end
+					local shadeCopy = macNew("Frame", {
+						BackgroundColor3 = shade.BackgroundColor3, BackgroundTransparency = 1, BorderSizePixel = 0,
+						Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = panel,
+					})
+					macCorner(shadeCopy, STATUS_RADIUS)
+					macNew("UIGradient", {Rotation = 90, Transparency = NumberSequence.new(keypoints), Parent = shadeCopy})
+					table.insert(layers, {shadeCopy, "BackgroundTransparency", shade.BackgroundTransparency})
+					local glass = createMacLiveGlass(pane, opts)
+					glass.enabled = true
+					glass.update(workspace.CurrentCamera)
+					menuGlass = glass
+					panel.Destroying:Connect(function()
+						glass.destroy()
+						if menuGlass == glass then
+							menuGlass = nil
+						end
+					end)
+				end
+				local images = {}
+				for _, layer in ipairs(layers) do
+					table.insert(images, layer[1])
+				end
+				ContentProvider:PreloadAsync(images)
+			end)
+			if not panel.Parent then
+				return
+			end
+			if not ok then
+				-- A frosted fill behind the text instead (dark under white text)
+				warn("[coolui] menu glass failed: " .. tostring(err))
+				panel.BackgroundColor3 = if bright then C.menu else Color3.fromRGB(44, 44, 50)
+				panel.BackgroundTransparency = if bright then 0.04 else 0.15
+				return
+			end
+			for _, layer in ipairs(layers) do
+				tween(layer[1], 0.12, {[layer[2]] = layer[3]}, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			end
+		end)
+		return if bright then MENU_STYLE else CLEAR_STYLE
+	end
+
+	local function showWifiMenu(button)
+		local panel, frame = openPanel(button, 290, STATUS_RADIUS)
+		local style = addMenuGlass(frame, "wifi")
+		local header = panelHeader(panel, "Wi-Fi", 1, style)
+		local toggle = macToggle(header, macNetwork.wifiOn, macSetWifi)
+		toggle.button.AnchorPoint = Vector2.new(1, 0.5)
+		toggle.button.Position = UDim2.new(1, -8, 0.5, 0)
+		local body, network = nil, nil
+		local function fill()
+			if body then
+				body:Destroy()
+			end
+			toggle.set(macNetwork.wifiOn)
+			body = macNew("Frame", {
+				BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.Y, Size = UDim2.fromScale(1, 0),
+				LayoutOrder = 2, Parent = panel,
+			})
+			macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Parent = body})
+			menuSeparator(body, 1, style)
+			-- With Wi-Fi off the game is still connected, so it must be wired
+			panelText(body, if macNetwork.wifiOn then "Known Network" else "Other Connections", 2, style, 12, Enum.FontWeight.SemiBold)
+			network = panelNetwork(body, 3, style)
+			menuSeparator(body, 4, style)
+			menuItem(body, {"Wi-Fi Settings…", function()
+				openApp("settings", {pane = "Wi-Fi"})
+			end}, 5, 9, style)
+		end
+		fill()
+		panel.Destroying:Connect(macOnNetwork(function()
+			if panel.Parent then
+				fill()
+			end
+		end))
+		task.spawn(function()
+			while panel.Parent do
+				task.wait(1)
+				if panel.Parent then
+					network.update()
+				end
+			end
+		end)
+	end
+
+	local function showBatteryMenu(button)
+		local panel, frame = openPanel(button, 290, STATUS_RADIUS)
+		local style = addMenuGlass(frame, "battery")
+		local header = panelHeader(panel, "Battery", 1, style)
+		macLabel(header, "Unknown", 14, Enum.FontWeight.Regular, style.soft, {
+			AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -9, 0, 0), Size = UDim2.new(0.5, 0, 1, 0),
+			TextXAlignment = Enum.TextXAlignment.Right, TextTransparency = style.softFade,
+		})
+		-- (a gap under the header: right below it Roblox cut off the line's top)
+		macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 6), LayoutOrder = 2, Parent = panel})
+		panelText(panel, "Power Source: Unknown", 3, style)
+		menuSeparator(panel, 4, style)
+		panelText(panel, "No Apps Using Significant Energy", 5, style)
+		menuSeparator(panel, 6, style)
+		menuItem(panel, {"Battery Settings…", function()
+			openApp("settings", {pane = "Battery"})
+		end}, 7, 9, style)
+	end
+
 	-- Right side: battery, Wi-Fi, Spotlight, date and time
 	local menuRight = macNew("Frame", {
-		BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -16, 0, 0),
+		BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 0),
 		Size = UDim2.new(0.4, 0, 1, 0), Parent = menuBar,
 	})
 	macNew("UIListLayout", {
 		FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Right,
 		VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder,
-		Padding = UDim.new(0, 18), Parent = menuRight,
+		Padding = UDim.new(0, 4), Parent = menuRight,
 	})
-	macImage(menuRight, I.battery, 19, white, {LayoutOrder = 1})
-	macImage(menuRight, I.wifi, 16, white, {LayoutOrder = 2})
-	macImage(menuRight, I.search, 15, white, {LayoutOrder = 3})
+	local function statusItem(width, order, open)
+		local button = macButton(menuRight, {Size = UDim2.fromOffset(width, 24), BackgroundColor3 = white, LayoutOrder = order})
+		macCorner(button, 6)
+		button.MouseButton1Down:Connect(function()
+			if openMenu and openMenu.button == button then
+				closeMenu()
+			else
+				open(button)
+			end
+		end)
+		button.MouseEnter:Connect(function()
+			if openMenu and openMenu.button ~= button then
+				open(button)
+			end
+		end)
+		return button
+	end
+	local batteryButton = statusItem(40, 1, showBatteryMenu)
+	macImage(batteryButton, MACOS_ICONS.batteryUnknown, 22, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
+	local wifiButton = statusItem(32, 2, showWifiMenu)
+	local menuWifi = macWifiGlyph(macNew("Frame", {
+		BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(16, 16), Parent = wifiButton,
+	}), white)
+	local searchHolder = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.fromOffset(31, 24), LayoutOrder = 3, Parent = menuRight})
+	macImage(searchHolder, I.search, 15, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
 	local clockLabel = macLabel(menuRight, "", 14, Enum.FontWeight.Medium, white, {
 		AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 20), LayoutOrder = 4,
 	})
+	macNew("UIPadding", {PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = clockLabel})
+	local function refreshStatus()
+		menuWifi.set(macReadNetwork())
+	end
+	local stopNetwork = macOnNetwork(refreshStatus)
 
 	-- ---------- Dock ----------
 	dock = macNew("Frame", {
@@ -4597,7 +5092,7 @@ local function createMacDesktop(session)
 	local dockItems = {}
 	function dockIconCenter(appId)
 		local item = dockItems[appId] or dockItems.finder
-		local p, size = item.button.AbsolutePosition, item.button.AbsoluteSize
+		local p, size = screenPos(item.button), item.button.AbsoluteSize
 		return Vector2.new((p.X + size.X / 2) / s, (p.Y + size.Y / 2) / s)
 	end
 
@@ -4706,6 +5201,9 @@ local function createMacDesktop(session)
 			local win = existing[#existing]
 			if args.path and win.openPath then
 				win.openPath(args.path)
+			end
+			if args.pane and win.showPane then
+				win.showPane(args.pane)
 			end
 			return
 		end
@@ -5493,11 +5991,13 @@ local function createMacDesktop(session)
 		})
 	end
 
-	-- System Settings: wallpaper and about
-	appBuilders.settings = function()
+	-- System Settings: Wi-Fi, battery, wallpaper and about. args.pane picks
+	-- the pane it opens on.
+	appBuilders.settings = function(args)
 		local sidebarWidth = 210
+		local firstPane = args.pane or "Wallpaper"
 		openWindow({
-			app = "settings", title = "Wallpaper", width = 720, height = 470,
+			app = "settings", title = firstPane, width = 720, height = 470,
 			sidebarWidth = sidebarWidth, titleLeft = sidebarWidth + 32,
 			build = function(win)
 				-- Account card
@@ -5590,9 +6090,117 @@ local function createMacDesktop(session)
 					buildAbout(holder)
 				end
 
-				paneButton("Wallpaper", I.image, Color3.fromRGB(90, 200, 250), Color3.fromRGB(0, 122, 255), 1)
-				paneButton("About", I.info, Color3.fromRGB(176, 178, 186), Color3.fromRGB(112, 114, 124), 2)
-				showPane("Wallpaper")
+				-- A rounded white group of `count` rows, like the real System
+				-- Settings; returns the row frames
+				local function group(pane, y, count)
+					local box = macNew("Frame", {
+						BackgroundColor3 = white, BorderSizePixel = 0, Position = UDim2.fromOffset(16, y),
+						Size = UDim2.new(1, -32, 0, count * 40), Parent = pane,
+					})
+					macCorner(box, 10)
+					macStroke(box, Color3.new(0, 0, 0), 0.92, 1)
+					local rows = {}
+					for i = 1, count do
+						rows[i] = macNew("Frame", {
+							BackgroundTransparency = 1, Position = UDim2.fromOffset(0, (i - 1) * 40), Size = UDim2.new(1, 0, 0, 40), Parent = box,
+						})
+						if i < count then
+							macNew("Frame", {
+								BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.92, BorderSizePixel = 0,
+								AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 14, 1, 0), Size = UDim2.new(1, -28, 0, 1), Parent = rows[i],
+							})
+						end
+					end
+					return rows
+				end
+				-- A label on the left and a grey value on the right; returns the value
+				local function valueRow(row, label, value)
+					macLabel(row, label, 14, Enum.FontWeight.Regular, C.ink, {Position = UDim2.fromOffset(14, 0), Size = UDim2.new(0.5, -14, 1, 0)})
+					return macLabel(row, value, 14, Enum.FontWeight.Regular, C.inkSoft, {
+						AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -14, 0, 0), Size = UDim2.new(0.5, -14, 1, 0),
+						TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd,
+					})
+				end
+				local function caption(pane, text, y)
+					macLabel(pane, text, 13, Enum.FontWeight.SemiBold, C.ink, {Position = UDim2.fromOffset(20, y), Size = UDim2.new(1, -40, 0, 18)})
+				end
+
+				panes["Wi-Fi"] = function(pane)
+					local top = group(pane, 0, 1)[1]
+					macAppTile(top, {icon = MACOS_ICONS.wifi, top = Color3.fromRGB(90, 170, 255), bottom = Color3.fromRGB(0, 110, 245)}, 26).Position = UDim2.fromOffset(10, 7)
+					macLabel(top, "Wi-Fi", 14, Enum.FontWeight.Medium, C.ink, {Position = UDim2.fromOffset(46, 0), Size = UDim2.new(1, -110, 1, 0)})
+					local toggle = macToggle(top, macNetwork.wifiOn, macSetWifi)
+					toggle.button.AnchorPoint = Vector2.new(1, 0.5)
+					toggle.button.Position = UDim2.new(1, -14, 0.5, 0)
+
+					local current = group(pane, 56, 1)[1]
+					local glyph = macWifiGlyph(macNew("Frame", {
+						BackgroundTransparency = 1, Position = UDim2.fromOffset(16, 11), Size = UDim2.fromOffset(18, 18), Parent = current,
+					}), C.ink)
+					local name = macLabel(current, "", 14, Enum.FontWeight.Medium, C.ink, {
+						Position = UDim2.fromOffset(46, 0), Size = UDim2.new(1, -170, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+					})
+					local dot = macNew("Frame", {
+						BorderSizePixel = 0, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -112, 0.5, 0),
+						Size = UDim2.fromOffset(8, 8), Parent = current,
+					})
+					macCorner(dot, UDim.new(1, 0))
+					local status = macLabel(current, "", 14, Enum.FontWeight.Regular, C.inkSoft, {
+						AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -14, 0, 0), Size = UDim2.fromOffset(94, 40),
+					})
+
+					caption(pane, "Details", 114)
+					local rows = group(pane, 138, 4)
+					local ping = valueRow(rows[1], "Ping", "")
+					local signal = valueRow(rows[2], "Signal", "")
+					local server = valueRow(rows[3], "Server", if game.JobId ~= "" then game.JobId:sub(1, 8) else "Local")
+					local players = valueRow(rows[4], "Players", "")
+
+					local function paint()
+						local state = macReadNetwork()
+						toggle.set(state.wifiOn)
+						glyph.set(state, true)
+						name.Text = if state.wifiOn then macGameName() else "Ethernet"
+						dot.BackgroundColor3 = if state.connected then Color3.fromRGB(52, 199, 89) else Color3.fromRGB(190, 190, 196)
+						status.Text = if state.connected then "Connected" else "Not Connected"
+						ping.Text = if state.ping and state.connected then state.ping .. " ms" else "—"
+						signal.Text = if not state.connected then "None"
+							else ({[0] = "Poor", "Fair", "Good", "Excellent"})[state.bars]
+						players.Text = #Players:GetPlayers() .. " of " .. Players.MaxPlayers
+					end
+					paint()
+					pane.Destroying:Connect(macOnNetwork(paint))
+					task.spawn(function()
+						while pane.Parent do
+							task.wait(1)
+							if pane.Parent then
+								paint()
+							end
+						end
+					end)
+				end
+
+				panes.Battery = function(pane)
+					local rows = group(pane, 0, 3)
+					valueRow(rows[1], "Battery Level", "Unknown")
+					valueRow(rows[2], "Power Source", "Unknown")
+					valueRow(rows[3], "Battery Health", "Unknown")
+					macLabel(pane, "Roblox doesn't let games read your battery, so its level and power source can't be shown.", 13, Enum.FontWeight.Regular, C.inkSoft, {
+						Position = UDim2.fromOffset(20, 130), Size = UDim2.new(1, -40, 0, 36), TextWrapped = true,
+						TextYAlignment = Enum.TextYAlignment.Top,
+					})
+				end
+
+				paneButton("Wi-Fi", MACOS_ICONS.wifi, Color3.fromRGB(90, 170, 255), Color3.fromRGB(0, 110, 245), 1)
+				paneButton("Battery", I.battery, Color3.fromRGB(120, 220, 120), Color3.fromRGB(40, 175, 70), 2)
+				paneButton("Wallpaper", I.image, Color3.fromRGB(90, 200, 250), Color3.fromRGB(0, 122, 255), 3)
+				paneButton("About", I.info, Color3.fromRGB(176, 178, 186), Color3.fromRGB(112, 114, 124), 4)
+				win.showPane = function(name)
+					if panes[name] then
+						showPane(name)
+					end
+				end
+				showPane(if panes[firstPane] then firstPane else "Wallpaper")
 			end,
 		})
 	end
@@ -5613,11 +6221,15 @@ local function createMacDesktop(session)
 		if liveGlass and root.Visible then
 			liveGlass.update(workspace.CurrentCamera)
 		end
+		if menuGlass and root.Visible then
+			menuGlass.update(workspace.CurrentCamera)
+		end
 	end)
 
 	task.spawn(function()
 		while alive do
 			clockLabel.Text = DateTime.now():FormatLocalTime("ddd MMM D  h:mm A", "en-us")
+			refreshStatus()
 			task.wait(1)
 		end
 	end)
@@ -5682,6 +6294,7 @@ local function createMacDesktop(session)
 		alive = false
 		desktop.closeAllWindows()
 		stopListening()
+		stopNetwork()
 		pcall(function()
 			RunService:UnbindFromRenderStep("coolui_mac_glass")
 		end)

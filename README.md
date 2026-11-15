@@ -6,6 +6,9 @@ screen with Liquid Glass, then a desktop:
 
 - a menu bar with the Apple menu (About This Mac, System Settings, Restart,
   Shut Down, Lock Screen, Log Out) and per-app menus
+- Wi-Fi and battery menus in Liquid Glass: the "network" is the game you're
+  in, its signal bars follow your ping, and the battery shows as unknown
+  (Roblox can't read it)
 - a Liquid Glass Dock; over the live 3D scene the glass is redrawn as the
   camera moves
 - windows you can drag, zoom, minimize to the Dock and close
