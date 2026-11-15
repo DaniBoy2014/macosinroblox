@@ -186,6 +186,18 @@ end)
 -- ==========================================
 rootPart.Anchored = true
 
+-- Anti-AFK: Roblox kicks after 20 minutes without input, which would end
+-- macOS for anyone who leaves it open. Whenever Roblox reports the player
+-- idle (every 2 minutes or so), a virtual right click resets the timer.
+-- It's switched off again when the script ends.
+local antiAfk = player.Idled:Connect(function()
+	pcall(function()
+		local VirtualUser = game:GetService("VirtualUser")
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.zero)
+	end)
+end)
+
 local tempfolder = Instance.new("Folder")
 tempfolder.Name = "Temp"
 tempfolder.Parent = game.ReplicatedStorage
@@ -2480,9 +2492,9 @@ local function bakeMacClockGlyph(placement, width, height)
 end
 
 -- ---------- Lock screen ----------
--- Shows the lock screen and yields until it's unlocked.
 -- Shows the lock screen on the session's ScreenGui (see createMacSession) and
--- returns once it's unlocked. `boot`: fade in from black (first start, Restart).
+-- returns once it's unlocked. `boot`: fade in from black (Restart); the first
+-- lock screen fades in out of the loader instead.
 local function showMacLockScreen(session, boot)
 	local gui = session.gui
 	local assets = session.assets
@@ -2553,11 +2565,48 @@ local function showMacLockScreen(session, boot)
 	local glassClockKey = nil
 	local glassDigits = {}
 	-- The glass is rendered against the wallpaper, so over the 3D scene the
-	-- frosted text clock is used instead
-	local function applyClockStyle()
+	-- frosted text clock is used instead. `time`: crossfade the two clocks
+	-- (along with the background) instead of switching at once.
+	local clockFade = 0
+	local function applyClockStyle(time)
 		local useGlass = glassClockOn and backgroundMode == "wallpaper"
-		glassClock.Visible = useGlass
-		clock.Visible = not useGlass
+		clockFade += 1
+		local fadeId = clockFade
+		local function settle()
+			glassClock.Visible = useGlass
+			clock.Visible = not useGlass
+			for _, image in ipairs(glassDigits) do
+				image.ImageTransparency = 0
+			end
+			clock.TextTransparency = 0.06
+			clockRim.Transparency = 0.55
+		end
+		if not time or (glassClock.Visible == useGlass and clock.Visible ~= useGlass) then
+			settle()
+			return
+		end
+		local info = TweenInfo.new(time, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
+		local glassTarget = if useGlass then 0 else 1
+		if useGlass then
+			for _, image in ipairs(glassDigits) do
+				image.ImageTransparency = 1
+			end
+		else
+			clock.TextTransparency = 1
+			clockRim.Transparency = 1
+		end
+		glassClock.Visible = true
+		clock.Visible = true
+		for _, image in ipairs(glassDigits) do
+			TweenService:Create(image, info, {ImageTransparency = glassTarget}):Play()
+		end
+		TweenService:Create(clock, info, {TextTransparency = if useGlass then 1 else 0.06}):Play()
+		TweenService:Create(clockRim, info, {Transparency = if useGlass then 1 else 0.55}):Play()
+		task.delay(time, function()
+			if fadeId == clockFade and alive then
+				settle()
+			end
+		end)
 	end
 	applyClockStyle()
 	local function useTextClock(reason)
@@ -2739,8 +2788,16 @@ local function showMacLockScreen(session, boot)
 		end
 	end
 	bakeFieldGlass()
-	local function applyFieldStyle()
+	-- `time`: crossfade to the new style along with the background
+	local function applyFieldStyle(time)
 		local fill, rim, pane = fieldStyle()
+		if time then
+			local info = TweenInfo.new(time, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
+			TweenService:Create(field, info, {BackgroundTransparency = fill}):Play()
+			TweenService:Create(fieldRim, info, {Transparency = rim}):Play()
+			TweenService:Create(glassPane, info, {ImageTransparency = pane}):Play()
+			return
+		end
 		field.BackgroundTransparency = fill
 		fieldRim.Transparency = rim
 		glassPane.ImageTransparency = pane
@@ -2945,7 +3002,7 @@ local function showMacLockScreen(session, boot)
 	shadeGradient.Parent = sceneShade
 
 	-- The session swaps the wallpaper and the 3D scene; the lock screen restyles
-	-- its clock, password field and shade to match (halfway through a crossfade)
+	-- its clock, password field and shade to match, crossfading along with it
 	local function applyBackground(mode, animate)
 		backgroundMode = mode
 		updateSwitch()
@@ -2957,11 +3014,8 @@ local function showMacLockScreen(session, boot)
 			return
 		end
 		TweenService:Create(sceneShade, TweenInfo.new(session.fadeTime, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {BackgroundTransparency = shadeTransparency}):Play()
-		task.wait(session.fadeTime / 2)
-		if alive then
-			applyClockStyle()
-			applyFieldStyle()
-		end
+		applyClockStyle(session.fadeTime)
+		applyFieldStyle(session.fadeTime)
 	end
 	applyBackground(backgroundMode, false)
 	local stopBackground = session.onBackground(applyBackground)
@@ -2988,10 +3042,37 @@ local function showMacLockScreen(session, boot)
 		end
 	end))
 
-	-- Boot in: fade up from black while the date and clock settle into place
-	if boot then
+	-- Coming in: out of the loader (its backdrop fades away), up from black
+	-- (Restart), or over the desktop's background (Lock Screen, Log Out) -
+	-- while the date and clock settle into place
+	if session.veil then
+		local veil = session.veil
+		session.veil = nil
+		local fade = TweenService:Create(veil, TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {ImageTransparency = 1})
+		fade:Play()
+		fade.Completed:Once(function()
+			veil:Destroy()
+		end)
+	elseif boot then
 		session.cover.BackgroundTransparency = 0
 		TweenService:Create(session.cover, TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {BackgroundTransparency = 1}):Play()
+	else
+		-- The whole lock screen fades in as one layer, then goes back to plain frames
+		local fader = Instance.new("CanvasGroup")
+		fader.BackgroundTransparency = 1
+		fader.Size = UDim2.fromScale(1, 1)
+		fader.ZIndex = ui.ZIndex
+		fader.GroupTransparency = 1
+		fader.Parent = gui
+		ui.Parent = fader
+		local fade = TweenService:Create(fader, TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {GroupTransparency = 0})
+		fade:Play()
+		fade.Completed:Once(function()
+			if ui.Parent == fader then
+				ui.Parent = gui
+			end
+			fader:Destroy()
+		end)
 	end
 	local settle = TweenInfo.new(1.1, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
 	local clockHome, dateHome = clock.Position, dateLabel.Position
@@ -3008,6 +3089,7 @@ local function showMacLockScreen(session, boot)
 
 	-- Unlock: the lock screen lifts away and the wallpaper eases forward; the
 	-- desktop then settles it back as the menu bar and Dock slide in
+	clockFade += 1 -- a clock crossfade still finishing mustn't undo the lift
 	local lift = TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
 	for _, l in ipairs({dateLabel, clock, nameLabel, hint}) do
 		TweenService:Create(l, lift, {TextTransparency = 1, Position = l.Position - UDim2.fromScale(0, 0.03)}):Play()
@@ -3028,6 +3110,14 @@ local function showMacLockScreen(session, boot)
 	TweenService:Create(switchRim, lift, {Transparency = 1}):Play()
 	TweenService:Create(switchIcon, lift, {ImageTransparency = 1}):Play()
 	TweenService:Create(switchLabel, lift, {TextTransparency = 1}):Play()
+	-- The status icons fade too; the desktop's menu bar brings its own
+	for _, item in ipairs(statusBar:GetChildren()) do
+		if item:IsA("TextLabel") then
+			TweenService:Create(item, lift, {TextTransparency = 1}):Play()
+		elseif item:IsA("ImageLabel") then
+			TweenService:Create(item, lift, {ImageTransparency = 1}):Play()
+		end
+	end
 	TweenService:Create(session.wallScale, TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1.03}):Play()
 	task.wait(0.45)
 
@@ -3537,11 +3627,17 @@ local function createMacSession(assets)
 	local listeners = {}
 	session.wall = buildMacWallpaper(gui, assets.glow, assets.wallpaper)
 	session.wallScale = macNew("UIScale", {Parent = session.wall})
-	-- Black cover for booting, restarting and shutting down
+	-- Black cover for restarting
 	session.cover = macNew("Frame", {
 		BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1, ZIndex = 50, Parent = gui,
 	})
+	-- A copy of the loader's opaque backdrop on top, so macOS is built out of
+	-- sight; the first lock screen fades it away, straight out of the loader
+	session.veil = background:Clone()
+	session.veil.ImageTransparency = 0
+	session.veil.ZIndex = 51
+	session.veil.Parent = gui
 
 	-- fn(mode, animate) runs whenever the background changes. When animated,
 	-- the crossfade takes session.fadeTime.
@@ -3777,6 +3873,11 @@ local function createMacDesktop(session)
 		table.insert(windows, win)
 		zCounter += 1
 		win.frame.ZIndex = zCounter
+		-- Mid-animation the window rides in a CanvasGroup, which has to come forward too
+		local group = win.frame.Parent
+		if group and group:IsA("CanvasGroup") then
+			group.ZIndex = zCounter
+		end
 		frontWindow = win
 		setWindowActive(win, true)
 		refreshMenuBar()
@@ -3790,7 +3891,20 @@ local function createMacDesktop(session)
 		local frame = win.frame
 		local pad = D.shadowBlur + 24
 		local size = Vector2.new(frame.Size.X.Offset, frame.Size.Y.Offset)
-		local home = Vector2.new(frame.Position.X.Offset, frame.Position.Y.Offset) + size / 2
+		-- Already animating (closed or minimized while it was still opening):
+		-- carry on from where that animation is, toward the same home spot
+		local current = frame.Parent
+		if current and current:IsA("CanvasGroup") and win.home then
+			local currentScale = current:FindFirstChildOfClass("UIScale")
+			from = {
+				scale = from.scale or (currentScale and currentScale.Scale),
+				transparency = from.transparency or current.GroupTransparency,
+				center = from.center or Vector2.new(current.Position.X.Offset, current.Position.Y.Offset),
+			}
+		else
+			win.home = Vector2.new(frame.Position.X.Offset, frame.Position.Y.Offset) + size / 2
+		end
+		local home = win.home
 		local start = from.center or home
 		local group = macNew("CanvasGroup", {
 			BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
@@ -3809,12 +3923,13 @@ local function createMacDesktop(session)
 		if frame.Parent == group then
 			frame.Parent = windowLayer
 			frame.Position = UDim2.fromOffset(home.X - size.X / 2, home.Y - size.Y / 2)
+			win.home = nil
 		end
 		group:Destroy()
 	end
 
 	-- spec: {app, title, width, height, build(win), background?, dark?,
-	-- sidebarWidth?, titleLeft?, fixedSize?, onClose?}
+	-- sidebarWidth?, titleLeft?, fixedSize?, onClose?, menuName?}
 	local function openWindow(spec)
 		local win = {app = spec.app, minimized = false, zoomed = false, closed = false, active = false, cleanup = {}}
 		local ax, ay, aw, ah = workArea()
@@ -3869,8 +3984,11 @@ local function createMacDesktop(session)
 			titleLabel.Size = UDim2.new(1, -168, 0, D.titleBar)
 			titleLabel.TextXAlignment = Enum.TextXAlignment.Center
 		end
+		-- The Window menu lists windows by title (`menuName` for untitled ones)
+		win.title = if spec.title ~= "" then spec.title else spec.menuName or MAC_APP_NAMES[spec.app] or spec.app
 		function win.setTitle(text)
 			titleLabel.Text = text
+			win.title = text
 		end
 
 		-- Traffic lights: close, minimize, zoom (symbols show on hover)
@@ -3894,10 +4012,12 @@ local function createMacDesktop(session)
 			})
 			lights[i] = {button = light, glyph = glyph, color = def[1], enabled = def[4]}
 		end
+		-- Unlit buttons are grey: light on light windows, dark on dark ones
+		local unlit = if spec.dark then Color3.fromRGB(74, 74, 80) else Color3.fromRGB(206, 206, 210)
 		function win.paintLights()
 			for _, light in ipairs(lights) do
 				local lit = light.enabled and (win.active or hoveringLights)
-				light.button.BackgroundColor3 = if lit then light.color else Color3.fromRGB(206, 206, 210)
+				light.button.BackgroundColor3 = if lit then light.color else unlit
 				light.glyph.ImageTransparency = if hoveringLights and light.enabled then 0.25 else 1
 			end
 		end
@@ -4292,7 +4412,7 @@ local function createMacDesktop(session)
 			if #windows > 0 then
 				table.insert(items, "-")
 				for _, win in ipairs(windows) do
-					table.insert(items, {win.frame.Name, function()
+					table.insert(items, {win.title, function()
 						if win.minimized then
 							win.restore()
 						elseif not win.closed then
@@ -4381,19 +4501,41 @@ local function createMacDesktop(session)
 		return opts
 	end
 
-	local function applyDockStyle()
+	-- `time`: crossfade to the new glass along with the background
+	local dockFade = 0
+	local function applyDockStyle(time)
 		local useBaked = session.mode == "wallpaper" and bakedReady
 		local useLive = session.mode == "scene" and liveGlass ~= nil
 		local glass = useBaked or useLive
-		dock.BackgroundTransparency = if glass then 1 else 0.78
-		dockRim.Transparency = if glass then 1 else 0.6
-		bakedPane.ImageTransparency = if useBaked then 0 else 1
-		livePane.ImageTransparency = if useLive then 0 else 1
-		liveTint.BackgroundTransparency = if useLive then 1 - MAC_GLASS.tintAlpha else 1
-		liveRim.ImageTransparency = if useLive then 0 else 1
+		local targets = {
+			{dock, "BackgroundTransparency", if glass then 1 else 0.78},
+			{dockRim, "Transparency", if glass then 1 else 0.6},
+			{bakedPane, "ImageTransparency", if useBaked then 0 else 1},
+			{livePane, "ImageTransparency", if useLive then 0 else 1},
+			{liveTint, "BackgroundTransparency", if useLive then 1 - MAC_GLASS.tintAlpha else 1},
+			{liveRim, "ImageTransparency", if useLive then 0 else 1},
+		}
+		for _, t in ipairs(targets) do
+			if time then
+				tween(t[1], time, {[t[2]] = t[3]}, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
+			else
+				t[1][t[2]] = t[3]
+			end
+		end
+		dockFade += 1
+		local fadeId = dockFade
 		if liveGlass then
-			liveGlass.enabled = useLive
-			liveGlass.invalidate()
+			if useLive or not time then
+				liveGlass.enabled = useLive
+				liveGlass.invalidate()
+			else
+				-- Keep the live glass drawing while it fades out
+				task.delay(time, function()
+					if fadeId == dockFade and liveGlass then
+						liveGlass.enabled = false
+					end
+				end)
+			end
 		end
 	end
 
@@ -5322,7 +5464,7 @@ local function createMacDesktop(session)
 
 	appBuilders.about = function()
 		openWindow({
-			app = "about", title = "", width = 320, height = 360, fixedSize = true,
+			app = "about", title = "", menuName = "About This Mac", width = 320, height = 360, fixedSize = true,
 			build = function(win)
 				local holder = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(16, -8), Size = UDim2.new(1, -32, 1, 0), Parent = win.content})
 				buildAbout(holder)
@@ -5464,10 +5606,7 @@ local function createMacDesktop(session)
 			return
 		end
 		tween(shade, session.fadeTime, {BackgroundTransparency = shadeTarget}, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
-		if animate then
-			task.wait(session.fadeTime / 2)
-		end
-		applyDockStyle()
+		applyDockStyle(if animate then session.fadeTime else nil)
 	end)
 
 	RunService:BindToRenderStep("coolui_mac_glass", Enum.RenderPriority.Camera.Value + 5, function()
@@ -5558,7 +5697,17 @@ local function createMacDesktop(session)
 	return desktop
 end
 
--- Lock screen, then the desktop, until Shut Down
+-- Fades out the Music app's song, so quitting the apps doesn't cut it off
+local function fadeMacMusic(time)
+	for _, sound in game:GetService("SoundService"):GetChildren() do
+		if sound.Name == "coolui_mac_music" and sound:IsA("Sound") then
+			TweenService:Create(sound, TweenInfo.new(time), {Volume = 0}):Play()
+		end
+	end
+end
+
+-- Lock screen, then the desktop, until Shut Down. Returns a function that
+-- closes macOS, so the goodbye screen can fade in over the desktop first.
 local function runMacOS(assets)
 	local session = createMacSession(assets)
 	local desktop = nil
@@ -5571,17 +5720,22 @@ local function runMacOS(assets)
 		if action == "shutdown" then
 			break
 		elseif action == "restart" then
+			fadeMacMusic(0.6)
 			session.fadeCover(0, 0.6)
 			desktop.closeAllWindows()
 			task.wait(1.2)
 			boot = true
 		elseif action == "logout" then
-			desktop.closeAllWindows()
+			-- The windows are already hidden; they quit once the song has faded
+			fadeMacMusic(0.4)
+			task.delay(0.4, desktop.closeAllWindows)
 		end
 	end
-	session.fadeCover(0, 0.7)
-	desktop.destroy()
-	session.gui:Destroy()
+	fadeMacMusic(0.5)
+	return function()
+		desktop.destroy()
+		session.gui:Destroy()
+	end
 end
 
 -- ---------- Load macOS ----------
@@ -5717,11 +5871,14 @@ local function runMacOSLoader()
 	task.wait(0.9)
 	TweenService:Create(Spinner, macFadeInfo, {ImageTransparency = 1}):Play()
 	TweenService:Create(status, macFadeInfo, {TextTransparency = 1}):Play()
+	-- The backdrop turns fully opaque: macOS starts under a copy of it, which
+	-- the lock screen then fades away (see createMacSession)
+	TweenService:Create(background, macFadeInfo, {ImageTransparency = 0}):Play()
 	task.wait(0.5)
 	status:Destroy()
 	detail:Destroy()
 
-	runMacOS(assets)
+	return runMacOS(assets)
 end
 
 -- ==========================================
@@ -5820,14 +5977,26 @@ local goodbyeShownAt = nil
 
 -- Goodbye screen, styled like the Lithora intro. The world gets
 -- restored behind it, then it fades away at the very end.
-local function showGoodbye()
+-- `closeBehind` (from macOS) runs once the screen is fully covered: the
+-- goodbye screen fades in right over the desktop, which is then closed.
+local function showGoodbye(closeBehind)
 	stopMusic(2)
 	Description.Text = '<font color="rgb(54, 61, 162)">Hope to see you later</font>'
 	Description.TextTransparency = 1
 	link.Visible = true
-	local coverIn = TweenService:Create(background, tweenInfo, {ImageTransparency = 0.1})
+	if closeBehind then
+		-- Above macOS, and opaque while macOS is closed underneath. The backdrop
+		-- may still be set from the wallpaper (hidden behind macOS until now).
+		background.ImageTransparency = 1
+		ScreenGui.DisplayOrder = 1002
+	end
+	local coverIn = TweenService:Create(background, tweenInfo, {ImageTransparency = if closeBehind then 0 else 0.1})
 	coverIn:Play()
 	coverIn.Completed:Wait()
+	if closeBehind then
+		closeBehind()
+		TweenService:Create(background, tweenInfo, {ImageTransparency = 0.1}):Play()
+	end
 	TweenService:Create(Description, tweenInfo, {TextTransparency = 0.04}):Play()
 	goodbyeShownAt = os.clock()
 end
@@ -6067,8 +6236,7 @@ if chosenAction == "load" then
 	end
 elseif chosenAction == "macos" then
 	-- Downloading assets, then macOS; Shut Down leads to the goodbye
-	runMacOSLoader()
-	showGoodbye()
+	showGoodbye(runMacOSLoader())
 else
 	showGoodbye()
 end
@@ -6086,6 +6254,7 @@ end
 -- 6. RESTORE EVERYTHING
 -- ==========================================
 isSpinning = false
+antiAfk:Disconnect()
 RunService:UnbindFromRenderStep("CustomCameraSway")
 for _, connection in ipairs(rankListConnections) do
 	connection:Disconnect()

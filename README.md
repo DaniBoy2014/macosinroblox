@@ -12,6 +12,7 @@ screen with Liquid Glass, then a desktop:
 - Finder (browses the executor's workspace folder), Notes, Terminal (shell
   commands plus Luau), Music, System Settings and Preview
 - a background switch between the Tahoe wallpaper and the 3D scene
+- anti-AFK while it's open, so Roblox's 20-minute idle kick doesn't end it
 
 ## Run it
 
