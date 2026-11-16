@@ -4,14 +4,24 @@ A Lithora-style loader UI for Roblox executors: a shop screen with an HD Admin
 rank viewer, and a "Load macOS" button that boots into a macOS Tahoe-style lock
 screen with Liquid Glass, then a desktop:
 
-- a menu bar with the Apple menu (About This Mac, System Settings, Restart,
-  Shut Down, Lock Screen, Log Out) and per-app menus
+- a menu bar with the Apple menu (About This Mac, System Settings, Sleep,
+  Restart, Shut Down, Lock Screen, Log Out) and per-app menus
+- Sleep hides macOS so you can play the game; "Wake macOS" at the top of the
+  screen brings it back to the lock screen. Its "Keep apps running" option
+  keeps the music playing while it's asleep
+- Restart and Shut Down ask first (60-second countdown, like a Mac) and can
+  reopen your windows afterwards, even after Shut Down
+- a startup screen (Apple logo and progress bar) on Restart and the first time
+  macOS starts; System Settings > General can show it every time
+- Light and Dark appearance (System Settings > Appearance)
 - Wi-Fi and battery menus in Liquid Glass: the "network" is the game you're
   in, its signal bars follow your ping, and the battery shows as unknown
   (Roblox can't read it)
 - a Liquid Glass Dock; over the live 3D scene the glass is redrawn as the
   camera moves
-- windows you can drag, zoom, minimize to the Dock and close
+- windows you can drag, stretch by their edges and corners, zoom, minimize to
+  the Dock and close; their red, yellow and green buttons stretch like jelly
+  when you pull on them
 - Finder (browses the executor's workspace folder), Notes, Terminal (shell
   commands plus Luau), Music, System Settings and Preview
 - a background switch between the Tahoe wallpaper and the 3D scene
@@ -36,8 +46,9 @@ assets/fonts/OFL.txt              Inter's license (must stay next to the font)
 The script downloads each asset once and caches it in the executor's
 workspace (`coolui_music/` and `coolui_assets/`), so later runs don't download
 again. Notes saves to `coolui_assets/Notes.txt`, and any mp3 you put in
-`coolui_music/` shows up in Music. If a file is missing from this repo, the script falls back to its old
-download source.
+`coolui_music/` shows up in Music. Settings (appearance, the startup screen,
+windows to reopen) are kept in `coolui_assets/settings.json`. If a file is
+missing from this repo, the script falls back to its old download source.
 
 ## Using a different repo name
 
