@@ -3661,6 +3661,7 @@ local MAC_APPS = {
 	{id = "finder", name = "Finder", icon = MAC_DESKTOP_ICONS.finder, top = Color3.fromRGB(110, 198, 255), bottom = Color3.fromRGB(18, 110, 238)},
 	{id = "notes", name = "Notes", icon = MAC_DESKTOP_ICONS.notes, top = Color3.fromRGB(255, 228, 120), bottom = Color3.fromRGB(247, 184, 34)},
 	{id = "music", name = "Music", icon = MAC_DESKTOP_ICONS.music, top = Color3.fromRGB(255, 110, 132), bottom = Color3.fromRGB(236, 34, 76)},
+	{id = "youtube", name = "YouTube", icon = MAC_DESKTOP_ICONS.play, top = Color3.fromRGB(255, 78, 78), bottom = Color3.fromRGB(214, 0, 24)},
 	{id = "terminal", name = "Terminal", icon = MAC_DESKTOP_ICONS.terminal, top = Color3.fromRGB(76, 76, 82), bottom = Color3.fromRGB(26, 26, 30)},
 	{id = "settings", name = "System Settings", icon = MAC_DESKTOP_ICONS.settings, top = Color3.fromRGB(178, 180, 188), bottom = Color3.fromRGB(110, 112, 122)},
 }
@@ -6212,6 +6213,10 @@ local function createMacDesktop(session)
 			if args.pane and win.showPane then
 				win.showPane(args.pane)
 			end
+			-- (YouTube: a search or a link to play)
+			if (args.query or args.kind) and win.handle then
+				win.handle(args)
+			end
 			return
 		end
 		bounce(appId)
@@ -6991,6 +6996,964 @@ local function createMacDesktop(session)
 		})
 	end
 
+	-- ---------- YouTube ----------
+	-- Roblox can't play video (it won't load a video file a script saves), and
+	-- YouTube won't hand a game its streams, so watching needs the YouTube
+	-- helper (youtube_helper.py in the repo) running on this PC. It searches
+	-- and decodes with yt-dlp and ffmpeg; this app paints its pictures into an
+	-- EditableImage and plays its sound in short mp3 pieces, keeping the
+	-- pictures in time with the sound.
+	appBuilders.youtube = function(args)
+		openWindow({
+			app = "youtube", title = "YouTube", width = 980, height = 620, minWidth = 640, minHeight = 460, dark = true,
+			background = Color3.fromRGB(15, 15, 15),
+			build = function(win)
+				local HELPER = "http://127.0.0.1:8765/"
+				local HELPER_FILE = "https://raw.githubusercontent.com/" .. ASSET_REPO .. "/" .. ASSET_BRANCH .. "/youtube_helper.py"
+				local FOLDER = "coolui_youtube"
+				local FPS = 24
+				local RED = Color3.fromRGB(255, 0, 51)
+				local GREY = Color3.fromRGB(170, 170, 170)
+				local CHIP = Color3.fromRGB(39, 39, 39)
+				local HttpService = game:GetService("HttpService")
+				local AssetService = game:GetService("AssetService")
+				local SoundService = game:GetService("SoundService")
+				local content = win.content
+				local windowOpen = true
+
+				-- ---- Talking to the helper ----
+				local function helper(path)
+					local send = (syn and syn.request) or http_request or request or (http and http.request)
+					if not send then
+						return nil
+					end
+					local ok, response = pcall(send, {Url = HELPER .. path, Method = "GET"})
+					if ok and type(response) == "table" and tonumber(response.StatusCode) and tonumber(response.StatusCode) > 0 then
+						return response
+					end
+					return nil
+				end
+				local function header(response, name)
+					for key, value in pairs(response.Headers or {}) do
+						if tostring(key):lower() == name then
+							return value
+						end
+					end
+					return nil
+				end
+				local function decode(response)
+					local ok, data = pcall(HttpService.JSONDecode, HttpService, response.Body or "")
+					return if ok and type(data) == "table" then data else nil
+				end
+				pcall(function()
+					if not isfolder(FOLDER) then
+						makefolder(FOLDER)
+					end
+					if not isfolder(FOLDER .. "/thumbnails") then
+						makefolder(FOLDER .. "/thumbnails")
+					end
+					-- Sound left over from an earlier run
+					for _, entry in ipairs(macListFolder(FOLDER)) do
+						if not entry.folder and entry.name:match("%.mp3$") then
+							delfile(entry.path)
+						end
+					end
+				end)
+
+				-- A white triangle pointing right (YouTube's play symbol), drawn once
+				local function triangleImage()
+					local path = MACOS_FOLDER .. "/ytplay_v1.png"
+					macMadeImages.remember(path, triangleImage)
+					if not isfile(path) then
+						local size = 32
+						local rows = table.create(size)
+						-- the corners: (7, 4), (7, 28) and (27, 16), smoothed by sampling 4x4 per pixel
+						local function inside(x, y)
+							return x >= 7 and (y - 4) >= (x - 7) * 0.6 and (28 - y) >= (x - 7) * 0.6
+						end
+						for y = 0, size - 1 do
+							local row = table.create(size + 1)
+							row[1] = "\0"
+							for x = 0, size - 1 do
+								local hits = 0
+								for sy = 0, 3 do
+									for sx = 0, 3 do
+										if inside(x + (sx + 0.5) / 4, y + (sy + 0.5) / 4) then
+											hits += 1
+										end
+									end
+								end
+								row[x + 2] = "\255" .. string.char(math.floor(hits / 16 * 255 + 0.5))
+							end
+							rows[y + 1] = table.concat(row)
+						end
+						ensureMacFolder()
+						writefile(path, macMakePng(size, size, 4, table.concat(rows)))
+					end
+					return getcustomasset(path)
+				end
+				local triangle = ""
+				pcall(function()
+					triangle = triangleImage()
+				end)
+
+				local function clockText(seconds)
+					seconds = math.max(0, math.floor(seconds or 0))
+					if seconds >= 3600 then
+						return string.format("%d:%02d:%02d", seconds // 3600, seconds // 60 % 60, seconds % 60)
+					end
+					return string.format("%d:%02d", seconds // 60, seconds % 60)
+				end
+				local function shortNumber(n)
+					for _, unit in ipairs({{1e9, "B"}, {1e6, "M"}, {1e3, "K"}}) do
+						if n >= unit[1] then
+							local value = n / unit[1]
+							return (if value < 10 then (string.format("%.1f", value):gsub("%.0$", "")) else tostring(math.floor(value))) .. unit[2]
+						end
+					end
+					return tostring(math.floor(n))
+				end
+
+				-- ---- Top: the logo, the search field and the tabs ----
+				local logo = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(18, 11), Size = UDim2.fromOffset(124, 30), ZIndex = 3, Parent = content})
+				local mark = macNew("Frame", {BackgroundColor3 = RED, BorderSizePixel = 0, Position = UDim2.fromOffset(0, 4), Size = UDim2.fromOffset(31, 22), ZIndex = 3, Parent = logo})
+				macCorner(mark, 7)
+				macNew("ImageLabel", {
+					BackgroundTransparency = 1, Image = triangle, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.55, 0.5),
+					Size = UDim2.fromOffset(14, 14), ZIndex = 4, Parent = mark,
+				})
+				macLabel(logo, "YouTube", 19, Enum.FontWeight.Bold, white, {Position = UDim2.fromOffset(36, 0), Size = UDim2.fromOffset(90, 30), ZIndex = 3})
+
+				local searchBar = macNew("Frame", {
+					BackgroundColor3 = Color3.fromRGB(18, 18, 18), BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0),
+					Position = UDim2.new(0.5, 30, 0, 8), Size = UDim2.new(1, -330, 0, 36), ZIndex = 3, Parent = content,
+				})
+				macNew("UISizeConstraint", {MaxSize = Vector2.new(560, 36), Parent = searchBar})
+				macCorner(searchBar, UDim.new(1, 0))
+				macStroke(searchBar, Color3.fromRGB(56, 56, 56), 0, 1)
+				local field = macNew("TextBox", {
+					BackgroundTransparency = 1, ClearTextOnFocus = false, Text = "", PlaceholderText = "Search or paste a YouTube link",
+					PlaceholderColor3 = Color3.fromRGB(136, 136, 136), TextColor3 = white, FontFace = macFont(Enum.FontWeight.Regular),
+					TextSize = 15, TextXAlignment = Enum.TextXAlignment.Left, Position = UDim2.fromOffset(18, 0), Size = UDim2.new(1, -84, 1, 0),
+					ClipsDescendants = true, ZIndex = 4, Parent = searchBar,
+				})
+				local searchButton = macButton(searchBar, {
+					AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(1, 0), Size = UDim2.new(0, 60, 1, 0),
+					BackgroundTransparency = 0, BackgroundColor3 = Color3.fromRGB(34, 34, 34), ZIndex = 4,
+				})
+				macCorner(searchButton, UDim.new(1, 0))
+				macImage(searchButton, I.search, 18, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.45, 0.5), ZIndex = 5})
+
+				local TABS = {
+					{key = "home", label = "Home", width = 64, kind = "video", query = "trending"},
+					{key = "shorts", label = "Shorts", width = 72, kind = "shorts", query = "trending"},
+					{key = "live", label = "Live", width = 56, kind = "live", query = "live"},
+				}
+				local tabButtons = {}
+				local currentTab = TABS[1]
+				local x = 18
+				for _, tab in ipairs(TABS) do
+					local button = macButton(content, {
+						Position = UDim2.fromOffset(x, 54), Size = UDim2.fromOffset(tab.width, 30), BackgroundTransparency = 0,
+						BackgroundColor3 = CHIP, ZIndex = 3,
+					})
+					macCorner(button, 8)
+					local label = macLabel(button, tab.label, 13, Enum.FontWeight.SemiBold, white, {
+						Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 4,
+					})
+					tabButtons[tab.key] = {button = button, label = label}
+					x += tab.width + 10
+				end
+				local function paintTabs()
+					for key, tab in pairs(tabButtons) do
+						local on = key == currentTab.key
+						tab.button.BackgroundColor3 = if on then Color3.fromRGB(241, 241, 241) else CHIP
+						tab.label.TextColor3 = if on then Color3.fromRGB(15, 15, 15) else white
+					end
+				end
+				paintTabs()
+
+				-- ---- The grid of videos ----
+				local grid = macNew("ScrollingFrame", {
+					BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(0, 96), Size = UDim2.new(1, 0, 1, -96),
+					CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 6,
+					ScrollBarImageColor3 = Color3.fromRGB(120, 120, 120), ScrollBarImageTransparency = 0.3,
+					ScrollingDirection = Enum.ScrollingDirection.Y, ZIndex = 2, Parent = content,
+				})
+				macNew("UIPadding", {
+					PaddingLeft = UDim.new(0, 18), PaddingRight = UDim.new(0, 18), PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 18), Parent = grid,
+				})
+				local gridLayout = macNew("UIGridLayout", {
+					SortOrder = Enum.SortOrder.LayoutOrder, CellPadding = UDim2.fromOffset(14, 18), CellSize = UDim2.fromOffset(290, 236), Parent = grid,
+				})
+				-- A message in the middle of the grid (searching, nothing found, start the helper)
+				local notice = macNew("Frame", {
+					BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 48),
+					Size = UDim2.new(1, -120, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Visible = false, ZIndex = 3, Parent = content,
+				})
+				macNew("UISizeConstraint", {MaxSize = Vector2.new(520, math.huge), Parent = notice})
+				macNew("UIListLayout", {
+					SortOrder = Enum.SortOrder.LayoutOrder, HorizontalAlignment = Enum.HorizontalAlignment.Center, Padding = UDim.new(0, 10), Parent = notice,
+				})
+				local noticeTitle = macLabel(notice, "", 17, Enum.FontWeight.SemiBold, white, {
+					Size = UDim2.fromScale(1, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
+					TextXAlignment = Enum.TextXAlignment.Center, LayoutOrder = 1, ZIndex = 3,
+				})
+				local noticeText = macLabel(notice, "", 13, Enum.FontWeight.Regular, GREY, {
+					Size = UDim2.fromScale(1, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true, RichText = true,
+					TextXAlignment = Enum.TextXAlignment.Center, LayoutOrder = 2, ZIndex = 3,
+				})
+				local noticeButtons = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.fromOffset(300, 34), LayoutOrder = 3, ZIndex = 3, Parent = notice})
+				macNew("UIListLayout", {
+					FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Center,
+					SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 10), Parent = noticeButtons,
+				})
+				local function noticeButton(text, order, primary)
+					local button = macButton(noticeButtons, {
+						Size = UDim2.fromOffset(136, 34), BackgroundTransparency = 0, BackgroundColor3 = if primary then Color3.fromRGB(241, 241, 241) else CHIP,
+						LayoutOrder = order, ZIndex = 4,
+					})
+					macCorner(button, UDim.new(1, 0))
+					macLabel(button, text, 13, Enum.FontWeight.SemiBold, if primary then Color3.fromRGB(15, 15, 15) else white, {
+						Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 5,
+					})
+					return button
+				end
+				local retryButton = noticeButton("Try Again", 1, true)
+				local copyButton = noticeButton("Copy Helper Link", 2, false)
+				local function showNotice(title, text, withButtons)
+					notice.Visible = title ~= nil
+					noticeTitle.Text = title or ""
+					noticeText.Text = text or ""
+					noticeText.Visible = text ~= nil and text ~= ""
+					noticeButtons.Visible = withButtons == true
+				end
+				local function showHelperMissing()
+					showNotice("YouTube needs its helper",
+						"Roblox can't play video by itself, so a small program on your PC does it. Install Python, yt-dlp "
+							.. "(<b>pip install -U yt-dlp</b>) and ffmpeg, download <b>youtube_helper.py</b> from the macOS in Roblox repo, "
+							.. "and run <b>python youtube_helper.py</b>. Leave it open while you watch.", true)
+				end
+
+				-- Thumbnails: saved in the workspace, so they load straight away next time
+				local function loadThumbnail(item, label)
+					local path = FOLDER .. "/thumbnails/" .. item.id .. ".jpg"
+					task.spawn(function()
+						local ok = pcall(function()
+							if not isfile(path) then
+								local data = game:HttpGet("https://i.ytimg.com/vi/" .. item.id .. (if item.short then "/hqdefault.jpg" else "/mqdefault.jpg"))
+								if #data < 600 then
+									error("no thumbnail")
+								end
+								writefile(path, data)
+							end
+						end)
+						if ok and label.Parent then
+							label.Image = getcustomasset(path)
+						end
+					end)
+				end
+
+				local results = {}
+				local resultsKind = "video"
+				local cards = {}
+				local function layoutGrid()
+					local width = grid.AbsoluteSize.X / getScale() - 36 - 8
+					if width <= 0 then
+						return
+					end
+					if resultsKind == "shorts" then
+						local columns = math.max(2, math.floor((width + 12) / 190))
+						local cell = (width - (columns - 1) * 12) / columns
+						gridLayout.CellPadding = UDim2.fromOffset(12, 18)
+						gridLayout.CellSize = UDim2.fromOffset(cell, cell * 16 / 9 + 48)
+					else
+						local columns = math.max(1, math.floor((width + 14) / 280))
+						local cell = (width - (columns - 1) * 14) / columns
+						gridLayout.CellPadding = UDim2.fromOffset(14, 18)
+						gridLayout.CellSize = UDim2.fromOffset(cell, cell * 9 / 16 + 74)
+					end
+				end
+				table.insert(win.cleanup, grid:GetPropertyChangedSignal("AbsoluteSize"):Connect(layoutGrid))
+
+				local playItem -- (below)
+				local function renderResults()
+					for _, card in ipairs(cards) do
+						card:Destroy()
+					end
+					table.clear(cards)
+					layoutGrid()
+					grid.CanvasPosition = Vector2.zero
+					for i, item in ipairs(results) do
+						local vertical = resultsKind == "shorts"
+						local card = macButton(grid, {LayoutOrder = i, ZIndex = 3})
+						local thumb = macNew("ImageLabel", {
+							BackgroundColor3 = CHIP, BorderSizePixel = 0, ScaleType = Enum.ScaleType.Crop,
+							Size = UDim2.new(1, 0, 1, if vertical then -48 else -74), ZIndex = 3, Parent = card,
+						})
+						macCorner(thumb, if vertical then 12 else 10)
+						loadThumbnail({id = item.id, short = vertical}, thumb)
+						-- Duration, or LIVE, in the corner
+						local badgeText = if item.live then "LIVE" elseif item.duration and not vertical then clockText(item.duration) else nil
+						if badgeText then
+							local badge = macLabel(thumb, badgeText, 11, Enum.FontWeight.SemiBold, white, {
+								AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -6, 1, -6), Size = UDim2.fromOffset(0, 18),
+								AutomaticSize = Enum.AutomaticSize.X, BackgroundTransparency = if item.live then 0 else 0.25,
+								BackgroundColor3 = if item.live then Color3.fromRGB(204, 0, 0) else Color3.new(0, 0, 0), ZIndex = 4,
+							})
+							macCorner(badge, 4)
+							macNew("UIPadding", {PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5), Parent = badge})
+						end
+						macLabel(card, item.title or "", if vertical then 13 else 14, Enum.FontWeight.Medium, white, {
+							Position = UDim2.new(0, 0, 1, if vertical then -42 else -66), Size = UDim2.new(1, 0, 0, if vertical then 34 else 38),
+							TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3,
+						})
+						local meta = {}
+						if not vertical and item.channel and item.channel ~= "" then
+							table.insert(meta, item.channel)
+						end
+						if item.views then
+							table.insert(meta, shortNumber(item.views) .. (if item.live then " watching" else " views"))
+						end
+						macLabel(card, table.concat(meta, " · "), 12, Enum.FontWeight.Regular, GREY, {
+							Position = UDim2.new(0, 0, 1, if vertical then -8 else -24), Size = UDim2.new(1, 0, 0, if vertical then 0 else 16),
+							TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3, Visible = not vertical or #meta > 0,
+						})
+						card.MouseButton1Click:Connect(function()
+							playItem(item, i)
+						end)
+						table.insert(cards, card)
+					end
+				end
+
+				local searchNumber = 0
+				local function search(query, kind)
+					searchNumber += 1
+					local number = searchNumber
+					results = {}
+					resultsKind = kind
+					renderResults()
+					showNotice("Searching…")
+					local response = helper(("search?type=%s&limit=30&q=%s"):format(kind, HttpService:UrlEncode(query)))
+					if number ~= searchNumber or not windowOpen then
+						return nil
+					end
+					if not response then
+						showHelperMissing()
+						return nil
+					end
+					local data = decode(response)
+					if response.StatusCode ~= 200 or not data then
+						showNotice("Search didn't work", if data and data.error then tostring(data.error) else "The helper couldn't search YouTube.")
+						return nil
+					end
+					results = data.results or {}
+					showNotice(if #results == 0 then "No results" else nil)
+					renderResults()
+					return results
+				end
+
+				-- ---- The player ----
+				local playerView = macNew("Frame", {
+					BackgroundColor3 = Color3.fromRGB(15, 15, 15), BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), Visible = false,
+					ZIndex = 6, Active = true, Parent = content,
+				})
+				local stage = macNew("Frame", {
+					BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Position = UDim2.fromOffset(20, 6), Size = UDim2.new(1, -40, 1, -112),
+					ClipsDescendants = true, ZIndex = 6, Parent = playerView,
+				})
+				macCorner(stage, 14)
+				local screen = macNew("ImageLabel", {
+					BackgroundTransparency = 1, ScaleType = Enum.ScaleType.Fit, Size = UDim2.fromScale(1, 1), ZIndex = 6, Parent = stage,
+				})
+				local stageStatus = macLabel(stage, "", 16, Enum.FontWeight.Medium, white, {
+					AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(1, -60, 0, 60),
+					TextXAlignment = Enum.TextXAlignment.Center, TextWrapped = true, TextTransparency = 0.15, ZIndex = 8,
+				})
+				local function roundButton(parent, props)
+					props.Size = props.Size or UDim2.fromOffset(36, 36)
+					props.BackgroundTransparency = props.BackgroundTransparency or 0.35
+					props.BackgroundColor3 = props.BackgroundColor3 or Color3.new(0, 0, 0)
+					props.ZIndex = props.ZIndex or 8
+					local button = macButton(parent, props)
+					macCorner(button, UDim.new(1, 0))
+					return button
+				end
+				local backButton = roundButton(stage, {Position = UDim2.fromOffset(12, 12)})
+				macImage(backButton, I.back, 20, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), ZIndex = 9})
+				-- Shorts: up and down to the previous and next one
+				local upButton = roundButton(stage, {AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, -26), Visible = false})
+				macImage(upButton, I.back, 20, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Rotation = 90, ZIndex = 9})
+				local downButton = roundButton(stage, {AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 26), Visible = false})
+				macImage(downButton, I.back, 20, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Rotation = -90, ZIndex = 9})
+
+				-- Controls under the picture: play/pause, time, the progress bar, mute
+				local controls = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.new(0, 20, 1, -100), Size = UDim2.new(1, -40, 0, 36), ZIndex = 6, Parent = playerView})
+				local playButton = roundButton(controls, {BackgroundTransparency = 0, BackgroundColor3 = CHIP, ZIndex = 7})
+				local playIcon = macNew("ImageLabel", {
+					BackgroundTransparency = 1, Image = triangle, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.54, 0.5),
+					Size = UDim2.fromOffset(16, 16), ZIndex = 8, Parent = playButton,
+				})
+				local pauseIcon = macNew("Frame", {
+					BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(12, 14),
+					ZIndex = 8, Parent = playButton,
+				})
+				for _, xBar in ipairs({0, 8}) do
+					local bar = macNew("Frame", {BackgroundColor3 = white, BorderSizePixel = 0, Position = UDim2.fromOffset(xBar, 0), Size = UDim2.fromOffset(4, 14), ZIndex = 8, Parent = pauseIcon})
+					macCorner(bar, 1)
+				end
+				local timeLabel = macLabel(controls, "", 13, Enum.FontWeight.Medium, white, {
+					Position = UDim2.fromOffset(48, 0), Size = UDim2.fromOffset(120, 36), ZIndex = 7,
+				})
+				local liveDot = macNew("Frame", {
+					BackgroundColor3 = Color3.fromRGB(255, 0, 0), BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 50, 0.5, 0),
+					Size = UDim2.fromOffset(8, 8), Visible = false, ZIndex = 7, Parent = controls,
+				})
+				macCorner(liveDot, UDim.new(1, 0))
+				local progress = macButton(controls, {
+					Position = UDim2.new(0, 176, 0.5, -8), Size = UDim2.new(1, -176 - 100, 0, 16), ZIndex = 7,
+				})
+				local track = macNew("Frame", {
+					BackgroundColor3 = white, BackgroundTransparency = 0.75, BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 0.5),
+					Position = UDim2.fromScale(0, 0.5), Size = UDim2.new(1, 0, 0, 4), ZIndex = 7, Parent = progress,
+				})
+				macCorner(track, UDim.new(1, 0))
+				local fill = macNew("Frame", {BackgroundColor3 = RED, BorderSizePixel = 0, Size = UDim2.fromScale(0, 1), ZIndex = 8, Parent = track})
+				macCorner(fill, UDim.new(1, 0))
+				local knob = macNew("Frame", {
+					BackgroundColor3 = RED, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0, 0.5),
+					Size = UDim2.fromOffset(12, 12), ZIndex = 9, Parent = track,
+				})
+				macCorner(knob, UDim.new(1, 0))
+				local muteButton = macButton(controls, {
+					AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(1, 0), Size = UDim2.fromOffset(86, 36),
+					BackgroundTransparency = 0, BackgroundColor3 = CHIP, ZIndex = 7,
+				})
+				macCorner(muteButton, UDim.new(1, 0))
+				local muteLabel = macLabel(muteButton, "Mute", 13, Enum.FontWeight.SemiBold, white, {
+					Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 8,
+				})
+				local videoTitle = macLabel(playerView, "", 17, Enum.FontWeight.Bold, white, {
+					Position = UDim2.new(0, 22, 1, -56), Size = UDim2.new(1, -44, 0, 24), TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 6,
+				})
+				local videoChannel = macLabel(playerView, "", 13, Enum.FontWeight.Regular, GREY, {
+					Position = UDim2.new(0, 22, 1, -30), Size = UDim2.new(1, -44, 0, 18), TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 6,
+				})
+
+				-- State of what's playing. Pictures come from the helper in batches
+				-- into `queue` ({number, pixels}); the sound's position is the clock
+				-- that decides which picture shows.
+				local player = {gen = 0, queue = {}, sounds = {}, files = {}, volume = 0.8, muted = false}
+				local image, imageSize = nil, nil
+				local function setStatus(text)
+					stageStatus.Text = text or ""
+					stageStatus.Visible = text ~= nil
+				end
+
+				local function stopPlayback()
+					player.gen += 1
+					local info = player.info
+					player.info = nil
+					if info then
+						task.spawn(helper, "stop?session=" .. info.session)
+					end
+					for _, sound in ipairs(player.sounds) do
+						sound:Destroy()
+					end
+					table.clear(player.sounds)
+					for _, path in ipairs(player.files) do
+						pcall(delfile, path)
+					end
+					table.clear(player.files)
+					table.clear(player.queue)
+					player.current, player.firstIndex, player.audioClock = nil, nil, nil
+					player.silentBase, player.silentStarted = nil, nil
+					player.picturesDone, player.finished, player.buffering, player.failed = false, false, false, false
+					player.lastShown = nil
+				end
+
+				-- The playing position in seconds from where this session started
+				function player.time()
+					if player.audioClock then
+						return player.audioClock()
+					elseif player.silentBase then
+						return player.silentBase + (if player.silentStarted then os.clock() - player.silentStarted else 0)
+					end
+					return nil
+				end
+
+				-- One piece of sound as a Sound, false when there's no more, nil if stopped
+				local function loadSegment(gen, info, number)
+					while gen == player.gen do
+						local response = helper(("audio?session=%s&seg=%d"):format(info.session, number))
+						if gen ~= player.gen then
+							return nil
+						end
+						local status = response and tonumber(response.StatusCode) or 0
+						if status == 200 then
+							local path = ("%s/%s_%d.mp3"):format(FOLDER, info.session, number)
+							if not pcall(writefile, path, response.Body) then
+								return false
+							end
+							table.insert(player.files, path)
+							local sound = macNew("Sound", {
+								Name = "coolui_youtube_sound", SoundId = getcustomasset(path), Volume = if player.muted then 0 else player.volume,
+								Parent = SoundService,
+							})
+							table.insert(player.sounds, sound)
+							return sound
+						elseif status ~= 202 then
+							return false
+						end
+						task.wait(0.3)
+					end
+					return nil
+				end
+
+				local function runSound(gen, info)
+					while not player.firstIndex and gen == player.gen do
+						task.wait()
+					end
+					if gen ~= player.gen then
+						return
+					end
+					local segment = info.segment or 10
+					local offset = player.firstIndex / info.fps
+					local number = math.floor(offset / segment)
+					offset -= number * segment
+					local current = if info.silent then false else loadSegment(gen, info, number)
+					if current == nil then
+						return
+					elseif current == false then
+						-- No sound: keep time by the clock instead
+						player.silentBase = player.firstIndex / info.fps
+						player.silentStarted = if player.paused then nil else os.clock()
+						return
+					end
+					while not current.IsLoaded and gen == player.gen do
+						task.wait()
+					end
+					if gen ~= player.gen then
+						return
+					end
+					current.TimePosition = offset
+					player.current, player.base = current, number * segment
+					local finishing = false
+					player.audioClock = function()
+						local sound = player.current
+						return player.base + (if finishing then sound.TimeLength else sound.TimePosition)
+					end
+					if not player.paused then
+						current:Play()
+					end
+					local upcoming = nil
+					local function fetch(n)
+						task.spawn(function()
+							local sound = loadSegment(gen, info, n)
+							if gen == player.gen then
+								upcoming = sound
+							end
+						end)
+					end
+					fetch(number + 1)
+					-- Each piece hands over to the next just before it ends
+					while gen == player.gen do
+						local sound = player.current
+						if not finishing and sound.TimeLength > 0 and sound.TimePosition >= sound.TimeLength - 0.035 then
+							finishing = true
+						end
+						if finishing and upcoming == false then
+							-- The sound has run out: the pictures carry on by the clock
+							player.silentBase, player.silentStarted = player.base + sound.TimeLength, if player.paused then nil else os.clock()
+							player.audioClock = nil
+							return
+						elseif finishing and upcoming then
+							local nextSound = upcoming
+							upcoming = nil
+							while not nextSound.IsLoaded and gen == player.gen do
+								task.wait()
+							end
+							if gen ~= player.gen then
+								return
+							end
+							player.base += sound.TimeLength
+							player.current = nextSound
+							finishing = false
+							if not player.paused and not player.buffering then
+								nextSound:Play()
+							end
+							local i = table.find(player.sounds, sound)
+							if i then
+								table.remove(player.sounds, i)
+							end
+							sound:Destroy()
+							number += 1
+							fetch(number + 1)
+						end
+						task.wait()
+					end
+				end
+
+				local function runPictures(gen, info, size)
+					local nextFrame = 0
+					local misses = 0
+					while gen == player.gen do
+						if #player.queue >= info.fps * 2 then
+							task.wait(0.03)
+							continue
+						end
+						local response = helper(("frames?session=%s&from=%d&max=12&wait=2"):format(info.session, nextFrame))
+						if gen ~= player.gen then
+							break
+						end
+						if not response or tonumber(response.StatusCode) ~= 200 then
+							misses += 1
+							if misses >= 6 then
+								setStatus("The YouTube helper stopped answering.")
+								break
+							end
+							task.wait(0.5)
+							continue
+						end
+						misses = 0
+						local first = tonumber(header(response, "x-first")) or nextFrame
+						local count = tonumber(header(response, "x-count")) or 0
+						if count > 0 and #response.Body >= count * size then
+							local all = buffer.fromstring(response.Body)
+							for i = 0, count - 1 do
+								local frame = buffer.create(size)
+								buffer.copy(frame, 0, all, i * size, size)
+								table.insert(player.queue, {first + i, frame})
+							end
+							nextFrame = first + count
+							if not player.firstIndex then
+								player.firstIndex = first
+							end
+						end
+						if tostring(header(response, "x-ended")) == "1" then
+							player.picturesDone = true
+							break
+						end
+					end
+				end
+
+				local playingItem, playingIndex = nil, nil
+				local function paintPlayButton()
+					local playing = player.info ~= nil and not player.paused and not player.finished
+					playIcon.Visible = not playing
+					pauseIcon.Visible = playing
+				end
+
+				-- Plays `item` from `startAt` seconds
+				local function startPlayback(item, startAt)
+					stopPlayback()
+					local gen = player.gen
+					player.paused = false
+					local vertical = item.short == true
+					playerView.Visible = true
+					upButton.Visible = vertical and playingIndex ~= nil and playingIndex > 1
+					downButton.Visible = vertical and playingIndex ~= nil and playingIndex < #results
+					videoTitle.Text = item.title or ""
+					videoChannel.Text = item.channel or ""
+					setStatus("Loading…")
+					paintPlayButton()
+					timeLabel.Text = ""
+					liveDot.Visible = false
+					progress.Visible = false
+					fill.Size = UDim2.fromScale(0, 1)
+					knob.Position = UDim2.fromScale(0, 0.5)
+					local w, h = if vertical then 270 else 480, if vertical then 480 else 270
+					local response = helper(("play?id=%s&w=%d&h=%d&fps=%d&start=%d"):format(item.id, w, h, FPS, math.floor(startAt or 0)))
+					if gen ~= player.gen or not windowOpen then
+						local data = response and decode(response)
+						if data and data.session then
+							task.spawn(helper, "stop?session=" .. data.session)
+						end
+						return
+					end
+					if not response then
+						setStatus("Start the YouTube helper on your PC to watch.")
+						return
+					end
+					local info = decode(response)
+					if tonumber(response.StatusCode) ~= 200 or not info or not info.session then
+						setStatus("This video can't be played." .. (if info and info.error then "\n" .. tostring(info.error) else ""))
+						return
+					end
+					player.info = info
+					paintPlayButton()
+					videoTitle.Text = if info.title ~= "" then info.title else videoTitle.Text
+					videoChannel.Text = (if info.channel ~= "" then info.channel else videoChannel.Text) .. (if info.live then "  ·  Live now" else "")
+					timeLabel.Position = UDim2.fromOffset(if info.live then 64 else 48, 0)
+					liveDot.Visible = info.live == true
+					progress.Visible = not info.live
+					-- A fresh picture to paint into
+					local size = Vector2.new(info.width, info.height)
+					if image then
+						image:Destroy()
+					end
+					image = AssetService:CreateEditableImage({Size = size})
+					imageSize = size
+					screen.ImageContent = Content.fromObject(image)
+					task.spawn(runPictures, gen, info, info.width * info.height * 4)
+					task.spawn(runSound, gen, info)
+					-- Nothing to show after a long wait: say so rather than load forever
+					task.delay(45, function()
+						if gen == player.gen and not player.lastShown then
+							setStatus("This video is taking too long to load.")
+						end
+					end)
+				end
+
+				function playItem(item, index)
+					playingItem, playingIndex = item, index
+					if item.short == nil then
+						item.short = resultsKind == "shorts"
+					end
+					task.spawn(startPlayback, item, 0)
+				end
+
+				local function setPaused(paused)
+					local info = player.info
+					if not info then
+						return
+					end
+					if info.live then
+						-- Pausing live stops it; playing again picks it up live
+						if paused then
+							stopPlayback()
+							player.paused = true
+							setStatus(nil)
+						end
+						paintPlayButton()
+						return
+					end
+					player.paused = paused
+					if player.current then
+						if paused then
+							player.current:Pause()
+						elseif not player.buffering then
+							player.current:Resume()
+						end
+					end
+					if player.silentBase then
+						if paused and player.silentStarted then
+							player.silentBase += os.clock() - player.silentStarted
+							player.silentStarted = nil
+						elseif not paused then
+							player.silentStarted = os.clock()
+						end
+					end
+					paintPlayButton()
+				end
+
+				playButton.MouseButton1Click:Connect(function()
+					if not playingItem then
+						return
+					end
+					if player.finished or (not player.info and player.paused) then
+						task.spawn(startPlayback, playingItem, 0)
+					elseif player.info then
+						setPaused(not player.paused)
+					end
+				end)
+				progress.MouseButton1Down:Connect(function(mouseX)
+					local info = player.info
+					if not info or info.live or not info.duration or info.duration <= 0 then
+						return
+					end
+					local fraction = math.clamp((mouseX - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+					task.spawn(startPlayback, playingItem, fraction * info.duration)
+				end)
+				muteButton.MouseButton1Click:Connect(function()
+					player.muted = not player.muted
+					muteLabel.Text = if player.muted then "Unmute" else "Mute"
+					for _, sound in ipairs(player.sounds) do
+						sound.Volume = if player.muted then 0 else player.volume
+					end
+				end)
+				backButton.MouseButton1Click:Connect(function()
+					stopPlayback()
+					playingItem, playingIndex = nil, nil
+					playerView.Visible = false
+				end)
+				local function step(delta)
+					local index = (playingIndex or 0) + delta
+					local item = results[index]
+					if item then
+						playItem(item, index)
+					end
+				end
+				upButton.MouseButton1Click:Connect(function()
+					step(-1)
+				end)
+				downButton.MouseButton1Click:Connect(function()
+					step(1)
+				end)
+
+				-- Every frame: the picture for the sound's position, and the controls
+				table.insert(win.cleanup, RunService.RenderStepped:Connect(function()
+					local info = player.info
+					if not info or not image then
+						return
+					end
+					-- The helper finished without a single picture
+					if player.picturesDone and not player.firstIndex and not player.failed then
+						player.failed = true
+						setStatus("This video can't be played here.")
+					end
+					local now = player.time()
+					if now then
+						local target = math.floor(now * info.fps)
+						local show = nil
+						while player.queue[1] and player.queue[1][1] <= target do
+							show = table.remove(player.queue, 1)
+						end
+						if show then
+							image:WritePixelsBuffer(Vector2.zero, imageSize, show[2])
+							player.lastShown = show[1]
+							if stageStatus.Visible and not player.buffering then
+								setStatus(nil)
+							end
+						end
+						-- A video waits for its pictures if they fall behind
+						if not info.live and not player.paused and player.current then
+							local starved = #player.queue == 0 and not player.picturesDone
+								and (player.lastShown == nil or target - player.lastShown > info.fps * 0.4)
+							if starved and not player.buffering then
+								player.buffering = true
+								player.current:Pause()
+								setStatus("Buffering…")
+							elseif player.buffering and (#player.queue >= info.fps or player.picturesDone) then
+								player.buffering = false
+								player.current:Resume()
+								setStatus(nil)
+							end
+						end
+						-- The end: Shorts start again, videos wait for Play
+						if player.picturesDone and #player.queue == 0 and not player.finished then
+							player.finished = true
+							if playingItem and playingItem.short then
+								task.spawn(startPlayback, playingItem, 0)
+							else
+								for _, sound in ipairs(player.sounds) do
+									sound:Stop()
+								end
+								paintPlayButton()
+							end
+						end
+						local position = (info.start or 0) + now
+						if info.live then
+							timeLabel.Text = "LIVE"
+						elseif info.duration then
+							timeLabel.Text = clockText(position) .. " / " .. clockText(info.duration)
+							local fraction = math.clamp(position / info.duration, 0, 1)
+							fill.Size = UDim2.fromScale(fraction, 1)
+							knob.Position = UDim2.fromScale(fraction, 0.5)
+						else
+							timeLabel.Text = clockText(position)
+						end
+					end
+				end))
+
+				table.insert(win.cleanup, function()
+					windowOpen = false
+					stopPlayback()
+					if image then
+						image:Destroy()
+						image = nil
+					end
+				end)
+
+				-- ---- Searching, tabs, links ----
+				local function videoFromLink(text)
+					local id = text:match("youtu%.be/([%w_%-]+)") or text:match("[?&]v=([%w_%-]+)") or text:match("/shorts/([%w_%-]+)")
+						or text:match("/live/([%w_%-]+)") or text:match("/embed/([%w_%-]+)")
+					if id and #id >= 11 then
+						return {id = id:sub(1, 11), short = text:find("/shorts/", 1, true) ~= nil, title = "", channel = ""}
+					end
+					return nil
+				end
+				-- Searches (or opens a link); `autoplay` plays the top result
+				local function handle(request)
+					request = request or {}
+					local text = tostring(request.query or ""):match("^%s*(.-)%s*$")
+					if request.kind then
+						for _, tab in ipairs(TABS) do
+							if tab.kind == request.kind then
+								currentTab = tab
+							end
+						end
+						paintTabs()
+					end
+					local link = videoFromLink(text)
+					if link then
+						results = {link}
+						resultsKind = if link.short then "shorts" else "video"
+						renderResults()
+						showNotice(nil)
+						playItem(link, 1)
+						return
+					end
+					if text ~= "" then
+						field.Text = text
+					end
+					task.spawn(function()
+						local found = search(if text ~= "" then text else currentTab.query, currentTab.kind)
+						if found and found[1] and request.autoplay then
+							playItem(found[1], 1)
+						end
+					end)
+				end
+				function win.handle(request)
+					if playerView.Visible then
+						stopPlayback()
+						playerView.Visible = false
+					end
+					handle(request)
+				end
+
+				field.FocusLost:Connect(function(enterPressed)
+					if enterPressed and field.Text:match("%S") then
+						handle({query = field.Text})
+					end
+				end)
+				searchButton.MouseButton1Click:Connect(function()
+					if field.Text:match("%S") then
+						handle({query = field.Text})
+					end
+				end)
+				for _, tab in ipairs(TABS) do
+					tabButtons[tab.key].button.MouseButton1Click:Connect(function()
+						currentTab = tab
+						paintTabs()
+						handle({query = field.Text})
+					end)
+				end
+				retryButton.MouseButton1Click:Connect(function()
+					handle({query = field.Text})
+				end)
+				copyButton.MouseButton1Click:Connect(function()
+					pcall(setclipboard, HELPER_FILE)
+					noticeTitle.Text = "Link copied"
+				end)
+
+				-- Open: check the helper is there, then the request or Home
+				task.spawn(function()
+					local response = helper("ping")
+					if not windowOpen then
+						return
+					end
+					if not response or tonumber(response.StatusCode) ~= 200 then
+						showHelperMissing()
+						return
+					end
+					handle(args)
+				end)
+			end,
+		})
+	end
+
 	-- About This Mac (also the About pane in System Settings)
 	local function buildAbout(parent)
 		local viewport = workspace.CurrentCamera.ViewportSize
@@ -7596,7 +8559,7 @@ local function createMacDesktop(session)
 		end
 		local appWords = {
 			finder = "files folders workspace", notes = "text write", music = "songs mp3 audio",
-			terminal = "console shell command luau", settings = "preferences system",
+			terminal = "console shell command luau", settings = "preferences system", youtube = "video videos shorts live stream watch",
 		}
 		for _, app in ipairs(MAC_APPS) do
 			table.insert(spotlightItems, {title = app.name, kind = "Application", keywords = appWords[app.id], tile = app, action = function()
@@ -8888,7 +9851,7 @@ local function createMacDesktop(session)
 			end
 			local TOOLS = [==[[
 {"name":"get_desktop_state","description":"What's on the screen now: the open windows (front first, with the ids window_action takes), the focused one, Light or Dark appearance, the background, Wi-Fi and ping, what Music is playing, the time and the screen size.","input_schema":{"type":"object","properties":{}}},
-{"name":"open_app","description":"Opens an app, or brings it to the front if it's already open. trash opens the Trash in Finder; about opens About This Mac.","input_schema":{"type":"object","properties":{"app":{"type":"string","enum":["finder","notes","terminal","music","settings","trash","about"]},"settings_pane":{"type":"string","enum":["Wi-Fi","Battery","General","Appearance","Wallpaper","Ask","About"],"description":"For settings: which pane to show."}},"required":["app"]}},
+{"name":"open_app","description":"Opens an app, or brings it to the front if it's already open. trash opens the Trash in Finder; about opens About This Mac.","input_schema":{"type":"object","properties":{"app":{"type":"string","enum":["finder","notes","terminal","music","youtube","settings","trash","about"]},"settings_pane":{"type":"string","enum":["Wi-Fi","Battery","General","Appearance","Wallpaper","Ask","About"],"description":"For settings: which pane to show."}},"required":["app"]}},
 {"name":"window_action","description":"Focuses, closes, minimizes, restores (un-minimizes) or zooms a window. Window ids come from get_desktop_state.","input_schema":{"type":"object","properties":{"window_id":{"type":"integer"},"action":{"type":"string","enum":["focus","close","minimize","restore","zoom"]}},"required":["window_id","action"]}},
 {"name":"list_folder","description":"Lists a folder in the workspace (what Finder shows). Paths are relative to the workspace with forward slashes; an empty path is the workspace itself.","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
 {"name":"search_files","description":"Finds files and folders in the workspace (a few levels deep) whose names contain the text.","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
@@ -8898,7 +9861,8 @@ local function createMacDesktop(session)
 {"name":"music","description":"Controls the Music app, opening it if needed: play (a song whose name contains song, or carry on), pause, next, previous, or status. Returns what's playing and every song.","input_schema":{"type":"object","properties":{"command":{"type":"string","enum":["play","pause","next","previous","status"]},"song":{"type":"string","description":"For play: part of the song's name."}},"required":["command"]}},
 {"name":"change_setting","description":"Changes a setting. appearance: light or dark. background: wallpaper (the Tahoe wallpaper) or scene (the live 3D game world behind the desktop). wifi: on or off (off shows Ethernet). startup_screen: on or off (the Apple logo screen when macOS loads).","input_schema":{"type":"object","properties":{"setting":{"type":"string","enum":["appearance","background","wifi","startup_screen"]},"value":{"type":"string","enum":["light","dark","wallpaper","scene","on","off"]}},"required":["setting","value"]}},
 {"name":"system_action","description":"Locks the screen, or shows the user the confirmation for Sleep, Restart or Shut Down (they can cancel). If it goes ahead, that's the end of your turn.","input_schema":{"type":"object","properties":{"action":{"type":"string","enum":["lock_screen","sleep","restart","shut_down"]}},"required":["action"]}},
-{"name":"copy_to_clipboard","description":"Puts text on the user's clipboard.","input_schema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}
+{"name":"copy_to_clipboard","description":"Puts text on the user's clipboard.","input_schema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
+{"name":"youtube","description":"Opens the YouTube app on a search or a YouTube link. With play true it plays the top result (or the link). kind picks videos, Shorts or live streams. Watching needs the YouTube helper running on the user's PC; if it isn't, the app shows how to start it.","input_schema":{"type":"object","properties":{"query":{"type":"string","description":"What to search for, or a YouTube link."},"kind":{"type":"string","enum":["video","shorts","live"]},"play":{"type":"boolean"}},"required":["query"]}}
 ]]==]
 			-- What the panel says while each tool runs
 			local working = {
@@ -8906,6 +9870,7 @@ local function createMacDesktop(session)
 				list_folder = "Looking through files…", search_files = "Searching files…", read_file = "Reading a file…",
 				write_file = "Writing a file…", open_file = "Opening a file…", music = "Using Music…",
 				change_setting = "Changing a setting…", system_action = "Waiting for you…", copy_to_clipboard = "Copying…",
+				youtube = "Opening YouTube…",
 			}
 
 			local function systemPrompt(useTools, useWeb)
@@ -8915,7 +9880,7 @@ local function createMacDesktop(session)
 						.. macGameName() .. "\". The user opened you from Spotlight's Ask. It's " .. now .. ". The user is "
 						.. player.DisplayName .. " (@" .. player.Name .. ").",
 					"",
-					if useTools then "You can see and use this macOS with your tools: open apps (Finder, Notes, Terminal, Music, System Settings), arrange windows, list, search, read, write and open files in the executor's workspace folder (what Finder shows), play music, change settings and copy text. When the user asks you to do something on the computer, do it with the tools, then say briefly what you did. For questions you can answer yourself, just answer."
+					if useTools then "You can see and use this macOS with your tools: open apps (Finder, Notes, Terminal, Music, YouTube, System Settings), play YouTube videos, Shorts and live streams, arrange windows, list, search, read, write and open files in the executor's workspace folder (what Finder shows), play music, change settings and copy text. When the user asks you to do something on the computer, do it with the tools, then say briefly what you did. For questions you can answer yourself, just answer."
 						else "The user has turned off your access to the desktop, so you can only answer.",
 					"",
 					if useWeb then "You can search the web for anything current or that you're unsure of; the card shows the sites you cite." else "You can't search the web.",
@@ -9184,6 +10149,15 @@ local function createMacDesktop(session)
 				elseif name == "copy_to_clipboard" then
 					setclipboard(tostring(input.text or ""))
 					return "Copied.", "Copied to the clipboard"
+				elseif name == "youtube" then
+					local query = tostring(input.query or "")
+					if not query:match("%S") then
+						error("Give something to search for, or a link", 0)
+					end
+					local kind = if input.kind == "shorts" or input.kind == "live" then input.kind else "video"
+					openApp("youtube", {query = query, kind = kind, autoplay = input.play == true})
+					return "Opened YouTube on “" .. query .. "”" .. (if input.play == true then " and started the top result (if the helper is running)." else "."),
+						(if input.play == true then "Playing “" else "Searched YouTube for “") .. query .. "”"
 				end
 				error("There's no tool called " .. tostring(name), 0)
 			end

@@ -41,7 +41,11 @@ screen with Liquid Glass, then a desktop:
   the Dock and close; their red, yellow and green buttons stretch like jelly
   when you pull on them
 - Finder (browses the executor's workspace folder), Notes, Terminal (shell
-  commands plus Luau), Music, System Settings and Preview
+  commands plus Luau), Music, YouTube, System Settings and Preview
+- YouTube: search, Home, Shorts and Live tabs, and real playback of videos
+  (seek, pause), Shorts (upright, with next and previous) and live streams,
+  with sound. Paste a YouTube link to play it. Needs the YouTube helper
+  running on your PC (see below)
 - a background switch between the Tahoe wallpaper and the 3D scene
 - anti-AFK while it's open, so Roblox's 20-minute idle kick doesn't end it
 
@@ -61,6 +65,7 @@ assets/fonts/Inter-Bold.ttf       outlines for the Liquid Glass clock
 assets/fonts/OFL.txt              Inter's license (must stay next to the font)
 assets/sounds/startup_chime.wav   the startup chime (startup screen)
 assets/sounds/volume_mount.wav    the log-in sound
+youtube_helper.py                 the YouTube helper (runs on your PC)
 ```
 
 The script downloads each asset once and caches it in the executor's
@@ -79,6 +84,25 @@ request is billed to your Anthropic account: each question is one or more
 Claude Opus 5.5 calls plus a tiny Claude Haiku 5.5 call that names the topic
 for the Working pill, and web searches cost about a cent each (System
 Settings > Ask can turn searching and desktop control off).
+
+## The YouTube helper
+
+Roblox can't play video on its own (it won't load a video file a script
+saves), and YouTube won't give a game its streams. So the YouTube app gets
+its pictures and sound from a small program on your PC, `youtube_helper.py`,
+which uses yt-dlp to find and download videos and ffmpeg to decode them.
+Only your own PC can reach it (it listens on `127.0.0.1:8765`).
+
+1. Install Python 3.9 or newer, and ffmpeg (it has to be on your PATH).
+2. `pip install -U yt-dlp`
+3. Download `youtube_helper.py` from this repo and run
+   `python youtube_helper.py`. Leave it open while you watch.
+
+Videos show at 480×270 (Shorts at 270×480) and 24 frames a second. A video
+takes a few seconds to start; a live stream plays about 7 seconds behind
+live. Thumbnails are saved in `coolui_youtube/` in the executor's workspace.
+If YouTube changes something and videos stop playing, update yt-dlp
+(`pip install -U yt-dlp`).
 
 ## Using a different repo name
 
