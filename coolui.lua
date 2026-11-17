@@ -1591,6 +1591,37 @@ local function saveMacSettings()
 	end)
 end
 
+-- Ask (Spotlight) talks to Claude with the user's own API key. It's kept in
+-- a file of its own in the executor's workspace (not in settings.json), only
+-- ever sent to Anthropic, and never shown in full.
+local macClaudeKey = {file = "coolui_assets/claude_api_key.txt"}
+function macClaudeKey.read()
+	local ok, key = pcall(function()
+		return if isfile(macClaudeKey.file) then readfile(macClaudeKey.file) else nil
+	end)
+	key = if ok and type(key) == "string" then key:match("^%s*(.-)%s*$") else nil
+	return if key and key ~= "" then key else nil
+end
+function macClaudeKey.save(key)
+	return pcall(function()
+		if not isfolder("coolui_assets") then
+			makefolder("coolui_assets")
+		end
+		writefile(macClaudeKey.file, key)
+	end)
+end
+function macClaudeKey.remove()
+	pcall(function()
+		if isfile(macClaudeKey.file) then
+			delfile(macClaudeKey.file)
+		end
+	end)
+end
+-- Only the start and the last four characters, for showing in Settings
+function macClaudeKey.masked(key)
+	return key:sub(1, 7) .. "…" .. key:sub(-4)
+end
+
 local function macFont(weight)
 	return Font.new(MACOS_FONT, weight)
 end
@@ -1768,8 +1799,19 @@ local function ensureMacFolder()
 	end
 end
 
+-- Every image this session has made (or found already made), with how to
+-- make it again: System Settings > General > Redownload remakes them all
+local macMadeImages = {list = {}, seen = {}}
+function macMadeImages.remember(path, make)
+	if not macMadeImages.seen[path] then
+		macMadeImages.seen[path] = true
+		table.insert(macMadeImages.list, {path = path, make = make})
+	end
+end
+
 local function getMacGlowAsset()
 	local path = MACOS_FOLDER .. "/softglow.png"
+	macMadeImages.remember(path, getMacGlowAsset)
 	if not isfile(path) then
 		ensureMacFolder()
 		writefile(path, makeGlowPng(128))
@@ -1790,6 +1832,10 @@ local function getMacDiscAsset()
 	-- leave a ragged edge, and with a clear margin: Roblox cuts the edges of a
 	-- rotated image off sharply, which would notch a disc that touched them
 	local path = MACOS_FOLDER .. "/disc_v3.png"
+	macMadeImages.remember(path, function()
+		macDiscId = nil
+		getMacDiscAsset()
+	end)
 	if not isfile(path) then
 		local size = 32
 		local radius = MAC_DISC_FILL * size / 2 - 0.5
@@ -1832,6 +1878,43 @@ local function getMacWallpaperAsset()
 		writefile(urlPath, MACOS_WALLPAPER_URL)
 	end
 	return getcustomasset(path)
+end
+
+-- System sounds, from the asset repo (assets/sounds/): the startup chime
+-- plays on the startup screen, the log-in sound when you unlock the desktop.
+-- Saved next to the other assets, so Music doesn't list them as songs.
+local macSounds = {startup = "startup_chime.wav", login = "volume_mount.wav"}
+function macSounds.get(fileName)
+	local path = MACOS_FOLDER .. "/sound_" .. fileName
+	if not isfile(path) then
+		local data = downloadAsset({ASSET_BASE_URL .. "sounds/" .. fileName}, 4096)
+		if data:sub(1, 4) ~= "RIFF" then
+			error(fileName .. " download looks broken (" .. #data .. " bytes)")
+		end
+		ensureMacFolder()
+		writefile(path, data)
+	end
+	return getcustomasset(path)
+end
+-- Plays one without waiting (downloading it first if it isn't saved yet)
+function macSounds.play(fileName, volume)
+	task.spawn(function()
+		local ok, id = pcall(macSounds.get, fileName)
+		if not ok then
+			warn("[coolui] couldn't play " .. fileName .. ": " .. tostring(id))
+			return
+		end
+		local sound = Instance.new("Sound")
+		sound.Name = "coolui_mac_sound"
+		sound.SoundId = id
+		sound.Volume = volume or 0.5
+		sound.Parent = game:GetService("SoundService")
+		sound:Play()
+		sound.Ended:Once(function()
+			sound:Destroy()
+		end)
+		game:GetService("Debris"):AddItem(sound, 15)
+	end)
 end
 
 -- ---------- Wallpaper ----------
@@ -2076,6 +2159,16 @@ local MAC_TEXT_GLASS = {
 -- Glass for the Wi-Fi and battery menus: the Dock's clear glass, with the
 -- lengths scaled down so the rim is about as wide as the Dock's (the menus
 -- are about twice as tall), plus a little more frost behind the text
+-- Spotlight's search bar: a capsule of glass with a strong lensing rim. Only
+-- lightly tinted: a gradient over it darkens the top (see openSpotlight).
+local MAC_SPOTLIGHT_GLASS = {
+	thickness = 0.34, refraction = 2.1, aberration = 0.22,
+	frost = 0.12,
+	tint = Color3.fromRGB(14, 12, 12), tintAlpha = 0.3,
+	fresnelSize = 0.1, fresnelHardness = 0.4, fresnelIntensity = 0.3,
+	glareSize = 0.2, glareHardness = 0.4, glareIntensity = 0.55,
+	glareConvergence = 0.9, glareOpposite = 0.5, glareAngle = -50,
+}
 local MAC_MENU_GLASS = {
 	thickness = 0.18, refraction = 2.1, aberration = 0.2,
 	frost = 0.05,
@@ -2321,6 +2414,9 @@ end
 local function bakeMacGlassRim(name, w, h, opts)
 	w, h = math.max(2, math.round(w)), math.max(2, math.round(h))
 	local path = string.format("%s/glassrim_v%d_%s_%dx%d_r%d.png", MACOS_FOLDER, MAC_GLASS_VERSION, name, w, h, math.round((opts.cornerRadius or 0) * 10))
+	macMadeImages.remember(path, function()
+		bakeMacGlassRim(name, w, h, opts)
+	end)
 	if not isfile(path) then
 		local shapeAt, p = macRoundedRectGlass(w, h, opts)
 		local optics = macGlassOptics(p)
@@ -2352,6 +2448,9 @@ end
 local function bakeMacGlass(name, x0, y0, w, h, width, height, opts)
 	x0, y0, w, h = math.round(x0), math.round(y0), math.max(2, math.round(w)), math.max(2, math.round(h))
 	local path = string.format("%s/glass_v%d_%s_%dx%d_%dx%d_%d_%d.png", MACOS_FOLDER, MAC_GLASS_VERSION, name, width, height, w, h, x0, y0)
+	macMadeImages.remember(path, function()
+		bakeMacGlass(name, x0, y0, w, h, width, height, opts)
+	end)
 	if not isfile(path) then
 		ensureMacFolder()
 		writefile(path, renderMacGlassPng(x0, y0, w, h, macSamplerFor(width, height), opts))
@@ -2765,6 +2864,9 @@ local function bakeMacClockGlyph(placement, width, height)
 	local y0 = math.round(placement.baselineY - field.baselineY)
 	local name = if placement.char == ":" then "colon" else placement.char
 	local path = string.format("%s/glass_v%d_clock_%s_%d_%dx%d_%d_%d.png", MACOS_FOLDER, MAC_GLASS_VERSION, name, fontPx, width, height, x0, y0)
+	macMadeImages.remember(path, function()
+		bakeMacClockGlyph(placement, width, height)
+	end)
 	if not isfile(path) then
 		local t = MAC_TEXT_GLASS
 		local w, depthMap, normalX, normalY = field.w, field.depth, field.normalX, field.normalY
@@ -4051,10 +4153,30 @@ local function createMacBootScreen(parent, zIndex, fadeIn)
 		corner.CornerRadius = UDim.new(1, 0)
 		corner.Parent = bar
 	end
+	-- What it's doing, under the bar (only Redownload uses these)
+	local function statusLine(offsetY, textSize)
+		local label = Instance.new("TextLabel")
+		label.BackgroundTransparency = 1
+		label.AnchorPoint = Vector2.new(0.5, 0)
+		label.Position = UDim2.new(0.5, 0, 0.56, offsetY)
+		label.Size = UDim2.new(0.8, 0, 0, textSize + 6)
+		label.FontFace = macFont(Enum.FontWeight.Medium)
+		label.TextSize = textSize
+		label.TextColor3 = Color3.new(1, 1, 1)
+		label.TextTransparency = 1
+		label.TextTruncate = Enum.TextTruncate.AtEnd
+		label.Text = ""
+		label.ZIndex = zIndex + 1
+		label.Parent = frame
+		return label
+	end
+	local statusLabel = statusLine(22, 15)
+	local fileLabel = statusLine(44, 13)
 
 	local boot = {}
 	local fadeInfo = TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-	-- Fades in (to black first, if asked) and shows the logo and bar; yields
+	-- Fades in (to black first, if asked) and shows the logo and bar, with
+	-- the startup chime; yields
 	function boot.show()
 		if fadeIn then
 			local black = TweenService:Create(frame, TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {BackgroundTransparency = 0})
@@ -4062,11 +4184,21 @@ local function createMacBootScreen(parent, zIndex, fadeIn)
 			black.Completed:Wait()
 			task.wait(0.3)
 		end
+		macSounds.play(macSounds.startup)
 		TweenService:Create(logo, fadeInfo, {ImageTransparency = 0}):Play()
 		task.wait(0.4)
 		TweenService:Create(track, fadeInfo, {BackgroundTransparency = 0.72}):Play()
 		TweenService:Create(fill, fadeInfo, {BackgroundTransparency = 0}):Play()
 		task.wait(0.5)
+	end
+	-- `title` ("Downloading music 1/2") and `detail` (the file's name)
+	function boot.setStatus(title, detail)
+		statusLabel.Text = title or ""
+		fileLabel.Text = detail or ""
+		if statusLabel.TextTransparency == 1 then
+			TweenService:Create(statusLabel, fadeInfo, {TextTransparency = 0.08}):Play()
+			TweenService:Create(fileLabel, fadeInfo, {TextTransparency = 0.5}):Play()
+		end
 	end
 	function boot.setProgress(fraction, time)
 		TweenService:Create(fill, TweenInfo.new(time or 0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
@@ -4089,6 +4221,8 @@ local function createMacBootScreen(parent, zIndex, fadeIn)
 		TweenService:Create(logo, out, {ImageTransparency = 1}):Play()
 		TweenService:Create(track, out, {BackgroundTransparency = 1}):Play()
 		TweenService:Create(fill, out, {BackgroundTransparency = 1}):Play()
+		TweenService:Create(statusLabel, out, {TextTransparency = 1}):Play()
+		TweenService:Create(fileLabel, out, {TextTransparency = 1}):Play()
 		task.wait(0.55)
 	end
 	-- (boot.ownGui: a ScreenGui made just for it, removed too)
@@ -4242,6 +4376,92 @@ local function macListFolder(path)
 		return a.name:lower() < b.name:lower()
 	end)
 	return entries
+end
+
+-- Redownload (System Settings > General): deletes every file macOS
+-- downloaded or made (the music, the clock font, the wallpaper, every Liquid
+-- Glass image) and gets each one again. Notes, settings, the background
+-- choice, the Claude key and your own songs stay. `report(fraction, title,
+-- file)` says what it's on; yields.
+local function rebuildMacAssets(report)
+	local made = {"^glass_", "^glassrim_", "^softglow", "^disc_v", "^edgeglow", "^ripple", "^clockfont_", "^wallpaper[%._]", "^sound_"}
+	local downloadedMusic = {"loadingsuccess.mp3", "shopmusic.mp3"}
+	local doomed = {}
+	pcall(function()
+		for _, entry in ipairs(macListFolder(MACOS_FOLDER)) do
+			for _, pattern in ipairs(made) do
+				if not entry.folder and entry.name:match(pattern) then
+					table.insert(doomed, entry)
+					break
+				end
+			end
+		end
+	end)
+	for _, name in ipairs(downloadedMusic) do
+		local path = MUSIC_FOLDER .. "/" .. name
+		if isfile(path) then
+			table.insert(doomed, {name = name, path = path})
+		end
+	end
+
+	-- What to get back, in order: downloads first (the glass clock needs the font)
+	local jobs = {}
+	for i, name in ipairs(downloadedMusic) do
+		table.insert(jobs, {string.format("Downloading music %d/%d", i, #downloadedMusic), name, function()
+			getMusicAsset(name)
+		end})
+	end
+	for i, name in ipairs({macSounds.startup, macSounds.login}) do
+		table.insert(jobs, {string.format("Downloading sound %d/2", i), name, function()
+			macSounds.get(name)
+		end})
+	end
+	table.insert(jobs, {"Downloading font 1/1", "Inter-Bold.ttf", function()
+		macClockFont = nil
+		loadMacClockFont()
+	end})
+	if MACOS_WALLPAPER_URL ~= "" then
+		table.insert(jobs, {"Downloading wallpaper 1/1", MACOS_WALLPAPER_URL:match("([^/?]+)[^/]*$") or "wallpaper", getMacWallpaperAsset})
+	end
+	-- Every image this session has used: the glow and the traffic lights'
+	-- disc first, then each piece of glass
+	local images = {}
+	for _, path in ipairs({MACOS_FOLDER .. "/softglow.png", MACOS_FOLDER .. "/disc_v3.png"}) do
+		for _, item in ipairs(macMadeImages.list) do
+			if item.path == path then
+				table.insert(images, item)
+			end
+		end
+	end
+	for _, item in ipairs(macMadeImages.list) do
+		if not table.find(images, item) then
+			table.insert(images, item)
+		end
+	end
+	for i, item in ipairs(images) do
+		table.insert(jobs, {string.format("Creating image %d/%d", i, #images), item.path:match("([^/]+)$"), item.make})
+	end
+
+	-- Deleting counts for the first tenth of the bar
+	for i, entry in ipairs(doomed) do
+		report(0.1 * i / #doomed, string.format("Deleting old assets %d/%d", i, #doomed), entry.name)
+		pcall(delfile, entry.path)
+		if i % 8 == 0 then
+			task.wait()
+		end
+	end
+	local failed = 0
+	for i, job in ipairs(jobs) do
+		report(0.1 + 0.9 * (i - 1) / #jobs, job[1], job[2])
+		task.wait()
+		local ok, err = pcall(job[3])
+		if not ok then
+			failed += 1
+			warn("[coolui] Redownload: " .. job[2] .. " failed: " .. tostring(err))
+		end
+	end
+	report(1, if failed > 0 then string.format("Done, but %d couldn't be downloaded", failed) else "All assets downloaded", "")
+	return failed
 end
 
 local function createMacDesktop(session)
@@ -5256,6 +5476,74 @@ local function createMacDesktop(session)
 		return n .. " " .. word .. (if n == 1 then "" else "s")
 	end
 
+	-- Sleep, Restart and Shut Down, each after its alert (the Apple menu and
+	-- Spotlight both use these)
+	local function confirmSleep()
+		local confirmed, keepRunning = showAlert({
+			title = "Put macOS to sleep?",
+			message = "macOS hides so you can play the game. To wake it, click Wake macOS at the top of the screen.",
+			checkbox = {text = "Keep apps running while asleep (music keeps playing)", value = session.keepRunning == true},
+			confirm = "Sleep",
+		})
+		if confirmed then
+			session.keepRunning = keepRunning
+			finish("sleep")
+		end
+	end
+
+	local function confirmRestart()
+		local confirmed, reopen = showAlert({
+			title = "Are you sure you want to restart your computer now?",
+			message = function(left)
+				return "If you do nothing, the computer will restart automatically in " .. plural(left, "second") .. "."
+			end,
+			countdown = 60,
+			checkbox = {text = "Reopen windows when logging back in", value = true},
+			confirm = "Restart",
+		})
+		if confirmed then
+			desktop.reopenList = if reopen then snapshotWindows() else nil
+			finish("restart")
+		end
+	end
+
+	local function confirmShutDown()
+		local confirmed, reopen = showAlert({
+			title = "Are you sure you want to shut down your computer now?",
+			message = function(left)
+				return "If you do nothing, the computer will shut down automatically in " .. plural(left, "second") .. "."
+			end,
+			countdown = 60,
+			checkbox = {text = "Reopen windows when logging back in", value = true},
+			confirm = "Shut Down",
+		})
+		if confirmed then
+			-- Saved, so they reopen the next time macOS is loaded
+			macSettings.reopen = if reopen then snapshotWindows() else nil
+			saveMacSettings()
+			finish("shutdown")
+		end
+	end
+
+	-- System Settings > General > Redownload (see rebuildMacAssets)
+	local function confirmRedownload()
+		local confirmed, reopen = showAlert({
+			title = "Redownload macOS's assets?",
+			message = "macOS will restart, delete its music, sounds, font and glass images, and get them all again. Notes, settings and your Claude key stay.",
+			checkbox = {text = "Reopen windows when logging back in", value = true},
+			confirm = "Redownload",
+		})
+		if confirmed then
+			desktop.reopenList = if reopen then snapshotWindows() else nil
+			finish("redownload")
+		end
+	end
+
+	-- Ask (Spotlight's Claude): filled in by the Ask section further down.
+	-- transcript: what the panel shows ({kind, text}); messages: the
+	-- conversation as JSON, as Anthropic's API takes it.
+	local ask = {transcript = {}, messages = {}, busy = false, status = ""}
+
 	menuTitle("", Enum.FontWeight.Bold, 1, function()
 		return {
 			{"About This Mac", function()
@@ -5266,50 +5554,9 @@ local function createMacDesktop(session)
 				openApp("settings")
 			end},
 			"-",
-			{"Sleep…", function()
-				local confirmed, keepRunning = showAlert({
-					title = "Put macOS to sleep?",
-					message = "macOS hides so you can play the game. To wake it, click Wake macOS in the top-left corner.",
-					checkbox = {text = "Keep apps running while asleep (music keeps playing)", value = session.keepRunning == true},
-					confirm = "Sleep",
-				})
-				if confirmed then
-					session.keepRunning = keepRunning
-					finish("sleep")
-				end
-			end},
-			{"Restart…", function()
-				local confirmed, reopen = showAlert({
-					title = "Are you sure you want to restart your computer now?",
-					message = function(left)
-						return "If you do nothing, the computer will restart automatically in " .. plural(left, "second") .. "."
-					end,
-					countdown = 60,
-					checkbox = {text = "Reopen windows when logging back in", value = true},
-					confirm = "Restart",
-				})
-				if confirmed then
-					desktop.reopenList = if reopen then snapshotWindows() else nil
-					finish("restart")
-				end
-			end},
-			{"Shut Down…", function()
-				local confirmed, reopen = showAlert({
-					title = "Are you sure you want to shut down your computer now?",
-					message = function(left)
-						return "If you do nothing, the computer will shut down automatically in " .. plural(left, "second") .. "."
-					end,
-					countdown = 60,
-					checkbox = {text = "Reopen windows when logging back in", value = true},
-					confirm = "Shut Down",
-				})
-				if confirmed then
-					-- Saved, so they reopen the next time macOS is loaded
-					macSettings.reopen = if reopen then snapshotWindows() else nil
-					saveMacSettings()
-					finish("shutdown")
-				end
-			end},
+			{"Sleep…", confirmSleep},
+			{"Restart…", confirmRestart},
+			{"Shut Down…", confirmShutDown},
 			"-",
 			{"Lock Screen", function()
 				finish("lock")
@@ -5704,8 +5951,16 @@ local function createMacDesktop(session)
 		BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
 		Size = UDim2.fromOffset(16, 16), Parent = wifiButton,
 	}), white)
-	local searchHolder = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.fromOffset(31, 24), LayoutOrder = 3, Parent = menuRight})
-	macImage(searchHolder, I.search, 15, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
+	-- The magnifier opens Spotlight (further down)
+	local toggleSpotlight
+	local spotlightGlass = nil -- its live glass over the 3D scene
+	local searchButton = macButton(menuRight, {Size = UDim2.fromOffset(31, 24), BackgroundColor3 = white, LayoutOrder = 3})
+	macCorner(searchButton, 6)
+	macImage(searchButton, I.search, 15, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
+	searchButton.MouseButton1Down:Connect(function()
+		closeMenu()
+		toggleSpotlight()
+	end)
 	local clockLabel = macLabel(menuRight, "", 14, Enum.FontWeight.Medium, white, {
 		AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 20), LayoutOrder = 4,
 	})
@@ -6682,6 +6937,46 @@ local function createMacDesktop(session)
 					rebuildRows()
 					play(i)
 				end
+				-- For Ask: "play" (a song whose name contains `song`, or carry
+				-- on), "pause", "next", "previous" or "status". Returns what's
+				-- playing and every song, or nil and what went wrong.
+				function win.control(command, song)
+					if command == "play" then
+						if type(song) == "string" and song ~= "" then
+							local wanted, found = song:lower(), nil
+							for i, track in ipairs(tracks) do
+								if track.title:lower() == wanted then
+									found = i
+									break
+								end
+							end
+							for i, track in ipairs(tracks) do
+								if not found and track.title:lower():find(wanted, 1, true) then
+									found = i
+								end
+							end
+							if not found then
+								return nil, "There's no song called \"" .. song .. "\""
+							end
+							play(found)
+						elseif index == 0 then
+							play(1)
+						elseif not sound.IsPlaying then
+							sound:Resume()
+						end
+					elseif command == "pause" then
+						sound:Pause()
+					elseif command == "next" and #tracks > 0 then
+						play(index % #tracks + 1)
+					elseif command == "previous" and #tracks > 0 then
+						play((index - 2) % #tracks + 1)
+					end
+					local names = {}
+					for _, track in ipairs(tracks) do
+						table.insert(names, track.title)
+					end
+					return {playing = sound.IsPlaying, track = if tracks[index] then tracks[index].title else nil, songs = names}
+				end
 				if args.path then
 					win.openPath(args.path)
 				end
@@ -6967,6 +7262,131 @@ local function createMacDesktop(session)
 						Position = UDim2.fromOffset(20, 50), Size = UDim2.new(1, -40, 0, 54), TextWrapped = true,
 						TextYAlignment = Enum.TextYAlignment.Top,
 					})
+
+					-- Redownload: restarts into the startup screen, which deletes the
+					-- assets and gets them again (see rebuildMacAssets)
+					local assetsRow = group(pane, 116, 1)[1]
+					macLabel(assetsRow, "Assets", 14, Enum.FontWeight.Regular, C.ink, {Position = UDim2.fromOffset(14, 0), Size = UDim2.new(1, -170, 1, 0)})
+					local redownload = macButton(assetsRow, {
+						AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(122, 26),
+						BackgroundTransparency = 0.9, BackgroundColor3 = C.line,
+					})
+					macCorner(redownload, UDim.new(1, 0))
+					macLabel(redownload, "Redownload…", 13, Enum.FontWeight.Medium, C.ink, {Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center})
+					redownload.MouseButton1Click:Connect(function()
+						task.spawn(confirmRedownload)
+					end)
+					macLabel(pane, "Deletes the music, sounds, clock font and Liquid Glass images macOS has saved, then restarts and downloads or makes each one again. Try it if something looks broken.", 13, Enum.FontWeight.Regular, C.inkSoft, {
+						Position = UDim2.fromOffset(20, 166), Size = UDim2.new(1, -40, 0, 54), TextWrapped = true,
+						TextYAlignment = Enum.TextYAlignment.Top,
+					})
+				end
+
+				-- Ask: the Claude API key Spotlight's Ask uses
+				panes.Ask = function(pane)
+					local red, green = Color3.fromRGB(230, 70, 60), Color3.fromRGB(40, 170, 80)
+					local top = group(pane, 0, 1)[1]
+					ask.orb(top, 26).Position = UDim2.fromOffset(10, 7)
+					macLabel(top, "Claude API key", 14, Enum.FontWeight.Medium, C.ink, {Position = UDim2.fromOffset(46, 0), Size = UDim2.new(1, -250, 1, 0)})
+					local current = macLabel(top, "", 14, Enum.FontWeight.Regular, C.inkSoft, {
+						AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -100, 0, 0), Size = UDim2.fromOffset(150, 40),
+						TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd,
+					})
+					local remove = macButton(top, {
+						AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(84, 26),
+						BackgroundTransparency = 0.9, BackgroundColor3 = C.line,
+					})
+					macCorner(remove, UDim.new(1, 0))
+					macLabel(remove, "Remove", 13, Enum.FontWeight.Medium, C.ink, {Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center})
+
+					-- The field shows dots, never the key itself
+					local fieldRow = group(pane, 52, 1)[1]
+					local hint = "Paste your key (sk-ant-…)"
+					local field = macNew("TextBox", {
+						BackgroundTransparency = 1, ClearTextOnFocus = false, Text = "", PlaceholderText = "", TextTransparency = 1,
+						TextColor3 = C.ink, FontFace = macFont(Enum.FontWeight.Regular), TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
+						Position = UDim2.fromOffset(14, 0), Size = UDim2.new(1, -110, 1, 0), ClipsDescendants = true, Parent = fieldRow,
+					})
+					local dots = macLabel(fieldRow, hint, 14, Enum.FontWeight.Regular, C.inkSoft, {
+						Position = UDim2.fromOffset(14, 0), Size = UDim2.new(1, -110, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+					})
+					field:GetPropertyChangedSignal("Text"):Connect(function()
+						local count = utf8.len(field.Text) or #field.Text
+						dots.Text = if count == 0 then hint else string.rep("•", math.min(count, 60))
+						dots.TextColor3 = if count == 0 then C.inkSoft else C.ink
+					end)
+					local save = macButton(fieldRow, {
+						AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(84, 26),
+						BackgroundTransparency = 0, BackgroundColor3 = C.accent,
+					})
+					macCorner(save, UDim.new(1, 0))
+					macLabel(save, "Save", 13, Enum.FontWeight.Medium, white, {Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center})
+					local message = macLabel(pane, "", 13, Enum.FontWeight.Medium, C.inkSoft, {
+						Position = UDim2.fromOffset(20, 98), Size = UDim2.new(1, -40, 0, 18), TextTruncate = Enum.TextTruncate.AtEnd,
+					})
+					local function say(text, color)
+						message.Text = text
+						message.TextColor3 = color or C.inkSoft
+					end
+					local function refresh()
+						local key = macClaudeKey.read()
+						current.Text = if key then macClaudeKey.masked(key) else "Not set"
+						current.Position = UDim2.new(1, if key then -100 else -14, 0, 0)
+						remove.Visible = key ~= nil
+					end
+					refresh()
+					local checking = false
+					local function trySave()
+						local key = (field.Text:gsub("%s", ""))
+						if key == "" or checking then
+							return
+						end
+						if not key:match("^sk%-ant%-") then
+							say("That doesn't look like a Claude API key: they start with sk-ant-.", red)
+							return
+						end
+						-- Anthropic's free model list says whether the key works
+						checking = true
+						say("Checking the key with Anthropic…")
+						task.spawn(function()
+							local ok, problem = ask.checkKey(key)
+							checking = false
+							if ok then
+								macClaudeKey.save(key)
+								field.Text = ""
+								refresh()
+								say("Saved. Press Ctrl+Space and type a question to Ask.", green)
+							else
+								say(problem or "Anthropic didn't accept that key.", red)
+							end
+						end)
+					end
+					save.MouseButton1Click:Connect(trySave)
+					field.FocusLost:Connect(function(enterPressed)
+						if enterPressed then
+							trySave()
+						end
+					end)
+					remove.MouseButton1Click:Connect(function()
+						macClaudeKey.remove()
+						refresh()
+						say("Removed. Ask is off until you add a key.")
+					end)
+
+					local switches = group(pane, 126, 2)
+					for i, spec in ipairs({{"Let Claude use this Mac", "askTools"}, {"Let Claude search the web", "askWeb"}}) do
+						macLabel(switches[i], spec[1], 14, Enum.FontWeight.Regular, C.ink, {Position = UDim2.fromOffset(14, 0), Size = UDim2.new(1, -80, 1, 0)})
+						local toggle = macToggle(switches[i], macSettings[spec[2]] ~= false, function(on)
+							macSettings[spec[2]] = on
+							saveMacSettings()
+						end)
+						toggle.button.AnchorPoint = Vector2.new(1, 0.5)
+						toggle.button.Position = UDim2.new(1, -14, 0.5, 0)
+					end
+					macLabel(pane, "Ask (in Spotlight) sends what you type to Claude Opus 5.5 with your own API key, so it's billed to your Anthropic account (web searches cost about a cent each). Claude can open apps, arrange windows, read and write files in the workspace, play music and change settings; Sleep, Restart and Shut Down still ask you first. The key is saved as plain text in your executor's workspace (coolui_assets/claude_api_key.txt) and is only ever sent to api.anthropic.com. Get one at console.anthropic.com.", 13, Enum.FontWeight.Regular, C.inkSoft, {
+						Position = UDim2.fromOffset(20, 216), Size = UDim2.new(1, -40, 0, 120), TextWrapped = true,
+						TextYAlignment = Enum.TextYAlignment.Top,
+					})
 				end
 
 				panes.Appearance = function(pane)
@@ -7040,7 +7460,13 @@ local function createMacDesktop(session)
 					})
 				end)
 				paneButton("Wallpaper", I.image, Color3.fromRGB(90, 200, 250), Color3.fromRGB(0, 122, 255), 5)
-				paneButton("About", I.info, Color3.fromRGB(176, 178, 186), Color3.fromRGB(112, 114, 124), 6)
+				-- Ask's icon: Claude's orb on black
+				paneButton("Ask", nil, Color3.fromRGB(44, 44, 52), Color3.fromRGB(14, 14, 18), 6, function(tile)
+					local orb = ask.orb(tile, 14)
+					orb.AnchorPoint = Vector2.new(0.5, 0.5)
+					orb.Position = UDim2.fromScale(0.5, 0.5)
+				end)
+				paneButton("About", I.info, Color3.fromRGB(176, 178, 186), Color3.fromRGB(112, 114, 124), 7)
 				win.showPane = function(name)
 					if panes[name] then
 						showPane(name)
@@ -7070,6 +7496,9 @@ local function createMacDesktop(session)
 		if menuGlass and root.Visible then
 			menuGlass.update(workspace.CurrentCamera)
 		end
+		if spotlightGlass and root.Visible then
+			spotlightGlass.update(workspace.CurrentCamera)
+		end
 	end)
 
 	task.spawn(function()
@@ -7083,6 +7512,1915 @@ local function createMacDesktop(session)
 	connect(gui:GetPropertyChangedSignal("AbsoluteSize"), relayout)
 	refreshMenuBar()
 	refreshDock()
+
+	-- ---------- Spotlight ----------
+	-- macOS 27's "Search or Ask" bar: a capsule of dark Liquid Glass with a
+	-- glowing cursor (the menu bar's magnifier, or Ctrl+Space). It finds apps,
+	-- System Settings panes, actions (Lock Screen, Sleep, Restart, Dark Mode…),
+	-- files in the workspace, and works out sums. With a Claude API key
+	-- (System Settings > Ask) it also Asks: see the Ask section below.
+	-- Sized like macOS 27's bar (measured from Apple's own screenshot): about
+	-- six times as long as it's tall, a seventh of the way down the screen
+	local SPOT_WIDTH, SPOT_HEIGHT, SPOT_TOP = 460, 74, 150
+	local SPOT_TEXT_SIZE, SPOT_TEXT_LEFT = 20, 30
+	local TextService = game:GetService("TextService")
+	local SPOT_ROW, SPOT_MAX_ROWS = 40, 8
+	local spotlight = nil -- the open one
+	local fileIndex, indexing, indexedAt = nil, false, 0
+
+	-- Files and folders in the workspace, a few levels deep. Built in the
+	-- background when Spotlight opens (and again after a while, as files change).
+	local function indexFiles()
+		if indexing then
+			return
+		end
+		indexing = true
+		local found = {}
+		local queue = {{"", 0}}
+		local folders = 0
+		while #queue > 0 and #found < 3000 and alive do
+			local folder = table.remove(queue, 1)
+			local ok, entries = pcall(macListFolder, folder[1])
+			if ok then
+				for _, entry in ipairs(entries) do
+					table.insert(found, entry)
+					if entry.folder and folder[2] < 3 then
+						table.insert(queue, {entry.path, folder[2] + 1})
+					end
+				end
+			end
+			folders += 1
+			if folders % 6 == 0 then
+				task.wait()
+			end
+		end
+		fileIndex, indexing, indexedAt = found, false, os.clock()
+	end
+
+	-- Opens a found file in the app that shows it (or its folder in Finder)
+	local function openFile(entry)
+		if entry.folder then
+			openApp("finder", {path = entry.path, newWindow = true})
+			return
+		end
+		local ext = macExtension(entry.name)
+		if MAC_IMAGE_EXTENSIONS[ext] then
+			openApp("preview", {path = entry.path, newWindow = true})
+		elseif MAC_AUDIO_EXTENSIONS[ext] then
+			openApp("music", {path = entry.path})
+		elseif MAC_TEXT_EXTENSIONS[ext] then
+			openApp("notes", {path = entry.path, newWindow = true})
+		else
+			openApp("finder", {path = entry.path:match("^(.*)/[^/]+$") or "", newWindow = true})
+		end
+	end
+
+	-- Everything Spotlight knows besides files: {title, kind, keywords?,
+	-- tile (an app, for its icon) or icon, action}
+	local spotlightItems = {}
+	do
+		local settingsTile, finderTile
+		for _, app in ipairs(MAC_APPS) do
+			if app.id == "settings" then
+				settingsTile = app
+			elseif app.id == "finder" then
+				finderTile = app
+			end
+		end
+		local appWords = {
+			finder = "files folders workspace", notes = "text write", music = "songs mp3 audio",
+			terminal = "console shell command luau", settings = "preferences system",
+		}
+		for _, app in ipairs(MAC_APPS) do
+			table.insert(spotlightItems, {title = app.name, kind = "Application", keywords = appWords[app.id], tile = app, action = function()
+				openApp(app.id)
+			end})
+		end
+		table.insert(spotlightItems, {title = "Trash", kind = "Application", tile = MAC_TRASH, action = function()
+			openApp("trash")
+		end})
+		table.insert(spotlightItems, {title = "About This Mac", kind = "Application", tile = finderTile, action = function()
+			openApp("about")
+		end})
+		local paneWords = {
+			["Wi-Fi"] = "wifi internet network ping", Battery = "power", General = "startup screen redownload assets",
+			Appearance = "dark mode light mode theme", Wallpaper = "background desktop 3d scene", Ask = "claude ai api key siri",
+			About = "version",
+		}
+		for _, pane in ipairs({"Wi-Fi", "Battery", "General", "Appearance", "Wallpaper", "Ask", "About"}) do
+			table.insert(spotlightItems, {title = pane, kind = "System Settings", keywords = paneWords[pane], tile = settingsTile, action = function()
+				openApp("settings", {pane = pane})
+			end})
+		end
+		local actions = {
+			{"Lock Screen", function()
+				finish("lock")
+			end},
+			{"Log Out", function()
+				finish("logout")
+			end},
+			{"Sleep", confirmSleep},
+			{"Restart", confirmRestart},
+			{"Shut Down", confirmShutDown},
+			{"Dark Mode", function()
+				desktop.setAppearance("dark")
+			end, "appearance theme"},
+			{"Light Mode", function()
+				desktop.setAppearance("light")
+			end, "appearance theme"},
+			{"Redownload Assets", confirmRedownload, "download reset images"},
+		}
+		for _, action in ipairs(actions) do
+			table.insert(spotlightItems, {title = action[1], kind = "Action", keywords = action[3], icon = I.apple, action = action[2]})
+		end
+	end
+
+	-- How well `text` matches (0 = not at all): whole, start, start of a word, anywhere
+	local function matchScore(text, query)
+		text = text:lower()
+		if text == query then
+			return 4
+		elseif text:sub(1, #query) == query then
+			return 3
+		elseif text:find("[%s%-_%.]" .. query:gsub("%p", "%%%0")) then
+			return 2
+		elseif text:find(query, 1, true) then
+			return 1
+		end
+		return 0
+	end
+
+	-- A sum like "12 * (3 + 4)": only digits, operators and brackets, so it's
+	-- safe to hand to Luau
+	local function calculate(query)
+		if not query:match("^[%d%s%.%+%-%*/%%%^%(%)]+$") or not query:match("%d") or not query:match("%d%s*[%+%-%*/%%%^]") then
+			return nil
+		end
+		local chunk = loadstring("return " .. query)
+		if not chunk then
+			return nil
+		end
+		local ok, value = pcall(chunk)
+		if ok and type(value) == "number" and value == value and math.abs(value) ~= math.huge then
+			return value
+		end
+		return nil
+	end
+
+	-- `canAsk`: there's a Claude key, so the query can be asked too
+	local function search(query, canAsk)
+		local original = query:match("^%s*(.-)%s*$")
+		query = original:lower()
+		if query == "" then
+			return {}
+		end
+		local results = {}
+		local value = calculate(query)
+		if value then
+			local text = if value == math.floor(value) and math.abs(value) < 1e15 then string.format("%d", value) else string.format("%.10g", value)
+			table.insert(results, {title = "= " .. text, kind = "Calculator — Enter copies", icon = I.plus, score = 10, action = function()
+				pcall(setclipboard, text)
+			end})
+		end
+		for _, item in ipairs(spotlightItems) do
+			local score = matchScore(item.title, query)
+			if score == 0 and item.keywords and matchScore(item.keywords, query) > 0 then
+				score = 0.5
+			end
+			if score > 0 then
+				item.score = score + 1.5 -- apps, settings and actions before files
+				table.insert(results, item)
+			end
+		end
+		if fileIndex then
+			local files = 0
+			for _, entry in ipairs(fileIndex) do
+				local score = matchScore(entry.name, query)
+				if score > 0 then
+					local kind, icon = macFileKind(entry.name, entry.folder)
+					local where = entry.path:match("^(.*)/[^/]+$")
+					table.insert(results, {
+						title = entry.name, kind = if where then kind .. " — " .. where else kind, icon = icon,
+						iconColor = if entry.folder then Color3.fromRGB(100, 170, 255) else Color3.fromRGB(205, 205, 212),
+						score = score, isFile = true, action = function()
+							openFile(entry)
+						end,
+					})
+					files += 1
+					if files >= 40 then
+						break
+					end
+				end
+			end
+		end
+		table.sort(results, function(a, b)
+			if a.score ~= b.score then
+				return a.score > b.score
+			end
+			return #a.title < #b.title
+		end)
+		local top, files = {}, 0
+		for _, item in ipairs(results) do
+			local isFile = item.isFile == true
+			if not isFile or files < 5 then
+				table.insert(top, item)
+				files += if isFile then 1 else 0
+			end
+			if #top >= SPOT_MAX_ROWS then
+				break
+			end
+		end
+
+		-- Ask Claude: first when nothing matches well or it reads like a
+		-- sentence, otherwise last. Without a key, a way to set one up.
+		local _, words = original:gsub("%S+", "")
+		local askRow = nil
+		if canAsk then
+			askRow = {title = original, kind = if #ask.transcript > 0 then "Ask a follow-up" else "Ask Claude", orb = true, ask = true}
+		elseif words >= 3 or #top == 0 then
+			askRow = {title = "Ask Claude", kind = "Set up in System Settings", orb = true, action = function()
+				openApp("settings", {pane = "Ask"})
+			end}
+		end
+		if askRow then
+			local first = canAsk and (words >= 3 or not top[1] or top[1].score < 3)
+			if first then
+				table.insert(top, 1, askRow)
+			else
+				table.insert(top, askRow)
+			end
+			if #top > SPOT_MAX_ROWS then
+				table.remove(top, if first then #top else SPOT_MAX_ROWS)
+			end
+		end
+		return top
+	end
+
+	local function closeSpotlight()
+		if not spotlight then
+			return
+		end
+		local open = spotlight
+		spotlight = nil
+		ask.onChange = nil
+		searchButton.BackgroundTransparency = 1
+		for _, connection in ipairs(open.connections) do
+			connection:Disconnect()
+		end
+		if spotlightGlass then
+			spotlightGlass.destroy()
+			spotlightGlass = nil
+		end
+		open.catcher:Destroy()
+		local out = tween(open.scale, 0.12, {Scale = 0.97}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		for _, item in ipairs(open.holder:GetDescendants()) do
+			if item:IsA("GuiObject") and item.BackgroundTransparency < 1 then
+				tween(item, 0.12, {BackgroundTransparency = 1}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			end
+			if item:IsA("ImageLabel") then
+				tween(item, 0.12, {ImageTransparency = 1}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			elseif item:IsA("TextLabel") or item:IsA("TextBox") then
+				tween(item, 0.12, {TextTransparency = 1}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			elseif item:IsA("UIStroke") then
+				tween(item, 0.12, {Transparency = 1}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			end
+		end
+		out.Completed:Once(function()
+			open.holder:Destroy()
+		end)
+	end
+
+	-- `quiet`: just show it (Ask's answer coming in), without taking the keyboard
+	local function openSpotlight(quiet)
+		if spotlight then
+			if not quiet then
+				spotlight.box:CaptureFocus()
+			end
+			return
+		end
+		closeMenu()
+		if not fileIndex or os.clock() - indexedAt > 30 then
+			task.spawn(indexFiles)
+		end
+		-- A conversation left alone for ten minutes starts over
+		if not ask.busy and ask.lastActivity and os.clock() - ask.lastActivity > 600 and ask.clear then
+			ask.clear()
+		end
+		searchButton.BackgroundTransparency = 0.72
+		local open = {connections = {}, results = {}, selected = 1, hasKey = macClaudeKey.read() ~= nil, glassParts = {}, merged = false}
+		spotlight = open
+
+		-- Clicking anywhere else closes it
+		open.catcher = macButton(overlay, {Size = UDim2.fromScale(1, 1), ZIndex = 25})
+		open.catcher.MouseButton1Down:Connect(closeSpotlight)
+		local holder = macNew("Frame", {
+			BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, SPOT_TOP),
+			Size = UDim2.fromOffset(SPOT_WIDTH, SPOT_HEIGHT), ZIndex = 26, Parent = overlay,
+		})
+		open.holder = holder
+		open.scale = macNew("UIScale", {Scale = 0.96, Parent = holder})
+		tween(open.scale, 0.2, {Scale = 1})
+
+		-- The bar. Like macOS 27's: glass that's nearly black along the top and
+		-- clears toward the bottom, where the background shows through, with
+		-- light catching its lower edge. (A dark fill where there's no glass.)
+		local bar = macNew("Frame", {
+			BackgroundColor3 = Color3.fromRGB(20, 20, 24), BackgroundTransparency = 1, BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0), Size = UDim2.fromScale(1, 1),
+			ZIndex = 2, Active = true, Parent = holder,
+		})
+		macCorner(bar, UDim.new(1, 0))
+		local edge = macStroke(bar, white, 0, 1)
+		macNew("UIGradient", {
+			Rotation = 90, Parent = edge,
+			Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 0.86), NumberSequenceKeypoint.new(0.6, 0.8), NumberSequenceKeypoint.new(1, 0.35),
+			}),
+		})
+		local shading = macNew("Frame", {
+			BackgroundColor3 = Color3.fromRGB(6, 6, 8), BackgroundTransparency = 0, BorderSizePixel = 0,
+			Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = bar,
+		})
+		macCorner(shading, UDim.new(1, 0))
+		macNew("UIGradient", {
+			Rotation = 90, Parent = shading,
+			Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 0.04), NumberSequenceKeypoint.new(0.45, 0.2), NumberSequenceKeypoint.new(1, 0.62),
+			}),
+		})
+		local baked = session.mode == "wallpaper" and not assets.wallpaper and assets.glow ~= nil
+		local live = session.mode == "scene" and macSky ~= nil
+		if baked or live then
+			task.spawn(function()
+				local ok, err = pcall(function()
+					-- Where the bar settles, in pixels from the top of the screen
+					local x = math.round((screenW - SPOT_WIDTH) / 2 * s)
+					local y = math.round(SPOT_TOP * s)
+					local w, h = math.round(SPOT_WIDTH * s), math.round(SPOT_HEIGHT * s)
+					local opts = table.clone(MAC_SPOTLIGHT_GLASS)
+					local pane = macNew("ImageLabel", {BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ImageTransparency = 1, ZIndex = 1, Parent = bar})
+					macCorner(pane, UDim.new(1, 0))
+					table.insert(open.glassParts, pane)
+					pane.Visible = not open.merged
+					local layers = {{pane, "ImageTransparency", 0}}
+					if baked then
+						local screen = gui.AbsoluteSize
+						pane.Image = bakeMacGlass("spotlight5", x, y, w, h, screen.X, screen.Y, opts)
+					else
+						local tint = macNew("Frame", {BackgroundColor3 = opts.tint, BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), ZIndex = 1, Parent = bar})
+						macCorner(tint, UDim.new(1, 0))
+						local rimLight = macNew("ImageLabel", {
+							BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ImageTransparency = 1, ZIndex = 1,
+							Image = bakeMacGlassRim("spotlight5", w, h, opts), Parent = bar,
+						})
+						table.insert(layers, {tint, "BackgroundTransparency", 1 - opts.tintAlpha})
+						table.insert(layers, {rimLight, "ImageTransparency", 0})
+						for _, part in ipairs({tint, rimLight}) do
+							table.insert(open.glassParts, part)
+							part.Visible = not open.merged
+						end
+						task.wait() -- sized by now
+						local glass = createMacLiveGlass(pane, opts)
+						glass.enabled = true
+						glass.update(workspace.CurrentCamera)
+						if spotlight == open then
+							spotlightGlass = glass
+						else
+							glass.destroy()
+						end
+					end
+					local images = {}
+					for _, layer in ipairs(layers) do
+						table.insert(images, layer[1])
+					end
+					ContentProvider:PreloadAsync(images)
+					if spotlight == open then
+						for _, layer in ipairs(layers) do
+							tween(layer[1], 0.15, {[layer[2]] = layer[3]}, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+						end
+					end
+				end)
+				if not ok then
+					warn("[coolui] Spotlight glass failed: " .. tostring(err))
+					open.barFill = 0.12
+					bar.BackgroundTransparency = if open.merged then 1 else 0.12
+				end
+			end)
+		else
+			open.barFill = 0.12
+			bar.BackgroundTransparency = 0.12
+		end
+		-- With an answer showing, the bar becomes the answer card's bottom row:
+		-- its own glass and shading go, and a hairline divides it off
+		local divider = macNew("Frame", {
+			BackgroundColor3 = white, BackgroundTransparency = 0.88, BorderSizePixel = 0, Position = UDim2.fromOffset(22, 0),
+			Size = UDim2.new(1, -44, 0, 1), Visible = false, ZIndex = 3, Parent = bar,
+		})
+		local function setMerged(on)
+			open.merged = on
+			shading.Visible = not on
+			edge.Enabled = not on
+			divider.Visible = on
+			bar.BackgroundTransparency = if on then 1 else open.barFill or 1
+			for _, part in ipairs(open.glassParts) do
+				part.Visible = not on
+			end
+			if not on then
+				bar.Position = UDim2.fromScale(0.5, 0)
+				bar.Size = UDim2.fromScale(1, 1)
+			end
+		end
+
+		-- Text field, with macOS 27's cursor drawn over Roblox's own: a bright
+		-- white line with a soft halo, wherever the cursor is in the text
+		local box = macNew("TextBox", {
+			BackgroundTransparency = 1, ClearTextOnFocus = false, Text = "", PlaceholderText = "Search",
+			PlaceholderColor3 = Color3.fromRGB(200, 198, 196), TextColor3 = white, FontFace = macFont(Enum.FontWeight.Regular),
+			TextSize = SPOT_TEXT_SIZE, TextXAlignment = Enum.TextXAlignment.Left, Position = UDim2.fromOffset(SPOT_TEXT_LEFT, 0),
+			Size = UDim2.new(1, -2 * SPOT_TEXT_LEFT, 1, 0), ClipsDescendants = true, ZIndex = 5, Parent = bar,
+		})
+		open.box = box
+		local caret = macNew("Frame", {
+			BackgroundColor3 = white, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0, SPOT_TEXT_LEFT, 0.5, 0), Size = UDim2.fromOffset(2, SPOT_TEXT_SIZE + 6),
+			Visible = false, ZIndex = 7, Parent = bar,
+		})
+		macCorner(caret, UDim.new(1, 0))
+		-- Two halos: a tight bright one, and a faint wider one
+		local halo = macNew("ImageLabel", {
+			BackgroundTransparency = 1, Image = assets.glow or "", ImageColor3 = Color3.fromRGB(255, 252, 245),
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(10, SPOT_TEXT_SIZE + 20),
+			ImageTransparency = 0.25, ZIndex = 6, Parent = caret,
+		})
+		local outerHalo = macNew("ImageLabel", {
+			BackgroundTransparency = 1, Image = assets.glow or "", ImageColor3 = Color3.fromRGB(255, 250, 240),
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(30, SPOT_TEXT_SIZE + 34),
+			ImageTransparency = 0.78, ZIndex = 6, Parent = caret,
+		})
+
+		-- Results, in a dark panel under the bar
+		local panel = macNew("Frame", {
+			BackgroundColor3 = Color3.fromRGB(24, 24, 28), BackgroundTransparency = 0, BorderSizePixel = 0,
+			Position = UDim2.fromOffset(0, SPOT_HEIGHT + 10), Size = UDim2.fromScale(1, 0), AutomaticSize = Enum.AutomaticSize.Y,
+			Visible = false, ZIndex = 2, Active = true, Parent = holder,
+		})
+		macCorner(panel, 22)
+		macStroke(panel, white, 0.88, 1)
+		macNew("UIPadding", {
+			PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), Parent = panel,
+		})
+		macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Parent = panel})
+
+		-- Ask. While Claude works, the bar gives way to a small "Working" pill
+		-- with a ring of dots, whose words turn into what you asked about once
+		-- that's known. Then the answer and the bar become one card: the answer
+		-- on top (with close and expand buttons), the bar as its bottom row for
+		-- a follow-up, and a ripple of light spreads through it as it arrives.
+		local pill = macNew("Frame", {
+			BackgroundColor3 = Color3.fromRGB(14, 14, 16), BackgroundTransparency = 0.06, BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, (SPOT_HEIGHT - 46) / 2), Size = UDim2.fromOffset(0, 46),
+			AutomaticSize = Enum.AutomaticSize.X, Visible = false, ZIndex = 2, Active = true, Parent = holder,
+		})
+		macCorner(pill, UDim.new(1, 0))
+		macStroke(pill, white, 0.9, 1)
+		local pillScale = macNew("UIScale", {Parent = pill})
+		macNew("UIPadding", {PaddingLeft = UDim.new(0, 13), PaddingRight = UDim.new(0, 10), Parent = pill})
+		macNew("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center,
+			SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 11), Parent = pill,
+		})
+		-- The ring: eight dots round a circle; a bright head goes round and the
+		-- dots behind it shrink and fade, leaving a gap just ahead of it
+		local ring = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.fromOffset(26, 26), LayoutOrder = 1, ZIndex = 3, Parent = pill})
+		local dots = {}
+		for i = 1, 8 do
+			local angle = (i - 1) / 8 * math.pi * 2
+			local dot = macNew("Frame", {
+				BackgroundColor3 = white, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.new(0.5, math.sin(angle) * 9.5, 0.5, -math.cos(angle) * 9.5), Size = UDim2.fromOffset(4, 4),
+				ZIndex = 3, Parent = ring,
+			})
+			macCorner(dot, UDim.new(1, 0))
+			dots[i] = {frame = dot, angle = angle}
+		end
+		local pillText = macLabel(pill, "Working", 16, Enum.FontWeight.Medium, white, {
+			Size = UDim2.fromOffset(0, 46), AutomaticSize = Enum.AutomaticSize.X, LayoutOrder = 2, ZIndex = 3,
+		})
+		-- Stop: a small square in a circle at the end of the pill
+		local stopButton = macButton(pill, {
+			Size = UDim2.fromOffset(26, 26), BackgroundTransparency = 0.85, BackgroundColor3 = white, LayoutOrder = 3, ZIndex = 3,
+		})
+		macCorner(stopButton, UDim.new(1, 0))
+		local stopSquare = macNew("Frame", {
+			BackgroundColor3 = white, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(9, 9), ZIndex = 4, Parent = stopButton,
+		})
+		macCorner(stopSquare, 2)
+		local shownTopic = "Working"
+		local function setPillText(text)
+			if text == shownTopic then
+				return
+			end
+			shownTopic = text
+			local out = tween(pillText, 0.12, {TextTransparency = 1}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			out.Completed:Once(function()
+				pillText.Text = shownTopic
+				tween(pillText, 0.18, {TextTransparency = 0}, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			end)
+		end
+
+		local CARD_HEADER, CARD_MAX = 56, 440
+		local card = macNew("Frame", {
+			BackgroundColor3 = white, BackgroundTransparency = 0.03, BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0), Size = UDim2.fromOffset(SPOT_WIDTH, CARD_HEADER + SPOT_HEIGHT),
+			Visible = false, ZIndex = 1, Active = true, Parent = holder,
+		})
+		macCorner(card, 28)
+		macStroke(card, white, 0.87, 1)
+		-- (white tinted by the gradient: a little lighter along the top)
+		macNew("UIGradient", {Rotation = 90, Color = ColorSequence.new(Color3.fromRGB(42, 42, 48), Color3.fromRGB(19, 19, 23)), Parent = card})
+		local function roundButton(anchor, x)
+			local button = macButton(card, {
+				AnchorPoint = Vector2.new(anchor, 0), Position = UDim2.new(anchor, x, 0, 12), Size = UDim2.fromOffset(32, 32),
+				BackgroundTransparency = 0.86, BackgroundColor3 = white, ZIndex = 3,
+			})
+			macCorner(button, UDim.new(1, 0))
+			return button
+		end
+		local closeButton = roundButton(0, 12)
+		macImage(closeButton, I.close, 16, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), ZIndex = 4})
+		-- Expand: two little arrows out to opposite corners, drawn as bars
+		local expandButton = roundButton(1, -12)
+		local glyph = macNew("Frame", {
+			BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(14, 14), ZIndex = 4, Parent = expandButton,
+		})
+		for _, bar in ipairs({{7, 7, 16, -45}, {11, 0.8, 6, 0}, {13.2, 3, 6, 90}, {3, 13.2, 6, 0}, {0.8, 11, 6, 90}}) do
+			local piece = macNew("Frame", {
+				BackgroundColor3 = white, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(bar[1], bar[2]),
+				Size = UDim2.fromOffset(bar[3], 1.7), Rotation = bar[4], ZIndex = 4, Parent = glyph,
+			})
+			macCorner(piece, UDim.new(1, 0))
+		end
+		local cardTitle = macLabel(card, "", 13, Enum.FontWeight.Medium, white, {
+			AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 12), Size = UDim2.new(1, -120, 0, 32),
+			TextXAlignment = Enum.TextXAlignment.Center, TextTransparency = 0.5, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3,
+		})
+		local scroller = macNew("ScrollingFrame", {
+			BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(0, CARD_HEADER), Size = UDim2.new(1, 0, 0, 0),
+			CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 4,
+			ScrollBarImageColor3 = white, ScrollBarImageTransparency = 0.65, ScrollingDirection = Enum.ScrollingDirection.Y,
+			ZIndex = 3, Parent = card,
+		})
+		local lines = macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 10), Parent = scroller})
+		macNew("UIPadding", {PaddingLeft = UDim.new(0, 24), PaddingRight = UDim.new(0, 24), PaddingBottom = UDim.new(0, 22), Parent = scroller})
+		-- The ripple: a rainbow ring spreading from the top of the card, kept
+		-- inside its rounded corners by a CanvasGroup
+		local rippleLayer = macNew("CanvasGroup", {BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 8, Parent = card})
+		macCorner(rippleLayer, 28)
+		local ripple = macNew("ImageLabel", {
+			BackgroundTransparency = 1, Image = ask.rippleImage(), ImageTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0), Size = UDim2.fromOffset(0, 0), ZIndex = 8, Parent = rippleLayer,
+		})
+		local rippleGradient = macNew("UIGradient", {Color = ask.colors, Parent = ripple})
+		for _, part in ipairs({rippleLayer, ripple}) do
+			pcall(function()
+				part.Interactable = false
+			end)
+		end
+
+		-- Claude writes Markdown: paragraphs, # headings, - and 1. lists,
+		-- **bold**, `code` and [links](…), which show underlined
+		local function inline(text)
+			text = text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+			text = text:gsub("%[([^%]\n]+)%]%(([^%)\n]+)%)", "<u>%1</u>")
+			text = text:gsub("%*%*(.-)%*%*", "<b>%1</b>"):gsub("`([^`\n]+)`", '<font face="RobotoMono">%1</font>')
+			return text
+		end
+		local function parseBlocks(text)
+			local out, paragraph, code = {}, {}, nil
+			local function flush()
+				if #paragraph > 0 then
+					table.insert(out, {kind = "p", text = table.concat(paragraph, "\n")})
+					table.clear(paragraph)
+				end
+			end
+			for line in (text:gsub("\r", "") .. "\n"):gmatch("(.-)\n") do
+				if line:match("^%s*```") then
+					flush()
+					if code then
+						table.insert(out, {kind = "code", text = table.concat(code, "\n")})
+						code = nil
+					else
+						code = {}
+					end
+				elseif code then
+					table.insert(code, line)
+				else
+					local heading = line:match("^%s*#+%s+(.+)$")
+					local bullet = line:match("^%s*[%-%*•]%s+(.+)$")
+					local number, numbered = line:match("^%s*(%d+)[%.%)]%s+(.+)$")
+					if heading then
+						flush()
+						table.insert(out, {kind = "h", text = heading})
+					elseif bullet or numbered then
+						flush()
+						table.insert(out, {kind = "li", text = bullet or numbered, marker = if numbered then number .. "." else nil})
+					elseif line:match("^%s*$") then
+						flush()
+					else
+						table.insert(paragraph, line)
+					end
+				end
+			end
+			flush()
+			if code and #code > 0 then
+				table.insert(out, {kind = "code", text = table.concat(code, "\n")})
+			end
+			return out
+		end
+
+		local order = 0
+		local function add(instance)
+			order += 1
+			instance.LayoutOrder = order
+			return instance
+		end
+		local function textBlock(text, size, weight, props)
+			props = props or {}
+			props.Size = props.Size or UDim2.fromScale(1, 0)
+			props.AutomaticSize = Enum.AutomaticSize.Y
+			props.TextWrapped = true
+			props.RichText = true
+			props.LineHeight = props.LineHeight or 1.15
+			props.ZIndex = 4
+			local color = props.color or white
+			props.color = nil
+			return macLabel(scroller, text, size, weight, color, props)
+		end
+		-- Small grey tags in a row that wraps: what Claude did, or its sources
+		local function chips(items)
+			local row = add(macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.fromScale(1, 0), AutomaticSize = Enum.AutomaticSize.Y, Parent = scroller}))
+			local layout = macNew("UIListLayout", {
+				FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6), Parent = row,
+			})
+			pcall(function()
+				layout.Wraps = true
+			end)
+			for i, text in ipairs(items) do
+				local chip = macNew("Frame", {
+					BackgroundColor3 = white, BackgroundTransparency = 0.9, BorderSizePixel = 0, Size = UDim2.fromOffset(0, 24),
+					AutomaticSize = Enum.AutomaticSize.X, LayoutOrder = i, ZIndex = 4, Parent = row,
+				})
+				macCorner(chip, 8)
+				macNew("UIPadding", {PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 9), Parent = chip})
+				macLabel(chip, text, 11, Enum.FontWeight.Medium, white, {
+					Size = UDim2.fromOffset(0, 24), AutomaticSize = Enum.AutomaticSize.X, TextTransparency = 0.38, ZIndex = 5,
+				})
+			end
+		end
+		local function renderAnswer(entry)
+			local sourcesShown = false
+			local function sources()
+				if sourcesShown or not entry.sources or #entry.sources == 0 then
+					return
+				end
+				sourcesShown = true
+				local shown = {}
+				for i = 1, math.min(3, #entry.sources) do
+					shown[i] = entry.sources[i]
+				end
+				if #entry.sources > 3 then
+					table.insert(shown, "+" .. (#entry.sources - 3))
+				end
+				chips(shown)
+			end
+			for _, block in ipairs(parseBlocks(entry.text)) do
+				if block.kind == "h" then
+					-- (a little more room above a heading)
+					add(macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.fromOffset(1, 4), Parent = scroller}))
+					add(textBlock(inline(block.text), 21, Enum.FontWeight.Bold, {LineHeight = 1.05}))
+				elseif block.kind == "li" then
+					local row = add(macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.fromScale(1, 0), AutomaticSize = Enum.AutomaticSize.Y, Parent = scroller}))
+					if block.marker then
+						macLabel(row, block.marker, 15, Enum.FontWeight.Medium, white, {Size = UDim2.fromOffset(22, 20), TextTransparency = 0.45, ZIndex = 4})
+					else
+						local dot = macNew("Frame", {
+							BackgroundColor3 = white, BackgroundTransparency = 0.5, BorderSizePixel = 0, Position = UDim2.fromOffset(4, 8),
+							Size = UDim2.fromOffset(5, 5), ZIndex = 4, Parent = row,
+						})
+						macCorner(dot, UDim.new(1, 0))
+					end
+					local label = textBlock(inline(block.text), 15, Enum.FontWeight.Regular, {Position = UDim2.fromOffset(22, 0), Size = UDim2.new(1, -22, 0, 0)})
+					label.Parent = row
+				elseif block.kind == "code" then
+					local text = block.text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+					add(textBlock('<font face="RobotoMono">' .. text .. "</font>", 13, Enum.FontWeight.Regular, {TextTransparency = 0.15}))
+				else
+					add(textBlock(inline(block.text), 16, Enum.FontWeight.Regular))
+					sources()
+				end
+			end
+			sources()
+		end
+
+		local mode = nil -- "search", "busy" or "answer"
+		local function fitCard()
+			local width = card.Size.X.Offset
+			-- (screen pixels per point, pop-in scale included)
+			local ratio = scroller.AbsoluteSize.X / width
+			if ratio <= 0 then
+				return
+			end
+			local most = if ask.expanded then math.max(CARD_MAX, D.height - SPOT_TOP - SPOT_HEIGHT - CARD_HEADER - 110) else CARD_MAX
+			local height = math.min(math.ceil(lines.AbsoluteContentSize.Y / ratio) + 22, most) -- (+ the bottom padding)
+			scroller.Size = UDim2.new(1, 0, 0, height)
+			card.Size = UDim2.fromOffset(width, CARD_HEADER + height + SPOT_HEIGHT)
+			-- The bar sits in the card's bottom row
+			if mode == "answer" then
+				bar.Position = UDim2.new(0.5, 0, 0, CARD_HEADER + height)
+				bar.Size = UDim2.fromOffset(width, SPOT_HEIGHT)
+			end
+		end
+		table.insert(open.connections, lines:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(fitCard))
+		-- The latest exchange: what Claude did (as tags), then its answer
+		local function paintCard()
+			for _, child in ipairs(scroller:GetChildren()) do
+				if child:IsA("GuiObject") then
+					child:Destroy()
+				end
+			end
+			order = 0
+			local start = 0
+			for i, entry in ipairs(ask.transcript) do
+				if entry.kind == "question" then
+					start = i
+				end
+			end
+			cardTitle.Text = if ask.transcript[start] then ask.transcript[start].text else ""
+			local actions = {}
+			for i = start + 1, #ask.transcript do
+				if ask.transcript[i].kind == "step" then
+					table.insert(actions, ask.transcript[i].text)
+				end
+			end
+			if #actions > 0 then
+				chips(actions)
+			end
+			for i = start + 1, #ask.transcript do
+				local entry = ask.transcript[i]
+				if entry.kind == "answer" then
+					renderAnswer(entry)
+				elseif entry.kind == "error" then
+					add(textBlock(inline(entry.text), 15, Enum.FontWeight.Medium, {color = Color3.fromRGB(255, 130, 120)}))
+				end
+			end
+			card.Size = UDim2.fromOffset(if ask.expanded then 680 else SPOT_WIDTH, card.Size.Y.Offset)
+			scroller.CanvasPosition = Vector2.zero
+			task.defer(fitCard)
+		end
+
+		local function refocus()
+			task.defer(function()
+				if spotlight == open and mode ~= "busy" then
+					box:CaptureFocus()
+				end
+			end)
+		end
+
+		-- The ripple: the ring spreads from the top middle of the card, and
+		-- each part of the answer fades in as the ring reaches it
+		local RIPPLE_TIME = 1.2
+		local function playRipple()
+			task.wait() -- (laid out by now)
+			if spotlight ~= open or mode ~= "answer" then
+				return
+			end
+			local w, h = card.Size.X.Offset, card.Size.Y.Offset
+			local ratio = card.AbsoluteSize.X / w
+			local radius = math.sqrt((w / 2) ^ 2 + h ^ 2) * 1.08 -- reaches the far corners
+			ripple.Size = UDim2.fromOffset(0, 0)
+			ripple.ImageTransparency = 0.2
+			rippleGradient.Rotation = math.random(0, 359)
+			tween(ripple, RIPPLE_TIME, {Size = UDim2.fromOffset(2 * radius, 2 * radius)}, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			task.delay(RIPPLE_TIME * 0.4, function()
+				tween(ripple, RIPPLE_TIME * 0.6, {ImageTransparency = 1}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			end)
+			local origin = card.AbsolutePosition + Vector2.new(card.AbsoluteSize.X / 2, 0)
+			for _, child in ipairs(scroller:GetChildren()) do
+				if child:IsA("GuiObject") then
+					local parts = child:GetDescendants()
+					table.insert(parts, child)
+					local saved = {}
+					for _, part in ipairs(parts) do
+						if part:IsA("TextLabel") then
+							table.insert(saved, {part, "TextTransparency", part.TextTransparency})
+							part.TextTransparency = 1
+						elseif part:IsA("ImageLabel") then
+							table.insert(saved, {part, "ImageTransparency", part.ImageTransparency})
+							part.ImageTransparency = 1
+						end
+						if part:IsA("GuiObject") and part.BackgroundTransparency < 1 then
+							table.insert(saved, {part, "BackgroundTransparency", part.BackgroundTransparency})
+							part.BackgroundTransparency = 1
+						end
+					end
+					-- When the ring (Quad Out) gets to this part's middle
+					local distance = ((child.AbsolutePosition + child.AbsoluteSize / 2 - origin) / ratio).Magnitude
+					local delay = RIPPLE_TIME * (1 - math.sqrt(1 - math.min(distance / radius, 1)))
+					task.delay(delay, function()
+						for _, item in ipairs(saved) do
+							tween(item[1], 0.4, {[item[2]] = item[3]}, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+						end
+					end)
+				end
+			end
+		end
+
+		-- Which shows: the bar (and results while there's text) with no
+		-- conversation; the pill while Claude works; then the card with the bar
+		-- as its bottom row
+		local function refreshPanels()
+			local typing = box.Text:match("%S") ~= nil
+			local newMode = if ask.busy then "busy"
+				elseif #ask.transcript > 0 and (open.hasKey or not typing) then "answer"
+				else "search"
+			if newMode ~= mode then
+				local old = mode
+				mode = newMode
+				bar.Visible = mode ~= "busy"
+				pill.Visible = mode == "busy"
+				card.Visible = mode == "answer"
+				setMerged(mode == "answer")
+				if mode == "busy" then
+					box:ReleaseFocus()
+					pillScale.Scale = 0.6
+					tween(pillScale, 0.35, {Scale = 1}, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+				elseif mode == "answer" then
+					card.Size = UDim2.fromOffset(if ask.expanded then 680 else SPOT_WIDTH, card.Size.Y.Offset)
+					card.BackgroundTransparency = 1
+					tween(card, 0.3, {BackgroundTransparency = 0.03}, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+					fitCard()
+					if old == "busy" and not quiet then
+						refocus()
+					end
+				end
+			end
+			panel.Visible = mode == "search" and typing and #open.results > 0
+			setPillText(if ask.topic then ask.topic else "Working")
+			box.PlaceholderText = if not open.hasKey then "Search" elseif #ask.transcript > 0 then "Ask a follow-up" else "Search or Ask"
+		end
+		-- (a fresh Spotlight shows an answer it's already seen without the
+		-- ripple; one opened for an answer that just came in ripples)
+		local shownVersion = if quiet then -1 else ask.version or 0
+		ask.onChange = function()
+			if spotlight ~= open then
+				return
+			end
+			local fresh = (ask.version or 0) ~= shownVersion
+			if fresh then
+				paintCard()
+			end
+			refreshPanels()
+			if fresh and mode == "answer" then
+				shownVersion = ask.version or 0
+				task.spawn(playRipple)
+			end
+		end
+		stopButton.MouseButton1Down:Connect(function()
+			ask.stop()
+			refocus()
+		end)
+		closeButton.MouseButton1Down:Connect(function()
+			ask.clear()
+			refocus()
+		end)
+		expandButton.MouseButton1Down:Connect(function()
+			ask.expanded = not ask.expanded
+			local width = if ask.expanded then 680 else SPOT_WIDTH
+			tween(card, 0.25, {Size = UDim2.fromOffset(width, card.Size.Y.Offset)})
+			tween(bar, 0.25, {Size = UDim2.fromOffset(width, SPOT_HEIGHT)})
+			task.delay(0.27, fitCard)
+			refocus()
+		end)
+
+		local measured, measuredWidth = nil, 0
+		local opened = os.clock()
+		table.insert(open.connections, RunService.RenderStepped:Connect(function()
+			if pill.Visible then
+				-- The ring of dots: about one turn a second
+				local head = (os.clock() * 1.15 % 1) * math.pi * 2
+				for _, dot in ipairs(dots) do
+					local behind = (head - dot.angle) % (math.pi * 2)
+					local t = (1 - behind / (math.pi * 2)) ^ 1.6
+					dot.frame.BackgroundTransparency = 0.72 - 0.72 * t
+					local size = 3 + 2.6 * t
+					dot.frame.Size = UDim2.fromOffset(size, size)
+				end
+			end
+			if not box:IsFocused() then
+				caret.Visible = false
+				return
+			end
+			-- Width of the text up to the cursor (cached until it changes)
+			local cursor = box.CursorPosition
+			local before = if cursor > 0 then box.Text:sub(1, cursor - 1) else box.Text
+			if before ~= measured then
+				measured = before
+				measuredWidth = TextService:GetTextSize(before, SPOT_TEXT_SIZE, Enum.Font.Roboto, Vector2.new(10000, 200)).X
+			end
+			local room = (if bar.Size.X.Offset > 0 then bar.Size.X.Offset else SPOT_WIDTH) - 2 * SPOT_TEXT_LEFT
+			caret.Position = UDim2.new(0, SPOT_TEXT_LEFT + math.min(measuredWidth, room) + 0.5, 0.5, 0)
+			caret.Visible = true
+			-- The halo breathes gently
+			local breath = math.sin((os.clock() - opened) * 3)
+			halo.ImageTransparency = 0.25 + 0.1 * breath
+			outerHalo.ImageTransparency = 0.78 + 0.08 * breath
+		end))
+
+		local rows = {}
+		local function paintRows()
+			for i, row in ipairs(rows) do
+				row.BackgroundTransparency = if i == open.selected then 0 else 1
+			end
+		end
+		local function activate(item)
+			if item.ask then
+				-- Asking keeps Spotlight open: the Working pill takes the bar's place
+				box.Text = ""
+				ask.submit(item.title)
+				return
+			end
+			closeSpotlight()
+			task.spawn(item.action)
+		end
+		local function showResults()
+			for _, row in ipairs(rows) do
+				row:Destroy()
+			end
+			table.clear(rows)
+			open.selected = 1
+			-- In a conversation, what you type is a follow-up: Enter asks it
+			if #ask.transcript > 0 and open.hasKey then
+				local text = box.Text:match("^%s*(.-)%s*$")
+				open.results = if text ~= "" then {{title = text, kind = "Ask a follow-up", ask = true}} else {}
+				refreshPanels()
+				return
+			end
+			open.results = search(box.Text, open.hasKey)
+			for i, item in ipairs(open.results) do
+				local row = macButton(panel, {
+					Size = UDim2.new(1, 0, 0, SPOT_ROW), BackgroundColor3 = C.accent, BackgroundTransparency = 1, LayoutOrder = i, ZIndex = 3,
+				})
+				macCorner(row, 14)
+				if item.orb then
+					ask.orb(row, 24).Position = UDim2.fromOffset(10, 8)
+				elseif item.tile then
+					macAppTile(row, item.tile, 26).Position = UDim2.fromOffset(9, 7)
+				elseif item.icon then
+					macImage(row, item.icon, 20, item.iconColor or white, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0.5, 0)})
+				end
+				macLabel(row, item.title, 15, Enum.FontWeight.Medium, white, {
+					Position = UDim2.fromOffset(46, 0), Size = UDim2.new(0.62, -46, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+				})
+				macLabel(row, item.kind, 12, Enum.FontWeight.Regular, white, {
+					AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -14, 0, 0), Size = UDim2.new(0.38, -14, 1, 0),
+					TextXAlignment = Enum.TextXAlignment.Right, TextTransparency = 0.4, TextTruncate = Enum.TextTruncate.AtEnd,
+				})
+				row.MouseEnter:Connect(function()
+					open.selected = i
+					paintRows()
+				end)
+				row.MouseButton1Down:Connect(function()
+					activate(item)
+				end)
+				rows[i] = row
+			end
+			paintRows()
+			refreshPanels()
+		end
+		table.insert(open.connections, box:GetPropertyChangedSignal("Text"):Connect(showResults))
+		-- Enter opens the highlighted result; Escape, or clicking away, closes
+		-- (but not while Claude is working, or when the click was on the conversation)
+		table.insert(open.connections, box.FocusLost:Connect(function(enterPressed)
+			if enterPressed then
+				local item = open.results[open.selected]
+				if item then
+					activate(item)
+				else
+					task.defer(function()
+						if spotlight == open then
+							box:CaptureFocus()
+						end
+					end)
+				end
+				return
+			end
+			task.delay(0.15, function()
+				if spotlight ~= open or box:IsFocused() or ask.busy then
+					return
+				end
+				local mouse = UserInputService:GetMouseLocation()
+				if (card.Visible and pointIn(card, mouse)) or (pill.Visible and pointIn(pill, mouse)) then
+					return
+				end
+				closeSpotlight()
+			end)
+		end))
+		-- Up and Down move through the results
+		table.insert(open.connections, UserInputService.InputBegan:Connect(function(input)
+			if #open.results == 0 or not panel.Visible then
+				return
+			end
+			if input.KeyCode == Enum.KeyCode.Down then
+				open.selected = open.selected % #open.results + 1
+				paintRows()
+			elseif input.KeyCode == Enum.KeyCode.Up then
+				open.selected = (open.selected - 2) % #open.results + 1
+				paintRows()
+			end
+		end))
+		paintCard()
+		refreshPanels()
+		if quiet then
+			ask.onChange() -- (ripples the answer that just came in)
+		end
+		-- (a frame later, so the Space of Ctrl+Space doesn't land in the field)
+		task.defer(function()
+			if spotlight == open then
+				box.Text = ""
+				if not quiet then
+					box:CaptureFocus()
+				end
+			end
+		end)
+	end
+
+	function toggleSpotlight()
+		if spotlight then
+			closeSpotlight()
+		elseif root.Visible then
+			openSpotlight()
+		end
+	end
+	connect(UserInputService.InputBegan, function(input)
+		if input.KeyCode == Enum.KeyCode.Space and root.Visible
+			and (UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)) then
+			toggleSpotlight()
+		end
+	end)
+
+	-- ---------- Ask (Claude) ----------
+	-- Spotlight's Ask sends the question to Claude (Anthropic's Messages API,
+	-- with the user's own key from System Settings > Ask) along with tools for
+	-- this desktop, so Claude can look at and use it: apps, windows, files,
+	-- music and settings. While it works, a rainbow glow runs around the edges
+	-- of the screen, like Siri's. (Its own function, to keep its many locals
+	-- out of the desktop's.)
+	do
+		local function setUpAsk()
+			local HttpService = game:GetService("HttpService")
+			local API = "https://api.anthropic.com/v1/"
+			local MAX_STEPS = 25
+
+			-- Apple Intelligence's colors, for the orb and the edge glow
+			ask.colors = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(188, 130, 243)), ColorSequenceKeypoint.new(0.2, Color3.fromRGB(245, 185, 234)),
+				ColorSequenceKeypoint.new(0.4, Color3.fromRGB(141, 159, 255)), ColorSequenceKeypoint.new(0.6, Color3.fromRGB(255, 103, 120)),
+				ColorSequenceKeypoint.new(0.8, Color3.fromRGB(255, 186, 113)), ColorSequenceKeypoint.new(1, Color3.fromRGB(198, 134, 255)),
+			})
+			-- Claude's orb: a ball of those colors with a soft highlight.
+			-- Returns it and its gradient (Spotlight spins it while Claude works).
+			function ask.orb(parent, size)
+				local orb = macNew("Frame", {BackgroundColor3 = white, BorderSizePixel = 0, Size = UDim2.fromOffset(size, size), Parent = parent})
+				macCorner(orb, UDim.new(1, 0))
+				local gradient = macNew("UIGradient", {Color = ask.colors, Rotation = 35, Parent = orb})
+				local shine = macNew("Frame", {
+					BackgroundColor3 = white, BackgroundTransparency = 0.5, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5),
+					Position = UDim2.fromScale(0.38, 0.32), Size = UDim2.fromScale(0.44, 0.3), Parent = orb,
+				})
+				macCorner(shine, UDim.new(1, 0))
+				return orb, gradient
+			end
+
+			-- ---- The rainbow edge glow ----
+			-- A soft band of light just inside the screen's edges (brightest in
+			-- the corners), as a white image tinted by a turning rainbow gradient
+			local function edgeGlowPng()
+				local size, half, radius, reach = 128, 64, 40, 60
+				local rows = table.create(size)
+				for y = 0, size - 1 do
+					local row = table.create(size + 1)
+					row[1] = "\0"
+					for x = 0, size - 1 do
+						-- How far inside a rounded square this pixel is
+						local qx = math.abs(x + 0.5 - half) - (half - radius)
+						local qy = math.abs(y + 0.5 - half) - (half - radius)
+						local outside = math.sqrt(math.max(qx, 0) ^ 2 + math.max(qy, 0) ^ 2) + math.min(math.max(qx, qy), 0) - radius
+						local t = math.clamp(1 + outside / reach, 0, 1)
+						row[x + 2] = "\255" .. string.char(math.floor(t ^ 2.4 * 255 + 0.5))
+					end
+					rows[y + 1] = table.concat(row)
+				end
+				return macMakePng(size, size, 4, table.concat(rows)) -- 4 = gray + alpha
+			end
+			local function getEdgeGlow()
+				local path = MACOS_FOLDER .. "/edgeglow_v1.png"
+				macMadeImages.remember(path, getEdgeGlow)
+				if not isfile(path) then
+					ensureMacFolder()
+					writefile(path, edgeGlowPng())
+				end
+				return getcustomasset(path)
+			end
+			-- The ripple that spreads through an answer as it arrives: a soft
+			-- white ring (tinted by a gradient) with a faint glow inside it
+			local function ripplePng()
+				local size = 128
+				local rows = table.create(size)
+				for y = 0, size - 1 do
+					local row = table.create(size + 1)
+					row[1] = "\0"
+					for x = 0, size - 1 do
+						local r = math.sqrt((x + 0.5 - size / 2) ^ 2 + (y + 0.5 - size / 2) ^ 2) / (size / 2)
+						local ring = math.exp(-((r - 0.86) / 0.07) ^ 2)
+						local inside = if r < 0.86 then 0.2 * (r / 0.86) ^ 3 else 0
+						local alpha = if r < 1 then math.max(ring, inside) else 0
+						row[x + 2] = "\255" .. string.char(math.floor(math.clamp(alpha, 0, 1) * 255 + 0.5))
+					end
+					rows[y + 1] = table.concat(row)
+				end
+				return macMakePng(size, size, 4, table.concat(rows)) -- 4 = gray + alpha
+			end
+			function ask.rippleImage()
+				local path = MACOS_FOLDER .. "/ripple_v1.png"
+				macMadeImages.remember(path, ask.rippleImage)
+				if not isfile(path) then
+					ensureMacFolder()
+					writefile(path, ripplePng())
+				end
+				return getcustomasset(path)
+			end
+
+			local glow = nil
+			local function buildGlow()
+				local holder = macNew("Frame", {Name = "AskGlow", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 45, Parent = gui})
+				local image = getEdgeGlow()
+				-- The same colors, deeper, so they hold up over a bright wallpaper
+				local vivid = ColorSequence.new({
+					ColorSequenceKeypoint.new(0, Color3.fromRGB(168, 92, 255)), ColorSequenceKeypoint.new(0.2, Color3.fromRGB(255, 120, 205)),
+					ColorSequenceKeypoint.new(0.4, Color3.fromRGB(96, 128, 255)), ColorSequenceKeypoint.new(0.6, Color3.fromRGB(255, 72, 98)),
+					ColorSequenceKeypoint.new(0.8, Color3.fromRGB(255, 166, 64)), ColorSequenceKeypoint.new(1, Color3.fromRGB(178, 98, 255)),
+				})
+				-- {reach (fraction of the screen's height), opacity, spin (degrees a second)}
+				local layers = {}
+				for _, spec in ipairs({{0.095, 0.6, 30}, {0.036, 1, -44}}) do
+					local label = macNew("ImageLabel", {
+						BackgroundTransparency = 1, Image = image, ImageTransparency = 1, ScaleType = Enum.ScaleType.Slice,
+						SliceCenter = Rect.new(63, 63, 65, 65), Size = UDim2.fromScale(1, 1), ZIndex = 45, Parent = holder,
+					})
+					local gradient = macNew("UIGradient", {Color = vivid, Parent = label})
+					table.insert(layers, {label = label, gradient = gradient, reach = spec[1], opacity = spec[2], spin = spec[3]})
+				end
+				-- And a crisp line right along the edge
+				local line = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(1, 1), Size = UDim2.new(1, -2, 1, -2), ZIndex = 46, Parent = holder})
+				local stroke = macStroke(line, white, 1, 2)
+				local strokeGradient = macNew("UIGradient", {Color = vivid, Parent = stroke})
+				local parts = holder:GetDescendants()
+				table.insert(parts, holder)
+				for _, item in ipairs(parts) do
+					pcall(function()
+						item.Interactable = false -- never in the way of a click
+					end)
+				end
+				glow = {holder = holder, layers = layers, stroke = stroke, strokeGradient = strokeGradient, level = 0, target = 0}
+			end
+			local glowConnection = nil
+			-- Fades the glow in or out
+			local function setGlow(on)
+				if not glow then
+					local ok, err = pcall(buildGlow)
+					if not ok then
+						warn("[coolui] Ask glow failed: " .. tostring(err))
+						return
+					end
+				end
+				glow.target = if on then 1 else 0
+				glow.holder.Visible = true
+				if glowConnection then
+					return
+				end
+				local started = os.clock()
+				glowConnection = connect(RunService.RenderStepped, function(dt)
+					glow.level += math.clamp(glow.target - glow.level, -dt * 2.2, dt * 2.2)
+					local t = os.clock() - started
+					local height = gui.AbsoluteSize.Y
+					local pulse = 0.5 + 0.5 * math.sin(t * 2.3)
+					for _, layer in ipairs(glow.layers) do
+						-- (the image's glow is 60 pixels deep)
+						layer.label.SliceScale = layer.reach * height * (0.92 + 0.08 * pulse) / 60
+						layer.gradient.Rotation = (t * layer.spin) % 360
+						layer.label.ImageTransparency = 1 - glow.level * layer.opacity * (0.85 + 0.15 * pulse)
+					end
+					glow.strokeGradient.Rotation = (t * 60) % 360
+					glow.stroke.Transparency = 1 - glow.level * 0.85
+					if glow.level <= 0 and glow.target == 0 then
+						glow.holder.Visible = false
+						glowConnection:Disconnect()
+						glowConnection = nil
+					end
+				end)
+			end
+
+			-- ---- Talking to Anthropic ----
+			-- Text as a JSON string (bytes that aren't UTF-8 become "?")
+			local escapes = {['"'] = '\\"', ["\\"] = "\\\\", ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t"}
+			local function jsonString(text)
+				text = tostring(text)
+				if utf8.len(text) == nil then
+					text = text:gsub("[\128-\255]", "?")
+				end
+				return '"' .. text:gsub('[%c"\\]', function(c)
+					return escapes[c] or string.format("\\u%04x", string.byte(c))
+				end) .. '"'
+			end
+			-- Claude's replies go back into the conversation exactly as they came
+			-- (thinking blocks must stay untouched), so their JSON is cut out of
+			-- the response as text rather than decoded and encoded again
+			local function skipString(json, i)
+				i += 1
+				while true do
+					local at = json:find('["\\]', i)
+					if not at then
+						return #json + 1
+					elseif json:sub(at, at) == "\\" then
+						i = at + 2
+					else
+						return at + 1
+					end
+				end
+			end
+			local function skipValue(json, i)
+				local c = json:sub(i, i)
+				if c == '"' then
+					return skipString(json, i)
+				elseif c == "{" or c == "[" then
+					local depth = 0
+					while i <= #json do
+						local at = json:find('[{}%[%]"]', i)
+						if not at then
+							return #json + 1
+						end
+						local ch = json:sub(at, at)
+						if ch == '"' then
+							i = skipString(json, at)
+						else
+							depth += if ch == "{" or ch == "[" then 1 else -1
+							i = at + 1
+							if depth == 0 then
+								return i
+							end
+						end
+					end
+					return i
+				end
+				return json:find("[,}%]%s]", i) or #json + 1 -- a number, true, false or null
+			end
+			-- The raw JSON of one field of the top-level object
+			local function rawField(json, key)
+				local i = json:find("{", 1, true)
+				if not i then
+					return nil
+				end
+				i += 1
+				while true do
+					i = json:find("%S", i)
+					if not i then
+						return nil
+					end
+					local c = json:sub(i, i)
+					if c == "," then
+						i += 1
+					elseif c ~= '"' then
+						return nil
+					else
+						local nameEnd = skipString(json, i)
+						local name = json:sub(i + 1, nameEnd - 2)
+						local colon = json:find(":", nameEnd, true)
+						if not colon then
+							return nil
+						end
+						local start = json:find("%S", colon + 1)
+						if not start then
+							return nil
+						end
+						local finish = skipValue(json, start)
+						if name == key then
+							return json:sub(start, finish - 1)
+						end
+						i = finish
+					end
+				end
+			end
+
+			-- One request to the API; returns the decoded reply and its raw text,
+			-- or nil and what went wrong (never the key)
+			local function call(key, path, body)
+				local send = (syn and syn.request) or http_request or request or (http and http.request)
+				if not send then
+					return nil, "This executor can't make web requests, so Ask can't reach Claude."
+				end
+				local ok, response = pcall(send, {
+					Url = API .. path, Method = if body then "POST" else "GET", Body = body,
+					Headers = {
+						["Content-Type"] = "application/json",
+						["x-api-key"] = key,
+						["anthropic-version"] = "2026-10-21",
+						-- lets Anthropic rerun a declined request on a fallback model
+						["anthropic-beta"] = "server-side-fallback-2026-07-01",
+					},
+				})
+				if not ok or type(response) ~= "table" then
+					return nil, "Couldn't reach Claude. Check your connection and try again."
+				end
+				local decodedOk, decoded = pcall(HttpService.JSONDecode, HttpService, response.Body or "")
+				if not decodedOk then
+					decoded = nil
+				end
+				local status = tonumber(response.StatusCode) or 0
+				if status ~= 200 then
+					local detail = if type(decoded) == "table" and type(decoded.error) == "table" then tostring(decoded.error.message or "") else ""
+					if status == 401 then
+						return nil, "Anthropic didn't accept the API key. Check it in System Settings > Ask.", status
+					elseif status == 429 then
+						return nil, "Too many requests just now. Try again in a moment."
+					elseif status >= 500 then
+						return nil, "Claude is busy right now. Try again in a moment."
+					end
+					return nil, string.format("Claude couldn't answer (%d)%s", status, if detail ~= "" then ": " .. detail else ".")
+				end
+				if type(decoded) ~= "table" then
+					return nil, "Claude's reply couldn't be read."
+				end
+				return decoded, response.Body
+			end
+
+			-- Whether a key works, from Anthropic's model list (free to ask)
+			function ask.checkKey(key)
+				local reply, problem, status = call(key, "models?limit=1", nil)
+				if status == 401 then
+					problem = "Anthropic didn't accept that key. Check you copied all of it."
+				end
+				return reply ~= nil, problem
+			end
+
+			-- ---- What Claude can do ----
+			local appNames = {trash = "the Trash", about = "About This Mac"}
+			for _, app in ipairs(MAC_APPS) do
+				appNames[app.id] = app.name
+			end
+			local TOOLS = [==[[
+{"name":"get_desktop_state","description":"What's on the screen now: the open windows (front first, with the ids window_action takes), the focused one, Light or Dark appearance, the background, Wi-Fi and ping, what Music is playing, the time and the screen size.","input_schema":{"type":"object","properties":{}}},
+{"name":"open_app","description":"Opens an app, or brings it to the front if it's already open. trash opens the Trash in Finder; about opens About This Mac.","input_schema":{"type":"object","properties":{"app":{"type":"string","enum":["finder","notes","terminal","music","settings","trash","about"]},"settings_pane":{"type":"string","enum":["Wi-Fi","Battery","General","Appearance","Wallpaper","Ask","About"],"description":"For settings: which pane to show."}},"required":["app"]}},
+{"name":"window_action","description":"Focuses, closes, minimizes, restores (un-minimizes) or zooms a window. Window ids come from get_desktop_state.","input_schema":{"type":"object","properties":{"window_id":{"type":"integer"},"action":{"type":"string","enum":["focus","close","minimize","restore","zoom"]}},"required":["window_id","action"]}},
+{"name":"list_folder","description":"Lists a folder in the workspace (what Finder shows). Paths are relative to the workspace with forward slashes; an empty path is the workspace itself.","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+{"name":"search_files","description":"Finds files and folders in the workspace (a few levels deep) whose names contain the text.","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
+{"name":"read_file","description":"Reads a text file in the workspace (up to 30,000 characters).","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+{"name":"write_file","description":"Writes a text file in the workspace, making it (and its folders) if needed. overwrite replaces what's in the file, so only overwrite an existing file when the user asked for that; append adds to the end.","input_schema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content","mode"]}},
+{"name":"open_file","description":"Opens a file or folder in the app that shows it: text in Notes, images in Preview, audio in Music, folders in Finder.","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+{"name":"music","description":"Controls the Music app, opening it if needed: play (a song whose name contains song, or carry on), pause, next, previous, or status. Returns what's playing and every song.","input_schema":{"type":"object","properties":{"command":{"type":"string","enum":["play","pause","next","previous","status"]},"song":{"type":"string","description":"For play: part of the song's name."}},"required":["command"]}},
+{"name":"change_setting","description":"Changes a setting. appearance: light or dark. background: wallpaper (the Tahoe wallpaper) or scene (the live 3D game world behind the desktop). wifi: on or off (off shows Ethernet). startup_screen: on or off (the Apple logo screen when macOS loads).","input_schema":{"type":"object","properties":{"setting":{"type":"string","enum":["appearance","background","wifi","startup_screen"]},"value":{"type":"string","enum":["light","dark","wallpaper","scene","on","off"]}},"required":["setting","value"]}},
+{"name":"system_action","description":"Locks the screen, or shows the user the confirmation for Sleep, Restart or Shut Down (they can cancel). If it goes ahead, that's the end of your turn.","input_schema":{"type":"object","properties":{"action":{"type":"string","enum":["lock_screen","sleep","restart","shut_down"]}},"required":["action"]}},
+{"name":"copy_to_clipboard","description":"Puts text on the user's clipboard.","input_schema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}
+]]==]
+			-- What the panel says while each tool runs
+			local working = {
+				get_desktop_state = "Looking at the desktop…", open_app = "Opening an app…", window_action = "Arranging windows…",
+				list_folder = "Looking through files…", search_files = "Searching files…", read_file = "Reading a file…",
+				write_file = "Writing a file…", open_file = "Opening a file…", music = "Using Music…",
+				change_setting = "Changing a setting…", system_action = "Waiting for you…", copy_to_clipboard = "Copying…",
+			}
+
+			local function systemPrompt(useTools, useWeb)
+				local now = DateTime.now():FormatLocalTime("dddd, MMMM D, YYYY h:mm A", "en-us")
+				return table.concat({
+					"You are Claude, built into \"macOS in Roblox\": a recreation of macOS Tahoe that runs as a script inside the Roblox game \""
+						.. macGameName() .. "\". The user opened you from Spotlight's Ask. It's " .. now .. ". The user is "
+						.. player.DisplayName .. " (@" .. player.Name .. ").",
+					"",
+					if useTools then "You can see and use this macOS with your tools: open apps (Finder, Notes, Terminal, Music, System Settings), arrange windows, list, search, read, write and open files in the executor's workspace folder (what Finder shows), play music, change settings and copy text. When the user asks you to do something on the computer, do it with the tools, then say briefly what you did. For questions you can answer yourself, just answer."
+						else "The user has turned off your access to the desktop, so you can only answer.",
+					"",
+					if useWeb then "You can search the web for anything current or that you're unsure of; the card shows the sites you cite." else "You can't search the web.",
+					"",
+					"Your reply shows in a card under the Spotlight bar. Start with a direct answer in a short paragraph. When a list helps, follow it with a short \"# \" heading and a few \"- \" bullets that each start with a **bold** term. **Bold**, `code` and links work (links show underlined but can't be clicked); tables and images don't. Keep it brief: the card is small.",
+					"",
+					"Good to know: Notes saves to coolui_assets/Notes.txt. Songs are the audio files in coolui_music. Sleep, Restart and Shut Down always ask the user first. You can't see the 3D game itself, only this desktop.",
+				}, "\n")
+			end
+
+			-- Windows get small ids for Claude, the first time it sees them
+			local nextWindowId = 0
+			local function windowId(win)
+				if not win.askId then
+					nextWindowId += 1
+					win.askId = nextWindowId
+				end
+				return win.askId
+			end
+			local function musicWindow()
+				for i = #windows, 1, -1 do
+					local win = windows[i]
+					if win.app == "music" and not win.closed and win.control then
+						return win
+					end
+				end
+				return nil
+			end
+			local function fileName(path)
+				return path:match("([^/]+)$") or path
+			end
+			-- A workspace path, tidied; nothing outside the workspace, and never the key
+			local function cleanPath(path)
+				path = tostring(path or ""):gsub("\\", "/"):gsub("^%./", ""):gsub("^/+", ""):gsub("/+$", "")
+				for part in path:gmatch("[^/]+") do
+					if part == ".." then
+						error("Paths can't leave the workspace.", 0)
+					end
+				end
+				if path:lower() == macClaudeKey.file:lower() then
+					error("That file holds the user's API key, so it's off limits.", 0)
+				end
+				return path
+			end
+
+			local function desktopState()
+				local out = {}
+				local network = macReadNetwork()
+				local screen = gui.AbsoluteSize
+				table.insert(out, "Time: " .. DateTime.now():FormatLocalTime("dddd, MMMM D, YYYY h:mm A", "en-us"))
+				table.insert(out, "Appearance: " .. appearance .. "; background: " .. (if session.mode == "scene" then "the 3D scene" else "the wallpaper"))
+				table.insert(out, "Wi-Fi: " .. (if network.wifiOn then "on, network \"" .. macGameName() .. "\"" else "off (Ethernet)")
+					.. "; ping: " .. (if network.ping then network.ping .. " ms" else "unknown"))
+				table.insert(out, string.format("Screen: %d x %d pixels", screen.X, screen.Y))
+				local music = musicWindow()
+				local status = if music then music.control("status") else nil
+				table.insert(out, "Music: " .. (if status and status.track then (if status.playing then "playing \"" else "paused on \"") .. status.track .. "\"" else "not playing"))
+				local listed = 0
+				for i = #windows, 1, -1 do
+					local win = windows[i]
+					if not win.closed then
+						if listed == 0 then
+							table.insert(out, "Windows, front first:")
+						end
+						listed += 1
+						table.insert(out, string.format("- id %d: %s, \"%s\"%s%s", windowId(win), appNames[win.app] or MAC_APP_NAMES[win.app] or win.app,
+							win.title or "", if win.minimized then " (minimized)" else "", if win == frontWindow and not win.minimized then " (focused)" else ""))
+					end
+				end
+				if listed == 0 then
+					table.insert(out, "Windows: none open")
+				end
+				return table.concat(out, "\n")
+			end
+
+			-- Runs one tool; returns the result for Claude and a line for the panel
+			local function runTool(name, input)
+				input = if type(input) == "table" then input else {}
+				if name == "get_desktop_state" then
+					return desktopState(), "Looked at the desktop"
+				elseif name == "open_app" then
+					local app = tostring(input.app)
+					if not appNames[app] then
+						error("There's no app called " .. app, 0)
+					end
+					local pane = if app == "settings" and type(input.settings_pane) == "string" then input.settings_pane else nil
+					openApp(app, if pane then {pane = pane} else nil)
+					local label = if pane then "System Settings > " .. pane else appNames[app]
+					return "Opened " .. label, "Opened " .. label
+				elseif name == "window_action" then
+					local id = tonumber(input.window_id)
+					local win = nil
+					for _, candidate in ipairs(windows) do
+						if not candidate.closed and candidate.askId == id then
+							win = candidate
+						end
+					end
+					if not win then
+						error("No open window has id " .. tostring(input.window_id) .. ". get_desktop_state lists them.", 0)
+					end
+					local action = input.action
+					local verbs = {focus = "Brought forward", close = "Closed", minimize = "Minimized", restore = "Restored", zoom = "Zoomed"}
+					if not verbs[action] then
+						error("Unknown window action: " .. tostring(action), 0)
+					end
+					if action == "focus" or action == "restore" then
+						if win.minimized then
+							win.restore()
+						else
+							focusWindow(win)
+						end
+					elseif action == "close" then
+						win.close()
+					elseif action == "minimize" then
+						if not win.minimized then
+							win.minimize()
+						end
+					else
+						win.zoom()
+					end
+					local title = if win.title ~= "" then win.title else appNames[win.app] or win.app
+					return verbs[action] .. " \"" .. title .. "\"", verbs[action] .. " " .. title
+				elseif name == "list_folder" then
+					local path = cleanPath(input.path)
+					if path ~= "" and not isfolder(path) then
+						error("There's no folder at \"" .. path .. "\"", 0)
+					end
+					local entries = macListFolder(path)
+					local out = {}
+					for i, entry in ipairs(entries) do
+						if i > 300 then
+							table.insert(out, "… and " .. (#entries - 300) .. " more")
+							break
+						end
+						table.insert(out, (if entry.folder then "[folder] " else "") .. entry.path)
+					end
+					return if #out == 0 then "(empty)" else table.concat(out, "\n"), "Looked in " .. (if path == "" then "the workspace" else fileName(path))
+				elseif name == "search_files" then
+					local query = tostring(input.query or ""):lower()
+					if query == "" then
+						error("Give some text to search for", 0)
+					end
+					if not fileIndex or os.clock() - indexedAt > 30 then
+						indexFiles()
+					end
+					while indexing do
+						task.wait()
+					end
+					local out = {}
+					for _, entry in ipairs(fileIndex or {}) do
+						if entry.name:lower():find(query, 1, true) then
+							table.insert(out, (if entry.folder then "[folder] " else "") .. entry.path)
+							if #out >= 40 then
+								break
+							end
+						end
+					end
+					return if #out == 0 then "Nothing found" else table.concat(out, "\n"), "Searched for “" .. tostring(input.query) .. "”"
+				elseif name == "read_file" then
+					local path = cleanPath(input.path)
+					if not isfile(path) then
+						error("There's no file at \"" .. path .. "\"", 0)
+					end
+					local text = readfile(path)
+					local length = utf8.len(text)
+					if length == nil then
+						error(string.format("\"%s\" isn't a text file (%d bytes)", path, #text), 0)
+					end
+					if length > 30000 then
+						text = text:sub(1, utf8.offset(text, 30001) - 1) .. string.format("\n[…cut off here: the file has %d characters]", length)
+					end
+					return text, "Read " .. fileName(path)
+				elseif name == "write_file" then
+					local path = cleanPath(input.path)
+					if path == "" or isfolder(path) then
+						error("Give the path of a file", 0)
+					end
+					if path:lower() == MAC_SETTINGS_FILE:lower() then
+						error("That's macOS's own settings file; use change_setting instead.", 0)
+					end
+					local folder = nil
+					for part in path:gmatch("([^/]+)/") do
+						folder = if folder then folder .. "/" .. part else part
+						if not isfolder(folder) then
+							makefolder(folder)
+						end
+					end
+					local content = tostring(input.content or "")
+					local appending = input.mode == "append" and isfile(path)
+					writefile(path, if appending then readfile(path) .. content else content)
+					return string.format("Saved %s (%d characters %s)", path, utf8.len(content) or #content, if appending then "added" else "in all"),
+						(if appending then "Added to " else "Wrote ") .. fileName(path)
+				elseif name == "open_file" then
+					local path = cleanPath(input.path)
+					local isFolder = path == "" or isfolder(path)
+					if not isFolder and not isfile(path) then
+						error("There's nothing at \"" .. path .. "\"", 0)
+					end
+					openFile({path = path, name = fileName(path), folder = isFolder})
+					return "Opened " .. (if path == "" then "the workspace" else path), "Opened " .. (if path == "" then "the workspace" else fileName(path))
+				elseif name == "music" then
+					local command = tostring(input.command)
+					local win = musicWindow()
+					if not win then
+						if command == "pause" or command == "status" then
+							return "Music isn't open, so nothing is playing.", "Checked Music"
+						end
+						openApp("music")
+						win = musicWindow()
+					end
+					if not win then
+						error("Music didn't open", 0)
+					end
+					local status, problem = win.control(command, input.song)
+					if not status then
+						error(problem, 0)
+					end
+					local songs = if #status.songs > 0 then table.concat(status.songs, ", ") else "none (put mp3 files in coolui_music)"
+					local now = if status.track then (if status.playing then "Playing \"" else "Paused on \"") .. status.track .. "\"" else "Not playing"
+					local line = if command == "pause" then "Paused Music"
+						elseif command == "status" then "Checked Music"
+						elseif status.track then "Playing “" .. status.track .. "”"
+						else "Opened Music"
+					return now .. "\nSongs: " .. songs, line
+				elseif name == "change_setting" then
+					local setting, value = input.setting, input.value
+					if setting == "appearance" and (value == "light" or value == "dark") then
+						desktop.setAppearance(value)
+						return "Appearance is now " .. value, "Switched to " .. (if value == "dark" then "Dark" else "Light") .. " Mode"
+					elseif setting == "background" and (value == "wallpaper" or value == "scene") then
+						if session.mode ~= value then
+							session.setBackground(value, true)
+						end
+						local label = if value == "scene" then "the 3D scene" else "the wallpaper"
+						return "The background is now " .. label, "Switched the background to " .. label
+					elseif setting == "wifi" and (value == "on" or value == "off") then
+						macSetWifi(value == "on")
+						return "Wi-Fi is now " .. value, "Turned Wi-Fi " .. value
+					elseif setting == "startup_screen" and (value == "on" or value == "off") then
+						macSettings.startupScreen = value == "on"
+						saveMacSettings()
+						return "The startup screen is now " .. value, "Turned the startup screen " .. value
+					end
+					error("Can't set " .. tostring(setting) .. " to " .. tostring(value), 0)
+				elseif name == "system_action" then
+					local action = input.action
+					if action == "lock_screen" then
+						ask.endTurn = true
+						closeSpotlight()
+						finish("lock")
+						return "The screen is locked.", "Locked the screen"
+					end
+					local confirmations = {sleep = confirmSleep, restart = confirmRestart, shut_down = confirmShutDown}
+					local labels = {sleep = "Sleep", restart = "Restart", shut_down = "Shut Down"}
+					if not confirmations[action] then
+						error("Unknown action: " .. tostring(action), 0)
+					end
+					-- The alert sits under Spotlight, so Spotlight gets out of the way
+					closeSpotlight()
+					confirmations[action]()
+					if pendingAction then
+						ask.endTurn = true
+						return "The user confirmed " .. labels[action] .. ".", labels[action] .. ": confirmed"
+					end
+					return "The user cancelled " .. labels[action] .. ".", labels[action] .. ": cancelled"
+				elseif name == "copy_to_clipboard" then
+					setclipboard(tostring(input.text or ""))
+					return "Copied.", "Copied to the clipboard"
+				end
+				error("There's no tool called " .. tostring(name), 0)
+			end
+
+			-- ---- The conversation ----
+			local function changed()
+				if ask.onChange then
+					task.spawn(ask.onChange)
+				end
+			end
+			local function note(kind, text)
+				table.insert(ask.transcript, {kind = kind, text = text})
+				ask.version = (ask.version or 0) + 1
+				changed()
+			end
+			-- Forget everything after message `count` (a turn that didn't finish
+			-- can't stay in the conversation)
+			local function rewind(count)
+				for i = #ask.messages, count + 1, -1 do
+					table.remove(ask.messages, i)
+				end
+			end
+
+			-- Claude, then its tools, then Claude again, until it answers
+			-- The desktop's tools, plus Anthropic's web search (it runs on their side)
+			local WEB_SEARCH = '{"type":"web_search_20260209","name":"web_search"}'
+			local function toolsJson()
+				if ask.useTools and ask.useWeb then
+					return TOOLS:gsub("%]%s*$", "," .. WEB_SEARCH .. "]")
+				elseif ask.useTools then
+					return TOOLS
+				elseif ask.useWeb then
+					return "[" .. WEB_SEARCH .. "]"
+				end
+				return nil
+			end
+
+			local function converse(key, checkpoint)
+				local tools = toolsJson()
+				for _ = 1, MAX_STEPS do
+					local body = '{"model":"claude-opus-5-5","max_tokens":16000,"output_config":{"effort":"medium"},"fallbacks":"default",'
+						.. '"cache_control":{"type":"ephemeral"},"system":' .. jsonString(ask.system)
+						.. (if tools then ',"tools":' .. tools else "")
+						.. ',"messages":[' .. table.concat(ask.messages, ",") .. "]}"
+					local reply, raw = call(key, "messages", body)
+					if ask.stopped or not alive then
+						rewind(checkpoint)
+						note("step", "Stopped")
+						return
+					end
+					if not reply then
+						rewind(checkpoint)
+						note("error", raw)
+						return
+					end
+					local content = rawField(raw, "content")
+					if not content then
+						rewind(checkpoint)
+						note("error", "Claude's reply couldn't be read.")
+						return
+					end
+					-- Text comes in runs split by tool blocks (citations cut a sentence
+					-- into several text blocks, so a run is joined as it is). The last
+					-- run is the answer; the sites it cites are its sources.
+					local runs, current, uses = {}, {}, {}
+					local sources, seen = {}, {}
+					for _, block in ipairs(reply.content or {}) do
+						if block.type == "text" and type(block.text) == "string" then
+							table.insert(current, block.text)
+							for _, cite in ipairs(if type(block.citations) == "table" then block.citations else {}) do
+								local site = type(cite) == "table" and type(cite.url) == "string" and cite.url:match("^%a+://([^/:?#]+)")
+								site = site and site:gsub("^www%.", "")
+								if site and not seen[site] then
+									seen[site] = true
+									table.insert(sources, site)
+								end
+							end
+						else
+							if #current > 0 then
+								table.insert(runs, table.concat(current))
+								current = {}
+							end
+							if block.type == "tool_use" then
+								table.insert(uses, block)
+							elseif block.type == "server_tool_use" and block.name == "web_search" and type(block.input) == "table" then
+								note("step", "Searched “" .. tostring(block.input.query or "the web") .. "”")
+							end
+						end
+					end
+					if #current > 0 then
+						table.insert(runs, table.concat(current))
+					end
+					local said = (runs[#runs] or ""):match("^%s*(.-)%s*$")
+					local stop = reply.stop_reason
+					if stop == "tool_use" and #uses > 0 then
+						table.insert(ask.messages, '{"role":"assistant","content":' .. content .. "}")
+						if said ~= "" then
+							note("note", said)
+						end
+						local results = {}
+						for _, use in ipairs(uses) do
+							local ok, result, line
+							if ask.stopped then
+								ok, result = false, "The user stopped this."
+							else
+								ask.status = working[use.name] or "Working…"
+								changed()
+								ok, result, line = pcall(runTool, use.name, use.input)
+								if ok then
+									note("step", line or use.name)
+								end
+							end
+							table.insert(results, '{"type":"tool_result","tool_use_id":' .. jsonString(use.id) .. ',"content":'
+								.. jsonString(if ok then result else tostring(result)) .. (if ok then "" else ',"is_error":true') .. "}")
+						end
+						if ask.stopped or not alive then
+							rewind(checkpoint)
+							note("step", "Stopped")
+							return
+						end
+						if ask.endTurn then
+							-- Locked, asleep, restarting or shutting down: next time is a new chat
+							ask.messages = {}
+							return
+						end
+						table.insert(ask.messages, '{"role":"user","content":[' .. table.concat(results, ",") .. "]}")
+						ask.status = "Thinking…"
+						changed()
+					elseif stop == "pause_turn" then
+						-- (the API paused a long turn; sending it back carries on)
+						table.insert(ask.messages, '{"role":"assistant","content":' .. content .. "}")
+					elseif stop == "refusal" then
+						rewind(checkpoint)
+						note("error", if said ~= "" then said else "Claude can't help with that one.")
+						return
+					elseif stop == "max_tokens" then
+						rewind(checkpoint)
+						note("answer", (if said ~= "" then said .. "\n\n" else "") .. "(The answer ran too long and was cut off.)")
+						return
+					else
+						if content:match("^%[%s*%]$") then
+							rewind(checkpoint)
+						else
+							table.insert(ask.messages, '{"role":"assistant","content":' .. content .. "}")
+						end
+						table.insert(ask.transcript, {kind = "answer", text = if said ~= "" then said else "Done.", sources = sources})
+					ask.version = (ask.version or 0) + 1
+						changed()
+						return
+					end
+				end
+				-- Too many steps: the conversation ends on tool results, so start over next time
+				ask.messages = {}
+				note("error", "Stopped after " .. MAX_STEPS .. " steps.")
+			end
+
+			-- A few words on what the question is about, for the Working pill.
+			-- Claude Haiku 5.5 with thinking off answers in about a second.
+			local TOPIC_PROMPT = "You label requests for a small status pill. Reply with only a title of 1 to 4 words for what the user's message is about, in sentence case, with no quotes and no full stop. Examples: Professional audio editors / Opening Notes / Weather in Paris / Writing a poem"
+			local function fetchTopic(key, question, id)
+				local body = '{"model":"claude-haiku-5-5","max_tokens":60,"thinking":{"type":"disabled"},"output_config":{"effort":"low"},'
+					.. '"system":' .. jsonString(TOPIC_PROMPT) .. ',"messages":[{"role":"user","content":' .. jsonString(question) .. "}]}"
+				local reply = call(key, "messages", body)
+				if not reply or ask.requestId ~= id or not ask.busy then
+					return
+				end
+				local text = ""
+				for _, block in ipairs(reply.content or {}) do
+					if block.type == "text" and type(block.text) == "string" then
+						text ..= block.text
+					end
+				end
+				text = text:gsub("%s+", " "):match("^%s*[\"'“]?(.-)[\"'”%.]?%s*$") or ""
+				if text ~= "" and utf8.len(text) and utf8.len(text) <= 40 then
+					ask.topic = text
+					changed()
+				end
+			end
+
+			function ask.submit(question)
+				question = tostring(question):match("^%s*(.-)%s*$")
+				if ask.busy or question == "" then
+					return
+				end
+				local key = macClaudeKey.read()
+				if not key then
+					note("error", "Add your Claude API key in System Settings > Ask first.")
+					return
+				end
+				if #ask.messages == 0 then
+					ask.useTools = macSettings.askTools ~= false
+					ask.useWeb = macSettings.askWeb ~= false
+					ask.system = systemPrompt(ask.useTools, ask.useWeb)
+				end
+				ask.busy, ask.stopped, ask.endTurn = true, false, false
+				ask.requestId = (ask.requestId or 0) + 1
+				ask.topic = nil
+				task.spawn(fetchTopic, key, question, ask.requestId)
+				ask.status = "Thinking…"
+				ask.lastActivity = os.clock()
+				local checkpoint = #ask.messages
+				table.insert(ask.messages, '{"role":"user","content":' .. jsonString(question) .. "}")
+				note("question", question)
+				setGlow(true)
+				task.spawn(function()
+					local ok, err = pcall(converse, key, checkpoint)
+					if not ok then
+						warn("[coolui] Ask failed: " .. tostring(err))
+						rewind(checkpoint)
+						note("error", "Something went wrong: " .. tostring(err))
+					end
+					ask.busy = false
+					ask.status = ""
+					ask.lastActivity = os.clock()
+					setGlow(false)
+					changed()
+					-- If Spotlight was closed meanwhile, it comes back with the answer
+					if alive and root.Visible and not spotlight and not ask.endTurn then
+						openSpotlight(true)
+					end
+				end)
+			end
+
+			function ask.stop()
+				if ask.busy then
+					ask.stopped = true
+					ask.status = "Stopping…"
+					ask.topic = "Stopping…"
+					changed()
+				end
+			end
+
+			function ask.clear()
+				if ask.busy then
+					return
+				end
+				table.clear(ask.transcript)
+				ask.version = (ask.version or 0) + 1
+				ask.messages = {}
+				changed()
+			end
+		end
+		setUpAsk()
+	end
 
 	-- Light or Dark. Every color on the desktop that's in the old palette is
 	-- swapped for the new palette's (see MAC_PALETTES), so open windows change
@@ -7166,6 +9504,7 @@ local function createMacDesktop(session)
 
 		local action = pendingAction or "shutdown"
 		closeMenu()
+		closeSpotlight()
 		tooltip.Visible = false
 		drag = nil
 		resize = nil
@@ -7365,6 +9704,7 @@ local function runMacOS(assets, startup)
 	while true do
 		showMacLockScreen(session, boot)
 		boot = false
+		macSounds.play(macSounds.login) -- logged in
 		if not desktop then
 			desktop = createMacDesktop(session)
 			-- Windows saved at the last Shut Down
@@ -7388,6 +9728,29 @@ local function runMacOS(assets, startup)
 			restartScreen.run(3.5)
 			restartScreen.hide()
 			restartScreen.destroy()
+			boot = true
+		elseif action == "redownload" then
+			-- Like Restart, but the startup screen deletes the assets and gets
+			-- them all again, saying what it's on
+			fadeMacMusic(0.6)
+			session.fadeCover(0, 0.6)
+			desktop.closeAllWindows()
+			task.wait(0.8)
+			local screen = createMacBootScreen(session.gui, 60, false)
+			screen.show()
+			local ok, err = pcall(rebuildMacAssets, function(fraction, title, file)
+				screen.setProgress(fraction, 0.2)
+				screen.setStatus(title, file)
+			end)
+			if not ok then
+				warn("[coolui] Redownload failed: " .. tostring(err))
+				screen.setStatus("Something went wrong", tostring(err))
+				screen.setProgress(1, 0.3)
+				task.wait(2.5)
+			end
+			task.wait(0.9)
+			screen.hide()
+			screen.destroy()
 			boot = true
 		elseif action == "sleep" then
 			macSleep(session)
@@ -7439,6 +9802,11 @@ local function runMacOSLoader()
 
 	local assets = {}
 	local steps = {
+		{"Sounds", function()
+			-- First, so the startup chime is ready when the startup screen comes up
+			macSounds.get(macSounds.startup)
+			macSounds.get(macSounds.login)
+		end},
 		{"Wallpaper effects", function()
 			assets.glow = getMacGlowAsset()
 		end},
