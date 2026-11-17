@@ -15,8 +15,10 @@ screen with Liquid Glass, then a desktop:
   and the first time macOS starts; System Settings > General can show it every
   time. Logging in plays the Mac's log-in sound
 - Redownload (System Settings > General): restarts into the startup screen,
-  deletes the downloaded and generated assets and gets each one again, saying
-  which file it's on ("Downloading music 1/2 · loadingsuccess.mp3")
+  downloads the music, sounds and clock font again and remakes every glass
+  image, saying which file it's on ("Downloading music 1/2 ·
+  loadingsuccess.mp3"). A downloaded file is only replaced once its new copy
+  has arrived, so a failed download never leaves you without it
 - Light and Dark appearance (System Settings > Appearance)
 - Spotlight (the menu bar's magnifier or Ctrl+Space): a dark Liquid Glass
   "Search or Ask" bar with a glowing cursor that finds apps, settings,

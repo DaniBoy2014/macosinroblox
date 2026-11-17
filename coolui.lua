@@ -89,10 +89,19 @@ local ASSET_BRANCH = "main"
 local ASSET_BASE_URL = "https://raw.githubusercontent.com/" .. ASSET_REPO .. "/" .. ASSET_BRANCH .. "/assets/"
 
 -- Downloads from the first URL that returns a real file (GitHub answers a
--- missing file with a tiny "404: Not Found" page, which is skipped)
+-- missing file with a tiny "404: Not Found" page, which is skipped). For a
+-- few minutes after a file is added to the repo, GitHub's cache can keep
+-- answering "404" for it, so GitHub links get a second try with a query
+-- string on the end, which the cache doesn't have yet.
 local function downloadAsset(urls, minBytes)
 	local lastProblem
+	local tries = table.clone(urls)
 	for _, url in ipairs(urls) do
+		if url:find("raw.githubusercontent.com", 1, true) and not url:find("?", 1, true) then
+			table.insert(tries, url .. "?v=" .. os.time())
+		end
+	end
+	for _, url in ipairs(tries) do
 		local ok, data = pcall(function()
 			return game:HttpGet(url)
 		end)
@@ -114,9 +123,11 @@ local MUSIC_BACKUP_URL = "https://raw.githubusercontent.com/DaniBoy2014/music/re
 local activeSounds = {}
 local musicEnabled = true
 
-local function getMusicAsset(fileName)
+-- `force`: download it again even if it's saved (Redownload). The saved file
+-- is only replaced once the new one has arrived.
+local function getMusicAsset(fileName, force)
 	local path = MUSIC_FOLDER .. "/" .. fileName
-	if not isfile(path) then
+	if force or not isfile(path) then
 		local data = downloadAsset({ASSET_BASE_URL .. "music/" .. fileName, MUSIC_BACKUP_URL .. fileName})
 		if not isfolder(MUSIC_FOLDER) then
 			makefolder(MUSIC_FOLDER)
@@ -1860,15 +1871,15 @@ local function getMacDiscAsset()
 	return macDiscId
 end
 
-local function getMacWallpaperAsset()
+local function getMacWallpaperAsset(force)
 	if MACOS_WALLPAPER_URL == "" then
 		return nil
 	end
 	local ext = if MACOS_WALLPAPER_URL:lower():match("%.jpe?g") then "jpg" else "png"
 	local path = MACOS_FOLDER .. "/wallpaper." .. ext
 	local urlPath = MACOS_FOLDER .. "/wallpaper_url.txt"
-	-- Re-download only when the link changes
-	if not (isfile(path) and isfile(urlPath) and readfile(urlPath) == MACOS_WALLPAPER_URL) then
+	-- Re-download only when the link changes (or Redownload asks)
+	if force or not (isfile(path) and isfile(urlPath) and readfile(urlPath) == MACOS_WALLPAPER_URL) then
 		local data = game:HttpGet(MACOS_WALLPAPER_URL)
 		if #data < 1024 then
 			error("wallpaper download looks broken (" .. #data .. " bytes)")
@@ -1884,9 +1895,9 @@ end
 -- plays on the startup screen, the log-in sound when you unlock the desktop.
 -- Saved next to the other assets, so Music doesn't list them as songs.
 local macSounds = {startup = "startup_chime.wav", login = "volume_mount.wav"}
-function macSounds.get(fileName)
+function macSounds.get(fileName, force)
 	local path = MACOS_FOLDER .. "/sound_" .. fileName
-	if not isfile(path) then
+	if force or not isfile(path) then
 		local data = downloadAsset({ASSET_BASE_URL .. "sounds/" .. fileName}, 4096)
 		if data:sub(1, 4) ~= "RIFF" then
 			error(fileName .. " download looks broken (" .. #data .. " bytes)")
@@ -2647,12 +2658,12 @@ local function parseTrueType(data)
 	}
 end
 
-local function loadMacClockFont()
-	if macClockFont then
+local function loadMacClockFont(force)
+	if macClockFont and not force then
 		return macClockFont
 	end
 	local path = MACOS_FOLDER .. "/clockfont_inter700.ttf"
-	if not isfile(path) then
+	if force or not isfile(path) then
 		local data = downloadAsset({ASSET_BASE_URL .. "fonts/Inter-Bold.ttf", MACOS_CLOCK_FONT_BACKUP_URL}, 10000)
 		if string.sub(data, 1, 4) ~= "\0\1\0\0" then
 			error("clock font download looks broken (" .. #data .. " bytes)")
@@ -4378,13 +4389,14 @@ local function macListFolder(path)
 	return entries
 end
 
--- Redownload (System Settings > General): deletes every file macOS
--- downloaded or made (the music, the clock font, the wallpaper, every Liquid
--- Glass image) and gets each one again. Notes, settings, the background
--- choice, the Claude key and your own songs stay. `report(fraction, title,
--- file)` says what it's on; yields.
+-- Redownload (System Settings > General): downloads the music, sounds,
+-- clock font and wallpaper again, and deletes and remakes every Liquid Glass
+-- image. A downloaded file is only replaced once its new copy has arrived,
+-- so a failed download leaves the old one working. Notes, settings, the
+-- background choice, the Claude key and your own songs stay. `report(fraction,
+-- title, file)` says what it's on; yields.
 local function rebuildMacAssets(report)
-	local made = {"^glass_", "^glassrim_", "^softglow", "^disc_v", "^edgeglow", "^ripple", "^clockfont_", "^wallpaper[%._]", "^sound_"}
+	local made = {"^glass_", "^glassrim_", "^softglow", "^disc_v", "^edgeglow", "^ripple"}
 	local downloadedMusic = {"loadingsuccess.mp3", "shopmusic.mp3"}
 	local doomed = {}
 	pcall(function()
@@ -4397,31 +4409,26 @@ local function rebuildMacAssets(report)
 			end
 		end
 	end)
-	for _, name in ipairs(downloadedMusic) do
-		local path = MUSIC_FOLDER .. "/" .. name
-		if isfile(path) then
-			table.insert(doomed, {name = name, path = path})
-		end
-	end
 
 	-- What to get back, in order: downloads first (the glass clock needs the font)
 	local jobs = {}
 	for i, name in ipairs(downloadedMusic) do
 		table.insert(jobs, {string.format("Downloading music %d/%d", i, #downloadedMusic), name, function()
-			getMusicAsset(name)
+			getMusicAsset(name, true)
 		end})
 	end
 	for i, name in ipairs({macSounds.startup, macSounds.login}) do
 		table.insert(jobs, {string.format("Downloading sound %d/2", i), name, function()
-			macSounds.get(name)
+			macSounds.get(name, true)
 		end})
 	end
 	table.insert(jobs, {"Downloading font 1/1", "Inter-Bold.ttf", function()
-		macClockFont = nil
-		loadMacClockFont()
+		loadMacClockFont(true)
 	end})
 	if MACOS_WALLPAPER_URL ~= "" then
-		table.insert(jobs, {"Downloading wallpaper 1/1", MACOS_WALLPAPER_URL:match("([^/?]+)[^/]*$") or "wallpaper", getMacWallpaperAsset})
+		table.insert(jobs, {"Downloading wallpaper 1/1", MACOS_WALLPAPER_URL:match("([^/?]+)[^/]*$") or "wallpaper", function()
+			getMacWallpaperAsset(true)
+		end})
 	end
 	-- Every image this session has used: the glow and the traffic lights'
 	-- disc first, then each piece of glass
@@ -4442,9 +4449,9 @@ local function rebuildMacAssets(report)
 		table.insert(jobs, {string.format("Creating image %d/%d", i, #images), item.path:match("([^/]+)$"), item.make})
 	end
 
-	-- Deleting counts for the first tenth of the bar
+	-- Deleting the images counts for the first tenth of the bar
 	for i, entry in ipairs(doomed) do
-		report(0.1 * i / #doomed, string.format("Deleting old assets %d/%d", i, #doomed), entry.name)
+		report(0.1 * i / #doomed, string.format("Deleting old images %d/%d", i, #doomed), entry.name)
 		pcall(delfile, entry.path)
 		if i % 8 == 0 then
 			task.wait()
