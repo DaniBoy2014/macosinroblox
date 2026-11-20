@@ -593,8 +593,14 @@ class LyricStudio(tk.Tk):
         left.pack(side="left", fill="y", padx=16, pady=16)
         left.pack_propagate(False)
 
-        self.cover_label = tk.Label(left, bg=BG2, width=280, height=280)
-        self.cover_label.pack()
+        # A fixed 280 x 280 box: a Label's width and height count characters
+        # while it shows text, so the ♪ on its own pushed everything below it
+        # (title, artist, log) out of the window
+        cover_box = tk.Frame(left, bg=BG2, width=280, height=280)
+        cover_box.pack_propagate(False)
+        cover_box.pack()
+        self.cover_label = tk.Label(cover_box, bg=BG2)
+        self.cover_label.pack(fill="both", expand=True)
         self.title_label = tk.Label(left, text="No song loaded", bg=BG, fg=FG,
                                     font=("Segoe UI", 14, "bold"), wraplength=290,
                                     justify="left", anchor="w")
@@ -874,6 +880,9 @@ class LyricStudio(tk.Tk):
             if self.no_id_var.get():
                 self.doc = {"SoundId": 0, "Unsynced": False, "Lyrics": []}
                 lyrics = self.audio_path.with_name(self.audio_path.stem + ".lyrics.json")
+                if not lyrics.exists():  # (or the last Auto-Sync of this file)
+                    lyrics = DOWNLOADS / (re.sub(r"[^\w\-]+", "-", self.audio_path.stem).strip("-")
+                                          + ".sync.json")
                 if lyrics.exists():  # (a song from Music that already has lyrics)
                     try:
                         loaded = json.loads(lyrics.read_text(encoding="utf-8"))
@@ -1349,12 +1358,15 @@ class PreviewWindow(tk.Toplevel):
         left.pack(side="left", fill="y", padx=24, pady=24)
         left.pack_propagate(False)
 
-        cover = tk.Label(left, bg=BG2, width=280, height=280)
+        cover_box = tk.Frame(left, bg=BG2, width=280, height=280)
+        cover_box.pack_propagate(False)
+        cover_box.pack()
+        cover = tk.Label(cover_box, bg=BG2)
         if app.cover_img is not None:
             cover.configure(image=app.cover_img)
         else:
             cover.configure(text="♪", fg=FG2, font=("Segoe UI", 60))
-        cover.pack()
+        cover.pack(fill="both", expand=True)
         tk.Label(left, text=app.title_label.cget("text"), bg=BG, fg=FG,
                  font=("Segoe UI", 15, "bold"), wraplength=300, justify="left",
                  anchor="w").pack(fill="x", pady=(14, 0))
@@ -1400,14 +1412,19 @@ class PreviewWindow(tk.Toplevel):
             self.line_marks.append(tag)
         self.canvas.configure(state="disabled")
 
+        loaded = False
         if AUDIO_OK and app.audio_path:
             try:
                 pygame.mixer.music.load(str(app.audio_path))
+                loaded = True
             except Exception as exc:
                 self.app._log(f"! preview audio failed: {exc}")
+                self.app.notify("Preview can't play this file", str(exc), error=True)
 
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.tick()
+        if loaded:
+            self.after(300, self.toggle)  # (starts playing straight away)
 
     @staticmethod
     def _fmt(seconds: float) -> str:
