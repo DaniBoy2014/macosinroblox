@@ -8,6 +8,10 @@
   "songs": {
     "carl dance.mp3": {
       "title": "Carl Dance"
+    },
+    "Carl Dance.mp3": {
+      "title": "Carl Dance",
+      "artist": "GroovyDominoes52"
     }
   }
 }
