@@ -113,6 +113,9 @@ def add_song(root: Path, category: str, audio: Path, document: dict | None = Non
     else:
         info = {"title": parts[-1].replace("-", " ").replace("_", " ").title(), "description": ""}
 
+    # Already in this category (adding lyrics to a song that's there): keep its file
+    if name is None and audio.resolve().parent == folder.resolve():
+        name = audio.stem
     base = safe_name(name or title)
     target = folder / f"{base}{audio.suffix.lower()}"
     written = []

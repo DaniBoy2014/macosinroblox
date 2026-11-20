@@ -83,6 +83,59 @@ def probe_duration(path: str | Path) -> float:
     )
 
 
+def probe_info(path: str | Path) -> dict:
+    """What the file itself says, nothing downloaded: its length, format, size,
+    sample rate, channels, and title/artist/album tags when it has them."""
+    path = Path(path)
+    info = {
+        "format": path.suffix.lstrip(".").upper() or "audio",
+        "size": path.stat().st_size if path.exists() else 0,
+        "duration": None, "title": "", "artist": "", "album": "",
+        "sample_rate": None, "channels": None, "bit_rate": None,
+    }
+    try:
+        import av
+
+        with av.open(str(path)) as container:
+            tags = {str(k).lower(): str(v) for k, v in (container.metadata or {}).items()}
+            if container.duration:
+                info["duration"] = container.duration / av.time_base
+            info["bit_rate"] = container.bit_rate or None
+            for stream in container.streams:
+                if stream.type == "audio":
+                    info["sample_rate"] = stream.codec_context.sample_rate or None
+                    info["channels"] = stream.codec_context.channels or None
+                    tags = {**{str(k).lower(): str(v) for k, v in (stream.metadata or {}).items()}, **tags}
+                    if info["duration"] is None and stream.duration and stream.time_base:
+                        info["duration"] = float(stream.duration * stream.time_base)
+                    break
+            info["title"] = tags.get("title", "").strip()
+            info["artist"] = (tags.get("artist") or tags.get("album_artist") or "").strip()
+            info["album"] = tags.get("album", "").strip()
+    except Exception:
+        pass
+    if info["duration"] is None:
+        try:
+            info["duration"] = probe_duration(path)
+        except AudioError:
+            pass
+    return info
+
+
+def describe_info(info: dict) -> str:
+    """"MP3 · 3:12 · 2.3 MB · 44.1 kHz stereo" from probe_info."""
+    parts = [info.get("format") or "audio"]
+    if info.get("duration"):
+        minutes, seconds = divmod(int(round(info["duration"])), 60)
+        parts.append(f"{minutes}:{seconds:02d}")
+    if info.get("size"):
+        parts.append(f"{info['size'] / 1_000_000:.1f} MB")
+    if info.get("sample_rate"):
+        channels = {1: " mono", 2: " stereo"}.get(info.get("channels") or 0, "")
+        parts.append(f"{info['sample_rate'] / 1000:g} kHz{channels}")
+    return " · ".join(parts)
+
+
 def fingerprint(path: str | Path) -> str:
     """Cheap identity for cache keys: size + mtime, no need to hash whole songs."""
     st = Path(path).stat()

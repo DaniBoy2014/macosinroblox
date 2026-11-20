@@ -54,6 +54,8 @@ def load_documents(songs_dir: Path) -> list[dict[str, Any]]:
             continue
         if "SoundId" not in data or not isinstance(data.get("Lyrics"), list):
             continue
+        if not data["SoundId"]:
+            continue  # not on Roblox, so no use in a Roblox lyrics library
         found[str(data["SoundId"])] = data
     return list(found.values())
 

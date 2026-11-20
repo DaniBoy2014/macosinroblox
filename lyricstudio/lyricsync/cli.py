@@ -40,8 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync = sub.add_parser("sync", help="transcribe an audio file and write the Roblox JSON")
     sync.add_argument("audio", help="path to the .mp3 (or wav/flac/ogg/m4a)")
-    sync.add_argument("--id", "--sound-id", dest="sound_id", required=True,
-                      help="Roblox audio id: 6910191685, rbxassetid://6910191685 or an asset URL")
+    sync.add_argument("--id", "--sound-id", dest="sound_id",
+                      help="Roblox audio id: 6910191685, rbxassetid://6910191685 or an asset URL. "
+                           "Leave it out for a song that isn't on Roblox (it then can't be published "
+                           "or go in the Lua library)")
     sync.add_argument("--user", "--username", dest="username",
                       help="name used in the certification line (remembered with --save)")
     sync.add_argument("--written-by", help="override the 'Written By' name")
@@ -453,6 +455,9 @@ def cmd_publish(args) -> int:
     log(f"\n  publishing {len(documents)} song(s) to {api}\n")
     failures = 0
     for name, document in documents:
+        if not document.get("SoundId"):
+            log(f"  skipped {name}: it has no Roblox id, and the API files lyrics by id")
+            continue
         ok, note = _publish_document(api, key, document)
         if ok:
             log(f"  ok      {document['SoundId']:<18} {name}  ({note})")
@@ -537,11 +542,13 @@ def cmd_sync(args) -> int:
         print(f"error: audio file not found: {audio_path}", file=sys.stderr)
         return 2
 
-    try:
-        sound_id = audioutil.parse_sound_id(args.sound_id)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+    sound_id = 0  # (a song that isn't on Roblox)
+    if args.sound_id:
+        try:
+            sound_id = audioutil.parse_sound_id(args.sound_id)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
     username = args.username or saved.get("username") or ""
     written_by = args.written_by or username
@@ -558,7 +565,7 @@ def cmd_sync(args) -> int:
 
     log(f"\n=== lyricsync {__version__} ===")
     log(f"  audio     {audio_path.name}  ({audioutil.format_timestamp(duration)})")
-    log(f"  sound id  {sound_id}")
+    log(f"  sound id  {sound_id or 'none (not on Roblox)'}")
 
     backend = pick_backend(args.model or saved.get("model") or None, args.device)
     log(f"  engine    {backend.describe()}")
@@ -642,7 +649,7 @@ def cmd_sync(args) -> int:
         header = (
             "# Corrected lyrics for lyricsync. One lyric line per text line.\n"
             "# Fix the words / move the line breaks, then re-run with:\n"
-            f"#   lyricsync \"{audio_path.name}\" --id {sound_id} "
+            f"#   lyricsync \"{audio_path.name}\"{f' --id {sound_id}' if sound_id else ''} "
             f"--user {written_by or 'You'} --lyrics-file \"{txt_path}\"\n"
         )
         txt_path.write_text(header + "\n".join(line.text for line in lines) + "\n", encoding="utf-8")

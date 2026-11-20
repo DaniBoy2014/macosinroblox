@@ -492,6 +492,8 @@ class LyricStudio(tk.Tk):
         self.doc: dict = {"SoundId": 0, "Unsynced": False, "Lyrics": []}
         self.cover_img = None
         self.cover_blob: bytes | None = None
+        self.song_title = ""   # (Add to macOS starts from these)
+        self.song_artist = ""
         self.preview_win = None
         self._toasts: list[Toast] = []
         self.sound_on = True
@@ -531,6 +533,11 @@ class LyricStudio(tk.Tk):
         self._info_job = None
         self._info_fetched_for = None
         self.id_entry.bind("<KeyRelease>", self._schedule_info_fetch)
+        # A song that isn't on Roblox: no id, and nothing is looked up online
+        self.no_id_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(bar, text="No music id", variable=self.no_id_var, command=self.on_toggle_no_id,
+                       bg=BG2, fg=FG2, selectcolor=BG3, activebackground=BG2, activeforeground=FG,
+                       cursor="hand2").pack(side="left", padx=(8, 4))
 
         def btn(text, cmd):
             b = tk.Button(bar, text=text, command=cmd, bg=BG3, fg=FG,
@@ -596,6 +603,9 @@ class LyricStudio(tk.Tk):
                                      bg=BG, fg=FG2, font=("Segoe UI", 11),
                                      wraplength=290, justify="left", anchor="w")
         self.artist_label.pack(fill="x")
+        self.details_label = tk.Label(left, text="", bg=BG, fg=FG2, font=("Segoe UI", 9),
+                                      wraplength=290, justify="left", anchor="w")
+        self.details_label.pack(fill="x", pady=(2, 0))
 
         tk.Label(left, text="Log", bg=BG, fg=FG2, anchor="w").pack(fill="x", pady=(14, 2))
         self.log_box = tk.Text(left, bg=BG2, fg=FG2, height=10, relief="flat",
@@ -707,6 +717,79 @@ class LyricStudio(tk.Tk):
                                        font=("Segoe UI", 60))
         self.after(0, apply)
 
+    # ------------------------------------------------------- no music id
+
+    def on_toggle_no_id(self):
+        """No music id: the song isn't on Roblox, so nothing is fetched for it."""
+        if self.no_id_var.get():
+            if self._info_job:
+                self.after_cancel(self._info_job)
+                self._info_job = None
+            self.id_entry.delete(0, "end")
+            self.id_entry.configure(state="disabled", disabledbackground=BG2)
+            self.sound_id = None
+            self.doc["SoundId"] = 0
+            self._info_fetched_for = None
+            if self.audio_path:
+                self._show_local_info(self.audio_path)
+            else:
+                self._set_cover(None)
+                self.song_title, self.song_artist = "", ""
+                self.title_label.configure(text="No song loaded")
+                self.artist_label.configure(text="Press Load Audio... to pick the song")
+                self.details_label.configure(text="")
+        else:
+            self.id_entry.configure(state="normal")
+            self.id_entry.focus_set()
+            if not self.audio_path:
+                self.artist_label.configure(text="Put in a music id and press Download")
+                self.details_label.configure(text="")
+
+    def _show_local_info(self, path: Path):
+        """The default cover and what the file itself says: its tags, length,
+        format and size (nothing is downloaded)."""
+        self._set_cover(None)
+
+        def work():
+            from lyricsync import audioutil
+            try:
+                info = audioutil.probe_info(path)
+            except Exception:  # noqa: BLE001 - an unreadable file still gets its name shown
+                info = {"format": path.suffix.lstrip(".").upper()}
+            title = info.get("title") or path.stem
+            artist = info.get("artist") or ""
+            album = info.get("album") or ""
+            self.song_title, self.song_artist = title, artist
+            byline = " - ".join(part for part in (artist, album if album != title else "") if part)
+            details = audioutil.describe_info(info) + " · no music id"
+            self.after(0, lambda: (self.title_label.configure(text=title),
+                                   self.artist_label.configure(text=byline or "Unknown artist"),
+                                   self.details_label.configure(text=details)))
+            self._log(f"{path.name}: {details}")
+
+        self._bg(work)
+
+    def _show_file_details(self, path: Path, lead: str = ""):
+        """Length, format and size under the artist, for a downloaded song."""
+        def work():
+            from lyricsync import audioutil
+            try:
+                text = audioutil.describe_info(audioutil.probe_info(path))
+            except Exception:  # noqa: BLE001
+                return
+            self.after(0, lambda: self.details_label.configure(text=" · ".join(p for p in (lead, text) if p)))
+
+        self._bg(work)
+
+    def _needs_id(self, action: str) -> bool:
+        """True (and says so) if this song has no music id, which `action` needs."""
+        if self.no_id_var.get():
+            self.notify("This song has no music id",
+                        f"{action} needs the song's Roblox music id. Untick No music id and type it.",
+                        error=True)
+            return True
+        return False
+
     # ---------------------------------------------------------- actions
 
     def _fetch_info(self, sound_id: int):
@@ -714,8 +797,10 @@ class LyricStudio(tk.Tk):
         self._log(f"fetching info for {sound_id}...")
         details = fetch_details(sound_id)
         title = details["title"] or f"Sound {sound_id}"
+        self.song_title, self.song_artist = details["title"], details["artist"]
         self.after(0, lambda: (self.title_label.configure(text=title),
-                               self.artist_label.configure(text=details["artist"] or "Unknown")))
+                               self.artist_label.configure(text=details["artist"] or "Unknown"),
+                               self.details_label.configure(text=f"Roblox id {sound_id}")))
         self._set_cover(fetch_thumbnail(sound_id))
         return title
 
@@ -727,6 +812,8 @@ class LyricStudio(tk.Tk):
 
     def _auto_info_fetch(self):
         self._info_job = None
+        if self.no_id_var.get():
+            return
         try:
             sound_id = parse_sound_id(self.id_entry.get())
         except ValueError:
@@ -737,6 +824,10 @@ class LyricStudio(tk.Tk):
         self._bg(lambda: self._fetch_info(sound_id))
 
     def on_download(self):
+        if self.no_id_var.get():
+            self.notify("No music id is ticked", "Download gets a song from Roblox by its id. Untick "
+                        "No music id and type one, or use Load Audio... for a file.", error=True)
+            return
         try:
             sound_id = parse_sound_id(self.id_entry.get())
         except ValueError as exc:
@@ -752,6 +843,7 @@ class LyricStudio(tk.Tk):
                 self.audio_path = download_audio(sound_id)
                 size_mb = self.audio_path.stat().st_size / 1_000_000
                 self._log(f"audio -> {self.audio_path.name} ({size_mb:.1f} MB)")
+                self._show_file_details(self.audio_path, f"Roblox id {sound_id}")
                 self.notify("Audio downloaded",
                             f"{title} · {self.audio_path.name} ({size_mb:.1f} MB) - "
                             "ready for Auto-Sync or Preview.")
@@ -768,7 +860,24 @@ class LyricStudio(tk.Tk):
         if path:
             self.audio_path = Path(path)
             self._log(f"audio -> {self.audio_path.name}")
-            if self.sound_id is None:
+            # No id typed: it's a song that isn't on Roblox
+            if not self.id_entry.get().strip() and not self.no_id_var.get():
+                self.no_id_var.set(True)
+                self.on_toggle_no_id()
+            if self.no_id_var.get():
+                self.doc = {"SoundId": 0, "Unsynced": False, "Lyrics": []}
+                lyrics = self.audio_path.with_name(self.audio_path.stem + ".lyrics.json")
+                if lyrics.exists():  # (a song from Music that already has lyrics)
+                    try:
+                        loaded = json.loads(lyrics.read_text(encoding="utf-8"))
+                        if isinstance(loaded.get("Lyrics"), list):
+                            self.doc = loaded
+                            self._log(f"loaded its lyrics from {lyrics.name} - edit away")
+                    except (OSError, ValueError, AttributeError):
+                        self._log(f"! {lyrics.name} couldn't be read")
+                self._refresh_tree()
+                self._show_local_info(self.audio_path)
+            elif self.sound_id is None:
                 try:
                     self.sound_id = parse_sound_id(self.id_entry.get())
                     self.doc["SoundId"] = self.sound_id
@@ -776,6 +885,8 @@ class LyricStudio(tk.Tk):
                     self._log("! set the music id too, publishing needs it")
 
     def on_fetch_published(self):
+        if self._needs_id("Fetch Published"):
+            return
         try:
             sound_id = parse_sound_id(self.id_entry.get())
         except ValueError as exc:
@@ -804,15 +915,19 @@ class LyricStudio(tk.Tk):
         if not self.audio_path:
             self.notify("No audio yet", "Download or load the audio first", error=True)
             return
-        if not self.sound_id:
-            self.notify("No music id", "Set the music id first", error=True)
+        if not self.sound_id and not self.no_id_var.get():
+            self.notify("No music id", "Type the song's Roblox id, or tick No music id", error=True)
             return
 
         def work():
-            out = HERE / "downloads" / f"{self.sound_id}.sync.json"
+            DOWNLOADS.mkdir(exist_ok=True)
+            name = (str(self.sound_id) if self.sound_id
+                    else re.sub(r"[^\w\-]+", "-", self.audio_path.stem).strip("-") or "song")
+            out = DOWNLOADS / f"{name}.sync.json"
             cmd = [sys.executable, "-m", "lyricsync", "sync", str(self.audio_path),
-                   "--id", str(self.sound_id), "--user", self.username,
-                   "-o", str(out), "--format", "json"]
+                   "--user", self.username, "-o", str(out), "--format", "json"]
+            if self.sound_id:
+                cmd += ["--id", str(self.sound_id)]
             self._log("running whisper... (this can take a while)")
             proc = subprocess.Popen(cmd, cwd=HERE, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True,
@@ -838,6 +953,8 @@ class LyricStudio(tk.Tk):
         self._bg(work)
 
     def on_publish(self):
+        if self._needs_id("Publishing"):
+            return
         self._commit_fields()
         if not self.doc["Lyrics"]:
             self.notify("Nothing to publish", "Load or sync lyrics first", error=True)
@@ -863,6 +980,8 @@ class LyricStudio(tk.Tk):
 
     def on_remove_published(self):
         """Delete this song's published lyrics from the API (for bad syncs)."""
+        if self._needs_id("Remove Published"):
+            return
         try:
             sound_id = parse_sound_id(self.id_entry.get())
         except ValueError as exc:
@@ -897,6 +1016,8 @@ class LyricStudio(tk.Tk):
 
     def on_test_fetch(self):
         """Ask the API for this song's lyrics, exactly like a player would."""
+        if self._needs_id("Test Fetch"):
+            return
         try:
             sound_id = parse_sound_id(self.id_entry.get())
         except ValueError as exc:
@@ -928,7 +1049,7 @@ class LyricStudio(tk.Tk):
 
     def on_save_local(self):
         self._commit_fields()
-        if not self.doc["Lyrics"] or not self.sound_id:
+        if not self.doc["Lyrics"]:
             return
         slug = re.sub(r"[^a-z0-9]+", "-",
                       (self.title_label.cget("text") or str(self.sound_id)).lower()).strip("-") \
@@ -1076,6 +1197,20 @@ class LyricStudio(tk.Tk):
         self.preview_win = PreviewWindow(self)
 
 
+def library_category(audio: Path, roots) -> str | None:
+    """"lofi/chill" if `audio` is in that category of one of the libraries."""
+    for root in roots:
+        if not root:
+            continue
+        try:
+            relative = audio.resolve().parent.relative_to(Path(root).resolve())
+        except ValueError:
+            continue
+        if relative.parts:
+            return relative.as_posix()
+    return None
+
+
 class AddToMacOSWindow(tk.Toplevel):
     """Puts the loaded song, its synced lyrics and its cover into macOS in
     Roblox Music on this PC (coolui_music in the executor's workspace). Music
@@ -1112,19 +1247,19 @@ class AddToMacOSWindow(tk.Toplevel):
                  bg=BG, fg=FG2, anchor="w").grid(row=1, column=0, columnspan=2, sticky="w", padx=18, pady=(0, 10))
 
         label("Category", 2)
-        self.category_var = tk.StringVar(value=saved.get("macos_category") or "")
+        inside = library_category(app.audio_path, [self.root])
+        self.keep_name = app.audio_path.stem if inside else None
+        self.category_var = tk.StringVar(value=inside or saved.get("macos_category") or "")
         combo = ttk.Combobox(self, textvariable=self.category_var, values=macos_library.categories(self.root), width=40)
         combo.grid(row=2, column=1, sticky="ew", padx=(0, 18), pady=6, ipady=2)
         tk.Label(self, text="pick one, or type a new name (lofi/chill puts it inside lofi)",
                  bg=BG, fg=FG2, font=("Segoe UI", 8), anchor="w").grid(row=3, column=1, sticky="w", padx=(0, 18))
 
-        title = app.title_label.cget("text")
-        artist = app.artist_label.cget("text")
         label("Title", 4)
-        self.title_var = tk.StringVar(value="" if title in ("No song loaded",) or title.startswith("Sound ") else title)
+        self.title_var = tk.StringVar(value=app.song_title or app.audio_path.stem)
         entry(self.title_var, 4)
         label("Artist", 5)
-        self.artist_var = tk.StringVar(value="" if artist in ("Unknown", "Put in a music id and press Download") else artist)
+        self.artist_var = tk.StringVar(value=app.song_artist)
         entry(self.artist_var, 5)
 
         self.cover_var = tk.BooleanVar(value=app.cover_blob is not None)
@@ -1161,6 +1296,7 @@ class AddToMacOSWindow(tk.Toplevel):
             artist=self.artist_var.get().strip(),
             cover=app.cover_blob if self.cover_var.get() else None,
             sound_id=app.sound_id,
+            name=self.keep_name,
         )
         self.config_module.save(macos_category=category)
         self.destroy()

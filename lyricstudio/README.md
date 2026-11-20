@@ -28,6 +28,19 @@ For another executor, point it at that executor's workspace once:
 `python -m lyricsync macos --workspace "C:\path\to\its\workspace"`. Music only
 plays mp3, ogg and wav.
 
+## Songs that aren't on Roblox
+
+Tick **No music id** (or just press **Load Audio...** with the id box empty) for a
+song that isn't on Roblox. Nothing is looked up online: the info pane shows the
+default ♪ cover and what the file itself says (its title and artist tags, length,
+format, size and sample rate). Auto-Sync and Add to macOS work as usual. Publish,
+Fetch Published, Test Fetch and Remove Published need a Roblox id, so they're off.
+On the command line, leave out `--id`.
+
+Loading a song that's already in Music opens its lyrics (`<song>.lyrics.json`) for
+editing, and Add to macOS picks its category and keeps its file, saving just the
+lyrics next to it.
+
 ## Keys and the Roblox cookie
 
 Keep them out of this folder (it's in a public repo):
