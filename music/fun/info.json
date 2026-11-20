@@ -5,5 +5,10 @@
   "genre": "Pop",
   "artist": "",
   "shuffle": false,
-  "songs": {}
+  "songs": {
+    "I'm A Gummy Bear.mp3": {
+      "title": "I'm A Gummy Bear",
+      "artist": "Tonekind"
+    }
+  }
 }
