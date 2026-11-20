@@ -719,7 +719,7 @@ class LyricStudio(tk.Tk):
 
     # ------------------------------------------------------- no music id
 
-    def on_toggle_no_id(self):
+    def on_toggle_no_id(self, show_info: bool = True):
         """No music id: the song isn't on Roblox, so nothing is fetched for it."""
         if self.no_id_var.get():
             if self._info_job:
@@ -731,7 +731,8 @@ class LyricStudio(tk.Tk):
             self.doc["SoundId"] = 0
             self._info_fetched_for = None
             if self.audio_path:
-                self._show_local_info(self.audio_path)
+                if show_info:
+                    self._show_local_info(self.audio_path)
             else:
                 self._set_cover(None)
                 self.song_title, self.song_artist = "", ""
@@ -745,7 +746,7 @@ class LyricStudio(tk.Tk):
                 self.artist_label.configure(text="Put in a music id and press Download")
                 self.details_label.configure(text="")
 
-    def _show_local_info(self, path: Path):
+    def _show_local_info(self, path: Path, announce: bool = False):
         """The default cover and what the file itself says: its tags, length,
         format and size (nothing is downloaded)."""
         self._set_cover(None)
@@ -766,18 +767,23 @@ class LyricStudio(tk.Tk):
                                    self.artist_label.configure(text=byline or "Unknown artist"),
                                    self.details_label.configure(text=details)))
             self._log(f"{path.name}: {details}")
+            if announce:
+                self.notify("Audio loaded", f"{title} · {audioutil.describe_info(info)} - ready for Auto-Sync"
+                            + (" (its lyrics are open below)" if self.doc.get("Lyrics") else "."))
 
         self._bg(work)
 
-    def _show_file_details(self, path: Path, lead: str = ""):
-        """Length, format and size under the artist, for a downloaded song."""
+    def _show_file_details(self, path: Path, lead: str = "", announce: bool = False):
+        """Length, format and size under the artist, for a downloaded or loaded song."""
         def work():
             from lyricsync import audioutil
             try:
                 text = audioutil.describe_info(audioutil.probe_info(path))
             except Exception:  # noqa: BLE001
-                return
+                text = path.suffix.lstrip(".").upper()
             self.after(0, lambda: self.details_label.configure(text=" · ".join(p for p in (lead, text) if p)))
+            if announce:
+                self.notify("Audio loaded", f"{path.name} · {text} - ready for Auto-Sync.")
 
         self._bg(work)
 
@@ -800,7 +806,8 @@ class LyricStudio(tk.Tk):
         self.song_title, self.song_artist = details["title"], details["artist"]
         self.after(0, lambda: (self.title_label.configure(text=title),
                                self.artist_label.configure(text=details["artist"] or "Unknown"),
-                               self.details_label.configure(text=f"Roblox id {sound_id}")))
+                               (None if self.audio_path else
+                                self.details_label.configure(text=f"Roblox id {sound_id}"))))
         self._set_cover(fetch_thumbnail(sound_id))
         return title
 
@@ -863,7 +870,7 @@ class LyricStudio(tk.Tk):
             # No id typed: it's a song that isn't on Roblox
             if not self.id_entry.get().strip() and not self.no_id_var.get():
                 self.no_id_var.set(True)
-                self.on_toggle_no_id()
+                self.on_toggle_no_id(show_info=False)
             if self.no_id_var.get():
                 self.doc = {"SoundId": 0, "Unsynced": False, "Lyrics": []}
                 lyrics = self.audio_path.with_name(self.audio_path.stem + ".lyrics.json")
@@ -876,13 +883,19 @@ class LyricStudio(tk.Tk):
                     except (OSError, ValueError, AttributeError):
                         self._log(f"! {lyrics.name} couldn't be read")
                 self._refresh_tree()
-                self._show_local_info(self.audio_path)
-            elif self.sound_id is None:
-                try:
-                    self.sound_id = parse_sound_id(self.id_entry.get())
-                    self.doc["SoundId"] = self.sound_id
-                except ValueError:
-                    self._log("! set the music id too, publishing needs it")
+                self._show_local_info(self.audio_path, announce=True)
+            else:
+                if self.sound_id is None:
+                    try:
+                        self.sound_id = parse_sound_id(self.id_entry.get())
+                        self.doc["SoundId"] = self.sound_id
+                    except ValueError:
+                        self._log("! set the music id too, publishing needs it")
+                # (the id's Roblox info, if it isn't showing yet; the file's details go under it)
+                self._auto_info_fetch()
+                self._show_file_details(self.audio_path,
+                                        f"Roblox id {self.sound_id}" if self.sound_id else "",
+                                        announce=True)
 
     def on_fetch_published(self):
         if self._needs_id("Fetch Published"):
