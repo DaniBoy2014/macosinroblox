@@ -4458,8 +4458,174 @@ local function macListFolder(path)
 	return entries
 end
 
--- Redownload (System Settings > General): downloads the music, sounds,
--- clock font and wallpaper again, and deletes and remakes every Liquid Glass
+-- ---------- The music library on GitHub ----------
+-- The repo's music folder is a music tree like coolui_music: category folders
+-- with an info.json, songs and pictures. Every start (Load macOS) and every
+-- Restart asks GitHub what's in it (one request) and downloads what's new or
+-- changed into coolui_music. Songs you add yourself stay, and a file from
+-- GitHub you delete stays deleted until it changes on GitHub (or Redownload).
+-- What came from GitHub is remembered in coolui_assets/music_library.json.
+local macMusicLibrary = {file = MACOS_FOLDER .. "/music_library.json", folder = "music", lastResult = nil}
+do
+	local HttpService = game:GetService("HttpService")
+
+	local function getJson(url)
+		local send = request or http_request
+		local body
+		if send then
+			local response = send({
+				Url = url, Method = "GET",
+				Headers = {["User-Agent"] = "macOS-in-Roblox", Accept = "application/vnd.github+json"},
+			})
+			if type(response) ~= "table" or (response.StatusCode or 200) >= 300 then
+				error("GitHub answered " .. tostring(type(response) == "table" and response.StatusCode or "nothing"), 0)
+			end
+			body = response.Body
+		else
+			body = game:HttpGet(url)
+		end
+		return HttpService:JSONDecode(body)
+	end
+
+	-- A repo path as a URL (spaces and the like escaped)
+	local function urlPath(path)
+		return (path:gsub("[^%w%-%._~/]", function(character)
+			return string.format("%%%02X", string.byte(character))
+		end))
+	end
+
+	local function readState()
+		local ok, state = pcall(function()
+			return HttpService:JSONDecode(readfile(macMusicLibrary.file))
+		end)
+		if ok and type(state) == "table" and type(state.files) == "table" then
+			return state
+		end
+		return {files = {}}
+	end
+
+	local function fileSize(path)
+		local ok, data = pcall(readfile, path)
+		return if ok and type(data) == "string" then #data else -1
+	end
+
+	-- Downloads what's new on GitHub. `report(done, total, file)` says what
+	-- it's downloading; `everything` gets every file again (Redownload). Yields.
+	-- Returns {added = {paths}, updated = {paths}, failed = count}; errors if
+	-- GitHub can't be reached.
+	function macMusicLibrary.sync(report, everything)
+		local state = if everything then {files = {}} else readState()
+		local listing = getJson(("https://api.github.com/repos/%s/git/trees/%s?recursive=1"):format(ASSET_REPO, ASSET_BRANCH))
+		local result = {added = {}, updated = {}, failed = 0}
+		if not everything and listing.sha and state.version == listing.sha then
+			return result -- nothing has changed on GitHub since the last check
+		end
+		local prefix = macMusicLibrary.folder .. "/"
+		local wanted = {}
+		for _, item in ipairs(listing.tree or {}) do
+			if item.type == "blob" and type(item.path) == "string" and item.path:sub(1, #prefix) == prefix then
+				local relative = item.path:sub(#prefix + 1)
+				local localPath = MUSIC_FOLDER .. "/" .. relative
+				local checked, exists = pcall(isfile, localPath)
+				exists = checked and exists == true
+				local known = state.files[relative]
+				if known == item.sha then
+					continue -- already here (or deleted here on purpose)
+				elseif not known and exists and fileSize(localPath) == item.size then
+					state.files[relative] = item.sha -- the same file was already here
+				else
+					table.insert(wanted, {path = item.path, relative = relative, localPath = localPath, sha = item.sha, size = item.size, new = not exists})
+				end
+			end
+		end
+		for i, file in ipairs(wanted) do
+			if report then
+				report(i - 1, #wanted, file.relative)
+			end
+			-- (the ?v= makes GitHub's cache fetch this exact version)
+			local ok, data = pcall(function()
+				return game:HttpGet(("https://raw.githubusercontent.com/%s/%s/%s?v=%s"):format(ASSET_REPO, ASSET_BRANCH, urlPath(file.path), file.sha))
+			end)
+			if ok and type(data) == "string" and (type(file.size) ~= "number" or #data == file.size) then
+				local saved = pcall(function()
+					local folder = MUSIC_FOLDER
+					if not isfolder(folder) then
+						makefolder(folder)
+					end
+					for part in file.relative:gmatch("([^/]+)/") do
+						folder ..= "/" .. part
+						if not isfolder(folder) then
+							makefolder(folder)
+						end
+					end
+					writefile(file.localPath, data)
+				end)
+				if saved then
+					state.files[file.relative] = file.sha
+					table.insert(if file.new then result.added else result.updated, file.relative)
+				else
+					result.failed += 1
+				end
+			else
+				result.failed += 1
+			end
+		end
+		if report and #wanted > 0 then
+			report(#wanted, #wanted, nil)
+		end
+		-- (with a failure, the next start looks again)
+		state.version = if result.failed == 0 then listing.sha else nil
+		pcall(function()
+			ensureMacFolder()
+			writefile(macMusicLibrary.file, HttpService:JSONEncode(state))
+		end)
+		macMusicLibrary.lastResult = result
+		return result
+	end
+
+	-- What a sync added, in words ("2 new songs in Lofi and Dance"), or nil
+	-- if it added no songs or categories
+	function macMusicLibrary.describe(result)
+		if not result or #result.added == 0 then
+			return nil
+		end
+		local songs, places, seen = 0, {}, {}
+		local function titleOf(folder)
+			local ok, info = pcall(function()
+				return HttpService:JSONDecode(readfile(MUSIC_FOLDER .. "/" .. folder .. "/info.json"))
+			end)
+			return if ok and type(info) == "table" and type(info.title) == "string" and info.title ~= "" then info.title else folder:match("([^/]+)$")
+		end
+		local newCategories = {}
+		for _, path in ipairs(result.added) do
+			local folder = path:match("^(.+)/[^/]+$")
+			if MAC_AUDIO_EXTENSIONS[macExtension(path)] then
+				songs += 1
+				if folder and not seen[folder] then
+					seen[folder] = true
+					table.insert(places, titleOf(folder))
+				end
+			elseif folder and path:match("/info%.json$") then
+				table.insert(newCategories, titleOf(folder))
+			end
+		end
+		local function list(names)
+			if #names <= 1 then
+				return names[1] or ""
+			end
+			return table.concat(names, ", ", 1, #names - 1) .. " and " .. names[#names]
+		end
+		if songs > 0 then
+			return songs .. (if songs == 1 then " new song" else " new songs") .. (if #places > 0 then " in " .. list(places) else "")
+		elseif #newCategories > 0 then
+			return "New " .. (if #newCategories == 1 then "category: " else "categories: ") .. list(newCategories)
+		end
+		return nil
+	end
+end
+
+-- Redownload (System Settings > General): downloads the music, the music
+-- library, sounds, clock font and wallpaper again, and deletes and remakes every Liquid Glass
 -- image. A downloaded file is only replaced once its new copy has arrived,
 -- so a failed download leaves the old one working. Notes, settings, the
 -- background choice, the Claude key and your own songs stay. `report(fraction,
@@ -4486,6 +4652,15 @@ local function rebuildMacAssets(report)
 			getMusicAsset(name, true)
 		end})
 	end
+	-- The music tree from GitHub, every file of it again
+	local jobFraction = 0
+	table.insert(jobs, {"Downloading the music library", "music", function()
+		macMusicLibrary.sync(function(done, total, file)
+			if file then
+				report(jobFraction, string.format("Downloading the music library %d/%d", done + 1, total), file)
+			end
+		end, true)
+	end})
 	for i, name in ipairs({macSounds.startup, macSounds.login}) do
 		table.insert(jobs, {string.format("Downloading sound %d/2", i), name, function()
 			macSounds.get(name, true)
@@ -4528,7 +4703,8 @@ local function rebuildMacAssets(report)
 	end
 	local failed = 0
 	for i, job in ipairs(jobs) do
-		report(0.1 + 0.9 * (i - 1) / #jobs, job[1], job[2])
+		jobFraction = 0.1 + 0.9 * (i - 1) / #jobs
+		report(jobFraction, job[1], job[2])
 		task.wait()
 		local ok, err = pcall(job[3])
 		if not ok then
@@ -6862,6 +7038,8 @@ local function createMacDesktop(session)
 	-- "songs" can also be a list, [{"file": "rain.mp3", …}, …], which sets the
 	-- order. A picture named like a song (rain.png) is that song's cover. The
 	-- library is read again every few seconds, so changes show up by themselves.
+	-- The repo's music folder is downloaded into it at every start and Restart
+	-- (see macMusicLibrary).
 	do
 		local HttpService = game:GetService("HttpService")
 		local COVER_FOLDER = MACOS_FOLDER .. "/music_covers"
@@ -7139,31 +7317,6 @@ local function createMacDesktop(session)
 			}, "\n")
 		end
 
-		-- The first time Music opens: lofi, fun and dance, to show how it works
-		local function makeExamples()
-			if macSettings.musicExamples then
-				return
-			end
-			macSettings.musicExamples = true
-			saveMacSettings()
-			pcall(function()
-				if not isfolder(MUSIC_FOLDER) then
-					makefolder(MUSIC_FOLDER)
-				end
-				for _, example in ipairs({
-					{"lofi", "Lofi", "Slow, warm beats to study, read or relax to.", "#8E5CF7", "Lofi Hip-Hop"},
-					{"fun", "Fun", "Bright, bouncy songs that make everything a bit more fun.", "#FF9F0A", "Pop"},
-					{"dance", "Dance", "Fast songs with a big beat, for dancing.", "#FF2D78", "Electronic"},
-				}) do
-					local folder = MUSIC_FOLDER .. "/" .. example[1]
-					if not isfolder(folder) then
-						makefolder(folder)
-						writefile(folder .. "/info.json", infoTemplate(example[2], example[3], example[4], example[5]))
-					end
-				end
-			end)
-		end
-
 		local function clockText(seconds)
 			seconds = math.max(0, math.floor(seconds))
 			return string.format("%d:%02d", seconds // 60, seconds % 60)
@@ -7182,7 +7335,6 @@ local function createMacDesktop(session)
 						sound:Destroy()
 					end)
 
-					makeExamples()
 					local library, fingerprint = readLibrary()
 					local page = {kind = "home"}
 					local expanded = {[library.path:lower()] = true}
@@ -9131,6 +9283,14 @@ local function createMacDesktop(session)
 			end
 		end)
 		task.delay(spec.duration or 5, dismiss)
+	end
+
+	-- After a start or Restart that brought new music from GitHub: a banner
+	-- that opens Music
+	function desktop.announceMusic(text)
+		notify({app = "music", title = "Music", text = text, duration = 7, onClick = function()
+			openApp("music")
+		end})
 	end
 
 	-- ---------- Timer ----------
@@ -12972,6 +13132,13 @@ local function runMacOS(assets, startup)
 				saveMacSettings()
 			end
 		end
+		-- New music from GitHub (at this start or Restart): a banner once the
+		-- desktop is up
+		local news = macMusicLibrary.describe(macMusicLibrary.lastResult)
+		macMusicLibrary.lastResult = nil
+		if news then
+			task.delay(1.6, desktop.announceMusic, news)
+		end
 		local action = desktop.run()
 		if action == "shutdown" then
 			break
@@ -12980,10 +13147,28 @@ local function runMacOS(assets, startup)
 			session.fadeCover(0, 0.6)
 			desktop.closeAllWindows()
 			task.wait(0.8)
-			-- Startup screen over the black cover, then the lock screen
+			-- Startup screen over the black cover, then the lock screen. Meanwhile
+			-- the music library checks GitHub for new songs.
 			local restartScreen = createMacBootScreen(session.gui, 60, false)
 			restartScreen.show()
+			local syncing = true
+			task.spawn(function()
+				local ok, err = pcall(macMusicLibrary.sync, function(done, total, file)
+					if file then
+						restartScreen.setStatus(string.format("Adding new music %d of %d", done + 1, total), file)
+					else
+						restartScreen.setStatus("", "")
+					end
+				end)
+				if not ok then
+					warn("[coolui] Couldn't check the music library: " .. tostring(err))
+				end
+				syncing = false
+			end)
 			restartScreen.run(3.5)
+			while syncing do
+				task.wait(0.1)
+			end
 			restartScreen.hide()
 			restartScreen.destroy()
 			boot = true
@@ -13059,11 +13244,26 @@ local function runMacOSLoader()
 	task.wait(0.5)
 
 	local assets = {}
+	local bootScreen = {} -- .screen: the startup screen, once it's showing
 	local steps = {
 		{"Sounds", function()
 			-- First, so the startup chime is ready when the startup screen comes up
 			macSounds.get(macSounds.startup)
 			macSounds.get(macSounds.login)
+		end},
+		{"Music library", function()
+			-- New songs and categories from the music tree on GitHub
+			local ok, err = pcall(macMusicLibrary.sync, function(done, total, file)
+				if file then
+					detail.Text = string.format("Adding new music %d of %d  ·  %s", done + 1, total, file)
+				end
+				if bootScreen.screen then
+					bootScreen.screen.setStatus(if file then string.format("Adding new music %d of %d", done + 1, total) else "", file or "")
+				end
+			end)
+			if not ok then
+				warn("[coolui] Couldn't check the music library: " .. tostring(err))
+			end
 		end},
 		{"Wallpaper effects", function()
 			assets.glow = getMacGlowAsset()
@@ -13166,6 +13366,7 @@ local function runMacOSLoader()
 			holder.Parent = player:WaitForChild("PlayerGui")
 			startup = createMacBootScreen(holder, 1, true)
 			startup.ownGui = holder
+			bootScreen.screen = startup
 			startup.show()
 			startup.setProgress(progress, 0.6)
 			startupShown = true

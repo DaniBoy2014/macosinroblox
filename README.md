@@ -51,12 +51,14 @@ screen with Liquid Glass, then a desktop:
   rules apply; whispers you get while Chat is in the background show a
   banner. Some games turn typing in chat off, and Chat says so
 - Music: a library built from folders. `coolui_music/` is the library, every
-  folder in it is a category (it starts with lofi, fun and dance), and
+  folder in it is a category (lofi, fun and dance come from this repo), and
   categories can hold more categories. Each one can have an `info.json` with
   its title, picture and description (see "The music library" below). The
   sidebar shows the tree, each category has a page with its cover, Play,
   Shuffle and its songs, and changes to the folders show up by themselves.
-  Ask can play a song or a whole category ("play some lofi")
+  Every start and Restart checks this repo's `music/` folder and downloads
+  new songs and categories, with a banner saying what arrived. Ask can play a
+  song or a whole category ("play some lofi")
 - Timer: a countdown with a ring that empties as it runs (it chimes and shows
   a banner when it's done) and a stopwatch with laps. Ask can start timers
 - YouTube: search, Home, Shorts and Live tabs, and real playback of videos
@@ -82,6 +84,8 @@ assets/fonts/Inter-Bold.ttf       outlines for the Liquid Glass clock
 assets/fonts/OFL.txt              Inter's license (must stay next to the font)
 assets/sounds/startup_chime.wav   the startup chime (startup screen)
 assets/sounds/volume_mount.wav    the log-in sound
+music/                            the music library everyone gets (see below)
+  lofi/info.json, fun/info.json, dance/info.json
 youtube_helper.py                 the YouTube helper (runs on your PC)
 ```
 
@@ -103,6 +107,39 @@ for the Working pill, and web searches cost about a cent each (System
 Settings > Ask can turn searching and desktop control off).
 
 ## The music library
+
+### Adding music for everyone (this repo)
+
+This repo's `music/` folder is the shared music tree. It's laid out exactly
+like `coolui_music/` below: a folder per category, each with an `info.json`,
+and the songs (mp3, ogg or wav) and pictures inside. To add music:
+
+1. Put the songs in a category folder, like `music/lofi/rainy day.mp3`, or
+   make a new folder with its own `info.json` for a new category (folders
+   inside folders work too).
+2. Commit and push.
+
+Every time macOS starts (Load macOS) or restarts, it asks GitHub what's in
+`music/` (one request) and downloads only what's new or changed into
+`coolui_music/`, showing "Adding new music 1 of 3" on the loading or restart
+screen. Once the desktop is up, a banner says what arrived ("2 new songs in
+Lofi"). Click it to open Music.
+
+- Songs people add to their own `coolui_music/` stay. Nothing is ever deleted
+  there, even when a file is removed from the repo.
+- A file from the repo that someone deletes locally stays deleted, until it
+  changes in the repo or they use System Settings > General > Redownload
+  (which gets the whole library again).
+- When a file changes in the repo (an edited `info.json`, say), the new
+  version replaces the local copy. Make shared changes here rather than in
+  `coolui_music/`.
+- What came from GitHub is remembered in `coolui_assets/music_library.json`.
+- GitHub allows 60 of these checks an hour from one network. If it says no,
+  macOS starts anyway and checks again next time.
+- GitHub takes files up to 100 MB, but big songs take longer on the first
+  start after they're added.
+
+### The folders
 
 Music reads its library from folders in the executor's workspace:
 
