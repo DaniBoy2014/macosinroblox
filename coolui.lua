@@ -4624,6 +4624,670 @@ do
 	end
 end
 
+-- ---------- Masters inside Music ----------
+-- Masters is a Roblox music player (DanielNov2014/Masters-client-sided) that
+-- runs on the client from three files its installer puts in the workspace:
+-- Masters.rbxm (the UI and modules), MastersLogic.lua (the Handler) and its
+-- loader. Music's "Masters" style runs it inside the Music window: the same
+-- files (downloaded here if they're missing), loaded the way its loader does,
+-- with a few changes so it lives in a window instead of on the screen, can play
+-- the Mac's own songs, and keeps Roblox's public music behind a setting:
+--   * the Mac's songs get negative ids (Roblox's are positive), which Masters'
+--     own checks accept; MastersSoundUri / MastersAudioMetadata turn them into
+--     the song's file, title and artist
+--   * every `ui.Interface` becomes MastersIface(), so the Interface can be moved
+--     into the window, and Main lays it out fullscreen (in the window) there
+--   * a block is added to the end of the Handler (MASTERS_BRIDGE_BLOCK): it
+--     shows the Mac's categories as stations and Discovery rows, finds their
+--     lyrics and covers, adds "Public music" to Settings > Extras, and gives
+--     Music attach/detach.
+-- Masters can only start once per server (a second copy doubles every button),
+-- so it stays loaded, hidden and paused, while Music is closed.
+local macMasters = {}
+do
+	local HttpService = game:GetService("HttpService")
+	local RAW = "https://raw.githubusercontent.com/DanielNov2014/Masters-client-sided/main/"
+	local FILES = {"Masters.rbxm", "MastersLogic.lua", "MastersShareAPI.txt", "MastersPresenceWS.txt"}
+	local REQUIRED = {["Masters.rbxm"] = true, ["MastersLogic.lua"] = true}
+
+	-- What Masters and Music share (it outlives Music windows and even macOS
+	-- restarts): the song snapshot, ids by file, and the hooks the block sets
+	function macMasters.bridge()
+		local bridge = rawget(_G, "MacOSMastersBridge")
+		if not bridge then
+			bridge = {ids = {}, nextId = 0, durations = {}, snapshot = {songs = {}, categories = {}}}
+			rawset(_G, "MacOSMastersBridge", bridge)
+		end
+		return bridge
+	end
+
+	local function escape(text)
+		return (text:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0"))
+	end
+	-- (plain text unless `isPattern`; the replacement is used as is)
+	local function replace(source, find, replacement, isPattern)
+		local count = 0
+		local out = source:gsub(if isPattern then find else escape(find), function()
+			count += 1
+			return replacement
+		end)
+		return out, count
+	end
+
+	-- Masters started from its own loader (not from Music) can't be moved in
+	local function runningOnItsOwn()
+		local bridge = rawget(_G, "MacOSMastersBridge")
+		if bridge and bridge.started then
+			return false
+		end
+		if rawget(_G, "Queue") ~= nil or ReplicatedStorage:FindFirstChild("Masters(Storage)") then
+			return true
+		end
+		local playerGui = player:FindFirstChild("PlayerGui")
+		return playerGui ~= nil and playerGui:FindFirstChild("Masters") ~= nil
+	end
+
+	-- Downloads the Masters files that aren't in the workspace (never replaces
+	-- one that is: Masters' own updater looks after those), checked against
+	-- the release's manifest
+	function macMasters.install(report)
+		local missing = {}
+		for _, name in ipairs(FILES) do
+			if not isfile(name) then
+				table.insert(missing, name)
+			end
+		end
+		if #missing == 0 then
+			return true
+		end
+		local okManifest, manifest = pcall(function()
+			return HttpService:JSONDecode(game:HttpGet(RAW .. "manifest.json?v=" .. os.time()))
+		end)
+		manifest = if okManifest and type(manifest) == "table" then manifest else {}
+		for i, name in ipairs(missing) do
+			report(string.format("Downloading Masters %d of %d", i, #missing), name)
+			local entry = manifest[name]
+			local ok, data = pcall(function()
+				return game:HttpGet(RAW .. name .. (if type(entry) == "table" and entry.sha256 then "?v=" .. entry.sha256 else ""))
+			end)
+			local good = ok and type(data) == "string" and #data > 0 and data ~= "404: Not Found"
+			if good and type(entry) == "table" and type(entry.sha256) == "string" then
+				local okHash, digest = pcall(crypt.hash, data, "sha256")
+				if okHash and type(digest) == "string" and digest:lower() ~= entry.sha256:lower() then
+					good = false
+				end
+			end
+			if good then
+				writefile(name, data)
+			elseif REQUIRED[name] then
+				return nil, "Couldn't download " .. name .. " from GitHub."
+			end
+		end
+		return true
+	end
+
+	-- Starts Masters (once), hidden; yields until its bridge block is ready.
+	-- `report(title, detail)` says what it's doing. Returns true, or nil and why.
+	function macMasters.start(report)
+		report = report or function() end
+		local bridge = macMasters.bridge()
+		if bridge.ready then
+			return true
+		end
+		if not bridge.started then
+			if runningOnItsOwn() then
+				return nil, "Masters is already running in this server from its own loader, so it can't move into Music. Rejoin and open it from Music instead."
+			end
+			bridge.started = true
+			bridge.failed = nil
+			local ok, err = pcall(function()
+				local okInstall, problem = macMasters.install(report)
+				if not okInstall then
+					error(problem, 0)
+				end
+				report("Starting Masters…", "")
+
+				-- Public music's saved setting, before Masters starts loading the catalogue
+				pcall(function()
+					local store = HttpService:JSONDecode(readfile("MastersData_" .. tostring(player.UserId) .. ".json"))
+					local extras = type(store) == "table" and type(store.Settings) == "table" and store.Settings.Extras
+					rawset(_G, "MastersPublicOff", if type(extras) == "table" and extras.PublicMusic == false then true else nil)
+				end)
+
+				local package = game:GetObjects(getcustomasset("Masters.rbxm"))[1]
+				local storage = package and package:FindFirstChild("Masters(Storage)")
+				local ui = package and package:FindFirstChild("Masters")
+				if not (storage and ui) then
+					error("Masters.rbxm doesn't hold the Masters package.", 0)
+				end
+
+				-- No server here: every remote becomes a Bindable the Handler answers itself
+				for _, root in ipairs({storage, ui}) do
+					for _, instance in ipairs(root:GetDescendants()) do
+						if instance:IsA("RemoteFunction") or instance:IsA("RemoteEvent") then
+							local bindable = Instance.new(if instance:IsA("RemoteFunction") then "BindableFunction" else "BindableEvent")
+							bindable.Name = instance.Name
+							for _, child in ipairs(instance:GetChildren()) do
+								child.Parent = bindable
+							end
+							bindable.Parent = instance.Parent
+							instance:Destroy()
+						end
+					end
+				end
+
+				-- The modules' changes (as source text, before they're compiled)
+				local modules = storage:FindFirstChild("Modules")
+				local function patchModule(name, edits)
+					local module = modules and modules:FindFirstChild(name)
+					local hidden = module and module:FindFirstChild("HiddenSource")
+					if not hidden then
+						return
+					end
+					local text = hidden.Value
+					for _, edit in ipairs(edits) do
+						text = replace(text, edit[1], edit[2], edit[3])
+					end
+					hidden.Value = text
+				end
+				patchModule("Queue", {
+					{'"rbxassetid://" .. Id', "_G.MastersSoundUri(Id)"},
+					{'"rbxassetid://" .. SongId', "_G.MastersSoundUri(SongId)"},
+					-- (its quick stand-in details: the Mac's songs have their own)
+					{'Title = "Track " .. tostring(SongId),', 'Title = (tonumber(SongId) or 0) < 0 and _G.MastersAudioMetadata({SongId})[1].Title or "Track " .. tostring(SongId),'},
+					{'Artist = "Masters Artist",', 'Artist = (tonumber(SongId) or 0) < 0 and (_G.MastersAudioMetadata({SongId})[1].Artist or "") or "Masters Artist",'},
+					{"Duration = 180", "Duration = (tonumber(SongId) or 0) < 0 and _G.MastersAudioMetadata({SongId})[1].Duration or 180"},
+				})
+				patchModule("Main", {
+					{"ui%.Interface%f[^%w_]", "_G.MastersIface()", true},
+					{"Utilities.GetViewportRatio() > 1300", '(not rawget(_G, "MastersEmbedded") and Utilities.GetViewportRatio() > 1300)'},
+					{"GuiService.TopbarInset.Height", '(rawget(_G, "MastersEmbedded") and 0 or GuiService.TopbarInset.Height)'},
+					{"CornerRadius = UDim.new(0, 0)", 'CornerRadius = UDim.new(0, rawget(_G, "MastersEmbedded") and 14 or 0)'},
+				})
+				-- (Masters' loader's own fix, until its package has it: a song that
+				-- ends with nothing after it and repeat off stops instead of replaying)
+				local queueSource = modules and modules:FindFirstChild("Queue") and modules.Queue:FindFirstChild("HiddenSource")
+				if queueSource and not queueSource.Value:find("MastersStopGuard", 1, true) then
+					local guard = 'if State.Settings.RepeatMode ~= "Song" and not State.Settings.Shuffle and #State.MasterList <= 1 and #State.Queue == 0 then return end -- MastersStopGuard\n\t\t\t'
+					queueSource.Value = queueSource.Value:gsub(
+						"(if State%.IsLoading or State%.IsCrossfading then return end%s*\n%s*if State%.IsPaused then return end%s*\n%s*)module%.Next%(%)",
+						function(lead)
+							return lead .. guard .. "module.Next()"
+						end, 1)
+				end
+
+				storage.Parent = ReplicatedStorage
+				ui.Enabled = false
+				ui.Parent = player:WaitForChild("PlayerGui")
+
+				rawset(_G, "MastersInterface", ui:FindFirstChild("Interface"))
+				rawset(_G, "MastersIface", function()
+					return rawget(_G, "MastersInterface")
+				end)
+				rawset(_G, "MastersEmbedded", true)
+				-- A song id as a SoundId: the Mac's songs are files
+				rawset(_G, "MastersSoundUri", function(id)
+					local n = tonumber(id)
+					if n and n < 0 then
+						local song = macMasters.bridge().snapshot.songs[n]
+						local ok, asset = pcall(function()
+							return getcustomasset(song.path)
+						end)
+						return if ok then asset else ""
+					end
+					return "rbxassetid://" .. tostring(id)
+				end)
+				-- AssetService:GetAudioMetadataAsync, but the Mac's songs answer for
+				-- themselves (the rest go to Roblox, keeping their places)
+				rawset(_G, "MastersAudioMetadata", function(list, fetch)
+					fetch = fetch or function(ids)
+						return game:GetService("AssetService"):GetAudioMetadataAsync(ids)
+					end
+					local out, numeric, slots = {}, {}, {}
+					for i, id in ipairs(list) do
+						local n = tonumber(id)
+						if n and n < 0 then
+							local song = macMasters.bridge().snapshot.songs[n]
+							out[i] = if song then {
+								AssetId = tostring(n), Id = n, Title = song.title, Artist = song.artist or "",
+								Duration = song.duration or 0, AudioType = Enum.AudioSubType.Music, Tags = {song.category},
+							} else {AssetId = "0"}
+						else
+							table.insert(numeric, id)
+							table.insert(slots, i)
+						end
+					end
+					if #numeric > 0 then
+						local ok, result = pcall(fetch, numeric)
+						for k, i in ipairs(slots) do
+							out[i] = if ok and type(result) == "table" and result[k] then result[k] else {AssetId = "0"}
+						end
+					end
+					return out
+				end)
+
+				-- The modules are compiled from their HiddenSource, like Masters' loader
+				local registry = {}
+				local realRequire = require
+				local function loadModule(module)
+					local hidden = module:FindFirstChild("HiddenSource")
+					if not hidden then
+						return nil
+					end
+					local body = hidden.Value:gsub(":InvokeServer%(", ":Invoke("):gsub(":FireServer%(", ":Fire(")
+					local compiled, compileError = loadstring("local script = ...; local require = _G.MastersRequire;\n" .. body, "=" .. module.Name)
+					if not compiled then
+						warn("[MASTERS] " .. module.Name .. " doesn't compile: " .. tostring(compileError))
+						return nil
+					end
+					local okRun, result = xpcall(compiled, debug.traceback, module)
+					result = if okRun then result else {}
+					if not okRun then
+						warn("[MASTERS] " .. module.Name .. " failed: " .. tostring(result))
+					end
+					registry[module] = result
+					registry[module.Name] = result
+					return result
+				end
+				rawset(_G, "MastersRequire", function(target)
+					if registry[target] then
+						return registry[target]
+					end
+					if typeof(target) == "Instance" and target:IsA("ModuleScript") then
+						return loadModule(target)
+					end
+					return realRequire(target)
+				end)
+
+				-- The Handler, changed the same way, with the bridge block on the end
+				local logic = readfile("MastersLogic.lua")
+				logic = replace(logic, "ui%.Interface%f[^%w_]", "_G.MastersIface()", true)
+				logic = replace(logic, 'game:GetService("AssetService"):GetAudioMetadataAsync(', "_G.MastersAudioMetadata(")
+				logic = replace(logic, "AssetService:GetAudioMetadataAsync(", "_G.MastersAudioMetadata(")
+				logic = replace(logic, '"rbxassetid://" .. tostring(_G.CurrentSongId)', "_G.MastersSoundUri(_G.CurrentSongId)")
+				logic = replace(logic, "\nAudios.LoadAudios(AudiosLoaded)", '\nif not rawget(_G, "MastersPublicOff") then Audios.LoadAudios(AudiosLoaded) end')
+				logic ..= "\n" .. macMasters.BLOCK
+				local run, compileError = loadstring(logic, "=MastersLogic")
+				if not run then
+					error("MastersLogic.lua doesn't compile: " .. tostring(compileError), 0)
+				end
+				setfenv(run, setmetatable({require = rawget(_G, "MastersRequire"), script = ui}, {__index = getfenv()}))
+				task.spawn(function()
+					local okRun, runError = xpcall(run, debug.traceback)
+					if not okRun then
+						bridge.failed = "Masters stopped with an error: " .. tostring(runError):match("^[^\n]*")
+						warn("[MASTERS] " .. tostring(runError))
+					end
+				end)
+			end)
+			if not ok then
+				bridge.failed = tostring(err)
+				warn("[MASTERS] couldn't start: " .. tostring(err))
+			end
+		end
+		local started = os.clock()
+		repeat
+			task.wait(0.25)
+		until bridge.ready or bridge.failed or os.clock() - started > 90
+		if bridge.ready then
+			return true
+		end
+		return nil, bridge.failed or "Masters took too long to start."
+	end
+
+	-- Puts Masters in `container` (a frame in the Music window); `onClose` runs
+	-- when Masters' own Close is pressed
+	function macMasters.attach(container, onClose)
+		local bridge = macMasters.bridge()
+		if bridge.ready and bridge.attach then
+			bridge.onClose = onClose
+			bridge.attach(container)
+		end
+	end
+
+	-- Takes Masters out of the window again (hidden, paused)
+	function macMasters.detach()
+		local bridge = rawget(_G, "MacOSMastersBridge")
+		if bridge and bridge.ready and bridge.detach and bridge.attached then
+			bridge.detach()
+		end
+	end
+
+	-- Appended to MastersLogic.lua: runs inside the Handler, after it has set
+	-- everything up, with its locals (ui, Main, Queue, Audios, Utilities, Signal,
+	-- SettingsPage, SettingsPageProperties, MastersBackend, AudiosLoaded, ...)
+	macMasters.BLOCK = [==[
+-- [[ macOS in Roblox: Masters inside the Music app (added by macOS when it starts Masters) ]]
+do
+	local Bridge = rawget(_G, "MacOSMastersBridge")
+	if Bridge then
+		local ok, err = pcall(function()
+			local Interface = _G.MastersIface()
+			local function library()
+				return Bridge.snapshot or {songs = {}, categories = {}}
+			end
+			local function isMac(id)
+				id = tonumber(id)
+				return id ~= nil and id < 0
+			end
+			-- Public music: Settings > Extras (on unless it's been switched off)
+			local function publicOn()
+				local data = SettingsPageProperties and SettingsPageProperties.Data
+				local extras = data and data.Extras
+				if type(extras) == "table" and extras.PublicMusic ~= nil then
+					return extras.PublicMusic ~= false
+				end
+				return not rawget(_G, "MastersPublicOff")
+			end
+			Bridge.publicOn = publicOn
+
+			-- Covers: the song's picture, else its category's, else Masters' own
+			local originalCover = Utilities.GetCoverForSong
+			Utilities.GetCoverForSong = function(id, ...)
+				if isMac(id) then
+					local song = library().songs[tonumber(id)]
+					return song and song.cover or "rbxassetid://74118540785733"
+				end
+				return originalCover(id, ...)
+			end
+
+			-- Titles, artists and lengths of the Mac's songs
+			local originalMetadata = Audios.GetAudioMetadataAsync
+			Audios.GetAudioMetadataAsync = function(ids, ...)
+				if type(ids) ~= "table" then
+					return originalMetadata(ids, ...)
+				end
+				return _G.MastersAudioMetadata(ids, originalMetadata)
+			end
+
+			-- Search: the Mac's songs first, then Roblox's (while public music is on)
+			local originalSearch = Audios.SearchAudiosByKeyword
+			Audios.SearchAudiosByKeyword = function(keyword, ...)
+				local hits = {}
+				local wanted = tostring(keyword or ""):lower()
+				if wanted ~= "" then
+					for id, song in pairs(library().songs) do
+						local text = (song.title .. " " .. (song.artist or "") .. " " .. (song.category or "")):lower()
+						if text:find(wanted, 1, true) then
+							table.insert(hits, {
+								Id = id, Title = song.title, Artist = song.artist or "", Duration = song.duration or 0,
+								Tags = {song.category}, AudioType = "Music",
+							})
+						end
+					end
+					table.sort(hits, function(a, b)
+						return a.Title:lower() < b.Title:lower()
+					end)
+				end
+				local signal = Signal.new()
+				if publicOn() then
+					local data = originalSearch(keyword, ...)
+					if #hits == 0 then
+						return data
+					end
+					task.defer(function()
+						signal:Fire(false, hits)
+						data.ChunkLoaded:Connect(function(finished, chunk)
+							signal:Fire(finished, chunk)
+						end)
+					end)
+					return {ChunkLoaded = signal, Advance = data.Advance, Results = data.Results, Finished = data.Finished}
+				end
+				task.defer(function()
+					if #hits > 0 then
+						signal:Fire(false, hits)
+					end
+					signal:Fire(true, {})
+				end)
+				return {ChunkLoaded = signal, Advance = function() end, Results = hits, Finished = true}
+			end
+
+			-- Roblox's catalogue (For You, Explore, genres) only while public music
+			-- is on; off, it counts as loaded so nothing waits for it
+			local originalLoad, originalIsLoaded = Audios.LoadAudios, Audios.IsLoaded
+			local publicLoaded = not rawget(_G, "MastersPublicOff")
+			Audios.LoadAudios = function(...)
+				if not publicOn() then
+					task.defer(function()
+						Audios.ChunkLoadingFinished:Fire()
+					end)
+					return
+				end
+				publicLoaded = true
+				return originalLoad(...)
+			end
+			Audios.IsLoaded = function()
+				if not publicOn() then
+					return true
+				end
+				return originalIsLoaded()
+			end
+			if not publicLoaded then
+				task.defer(function()
+					Audios.ChunkLoadingFinished:Fire()
+				end)
+			end
+			-- With public music off, Roblox's songs (positive ids) also leave the
+			-- rows already built (Keep Playing, For You, Explore...), and rows left
+			-- empty go too; back on, they come back as they were
+			-- (Roblox's stations go too: in the stations shelf, anything that isn't
+			-- one of the Mac's categories)
+			local hiddenByMac = setmetatable({}, {__mode = "k"})
+			local function tidyDiscovery()
+				local discovery = Full.Container:FindFirstChild("Discovery")
+				if not discovery then
+					return
+				end
+				local off = not publicOn()
+				local macNames = {}
+				for _, category in ipairs(library().categories) do
+					macNames[category.title] = true
+				end
+				for _, section in ipairs(discovery:GetChildren()) do
+					local content = section:IsA("GuiObject") and section:FindFirstChild("Content")
+					local stations = section.Name == "LocalStations"
+					if content and not section.Name:match("^macOS") then
+						local shown = 0
+						for _, item in ipairs(content:GetChildren()) do
+							if item:IsA("GuiObject") then
+								local id = tonumber(item.Name)
+								local public = if stations then not macNames[item.Name] else (id ~= nil and id > 0)
+								if off and public and item.Visible then
+									item.Visible = false
+									hiddenByMac[item] = true
+								elseif not off and hiddenByMac[item] then
+									item.Visible = true
+									hiddenByMac[item] = nil
+								end
+								if item.Visible then
+									shown += 1
+								end
+							end
+						end
+						if off and shown == 0 and section.Visible then
+							section.Visible = false
+							hiddenByMac[section] = true
+						elseif not off and hiddenByMac[section] then
+							section.Visible = true
+							hiddenByMac[section] = nil
+						end
+					end
+				end
+			end
+			task.spawn(function()
+				while true do
+					task.wait(1.5)
+					pcall(tidyDiscovery)
+				end
+			end)
+			-- Switching only hides or shows what's there: rebuilding Discovery would
+			-- empty For You and Explore, which only fill while the catalogue is
+			-- loading. Except if Masters started with public music off: then the
+			-- catalogue was never loaded, so Discovery is rebuilt first and the
+			-- catalogue loaded into it.
+			local function applyPublic(on)
+				rawset(_G, "MastersPublicOff", if on then nil else true)
+				if on and not publicLoaded then
+					publicLoaded = true
+					if _G.MastersRefreshDiscovery then
+						task.spawn(_G.MastersRefreshDiscovery, true)
+					end
+					task.delay(1, function()
+						originalLoad(AudiosLoaded)
+					end)
+				end
+				task.defer(function()
+					pcall(tidyDiscovery)
+				end)
+			end
+
+			-- The Mac's categories as stations and Discovery rows, and their lyrics
+			local STATION_BASE = 970000
+			local function macStations()
+				local list = {}
+				for i, category in ipairs(library().categories) do
+					table.insert(list, {
+						StationId = STATION_BASE + i, Name = category.title,
+						Description = category.description or (#category.songs .. (if #category.songs == 1 then " song" else " songs") .. " on your Mac"),
+						Cover = category.cover or "", Updated = os.time(), Songs = category.songs,
+					})
+				end
+				return list
+			end
+			local originalHandle = MastersBackend.Handle
+			MastersBackend.Handle = function(name, ...)
+				-- (Roblox's stations stay in the list; with public music off the
+				-- Discovery tidy-up hides them)
+				if name == "GetLocalStations" or name == "GetLocalStationsServer" then
+					local handled, base = originalHandle(name, ...)
+					local list = macStations()
+					if handled and type(base) == "table" then
+						for _, station in ipairs(base) do
+							table.insert(list, station)
+						end
+					end
+					return true, list
+				elseif name == "GetLocalStationByStationId" or name == "GetLocalStationByStationIdServer" then
+					local wanted = ...
+					for _, station in ipairs(macStations()) do
+						if station.StationId == wanted then
+							return true, station
+						end
+					end
+				elseif name == "GetConfiguration" or name == "GetConfigurationServer" then
+					local handled, config = originalHandle(name, ...)
+					config = if handled and type(config) == "table" then config else {}
+					config.CustomSections = config.CustomSections or {}
+					for i, category in ipairs(library().categories) do
+						config.CustomSections["macOS" .. i] = {Name = category.title, Songs = category.songs}
+					end
+					return true, config
+				elseif name == "GetLyricsIndex" then
+					local handled, index = originalHandle(name, ...)
+					index = if handled and type(index) == "table" then index else {}
+					for id, song in pairs(library().songs) do
+						if song.lyrics then
+							index[tostring(id)] = "macos:" .. id
+						end
+					end
+					return true, index
+				elseif name == "GetLyrics" then
+					local key = ...
+					local id = type(key) == "string" and tonumber(key:match("^macos:(%-?%d+)$"))
+					if id then
+						return true, (Bridge.lyrics and Bridge.lyrics(id))
+					end
+				end
+				return originalHandle(name, ...)
+			end
+
+			-- Settings > Extras > Public music (a copy of the Glow switch)
+			local extras = SettingsPage.Scroll.Extras.Container
+			local template = extras:FindFirstChild("Glow")
+			local publicSwitch = nil
+			if template then
+				local row = template:Clone()
+				row.Name = "PublicMusic"
+				for _, label in ipairs(row:GetDescendants()) do
+					if label:IsA("TextLabel") and label.Name == "Label" then
+						label.Text = "Public music"
+					end
+				end
+				row.LayoutOrder = 50
+				row.Parent = extras
+				publicSwitch = row:FindFirstChild("Switch", true)
+				row.MouseButton1Click:Connect(function()
+					if SettingsPageProperties.LoadingSettings or not SettingsPageProperties.Data then
+						return
+					end
+					local data = SettingsPageProperties.Data
+					data.Extras = data.Extras or {}
+					local on = not publicOn()
+					data.Extras.PublicMusic = on
+					if publicSwitch then
+						Utilities.SwitchToggle(publicSwitch, on)
+					end
+					SettingsPageProperties.Changed:Fire(data)
+					applyPublic(on)
+				end)
+			end
+			local originalLoadSettings = LoadSettings
+			LoadSettings = function(...)
+				local result = table.pack(originalLoadSettings(...))
+				if publicSwitch then
+					pcall(Utilities.SwitchToggle, publicSwitch, publicOn())
+				end
+				return table.unpack(result, 1, result.n)
+			end
+
+			-- In the Music window: always Full (fullscreen, in the window); its
+			-- Close closes the window instead of shrinking to the bar
+			local originalSetState = Main.SetState
+			Main.SetState = function(state, ...)
+				if Bridge.attached and state == "Bar" then
+					if Bridge.onClose then
+						task.spawn(Bridge.onClose)
+					end
+					return
+				end
+				return originalSetState(state, ...)
+			end
+			local layer = ui:FindFirstChild("Layer")
+			local function hideLayer()
+				if Bridge.attached and layer then
+					layer.Visible = false
+				end
+			end
+			if layer then
+				layer:GetPropertyChangedSignal("Visible"):Connect(hideLayer)
+			end
+			Bridge.attach = function(container)
+				Bridge.attached = true
+				ui.Enabled = true
+				Interface.Parent = container
+				hideLayer()
+				originalSetState("Full")
+			end
+			Bridge.detach = function()
+				Bridge.attached = false
+				pcall(function()
+					Queue.Pause()
+				end)
+				Interface.Parent = ui
+				ui.Enabled = false
+			end
+			Bridge.ready = true
+			print("[MASTERS] macOS bridge ready")
+		end)
+		if not ok then
+			Bridge.failed = "Masters' macOS bridge failed: " .. tostring(err)
+			warn("[MASTERS] " .. Bridge.failed)
+		end
+	end
+end
+]==]
+end
+
 -- Redownload (System Settings > General): downloads the music, the music
 -- library, sounds, clock font and wallpaper again, and deletes and remakes every Liquid Glass
 -- image. A downloaded file is only replaced once its new copy has arrived,
@@ -7417,6 +8081,112 @@ local function createMacDesktop(session)
 			return lyrics
 		end
 
+		-- ---- What Masters sees of the library (Music's Masters style) ----
+		-- Every song gets a negative id (Roblox's are positive), the same one for
+		-- the whole server; each category with songs is a station and a row.
+		local bridge = macMasters.bridge()
+		-- A picture as a content id right now (a link counts once it's downloaded)
+		local function assetFor(value, folder)
+			if type(value) == "number" then
+				return "rbxassetid://" .. math.floor(value)
+			end
+			if type(value) ~= "string" then
+				return nil
+			end
+			value = value:match("^%s*(.-)%s*$")
+			if value == "" then
+				return nil
+			elseif value:match("^%d+$") then
+				return "rbxassetid://" .. value
+			elseif value:match("^rbx%w*://") then
+				return value
+			elseif value:match("^https?://") then
+				return images[value] or nil
+			end
+			local relative = value:gsub("\\", "/"):gsub("^%./", "")
+			return localImage(folder .. "/" .. relative) or localImage(relative)
+		end
+		local function updateBridge(root)
+			local songs, categories = {}, {}
+			local function add(node)
+				local ids = {}
+				local cover = if node.image ~= nil then assetFor(node.image, node.path) else nil
+				for _, song in ipairs(node.songs) do
+					local id = bridge.ids[song.path]
+					if not id then
+						bridge.nextId -= 1
+						id = bridge.nextId
+						bridge.ids[song.path] = id
+					end
+					table.insert(ids, id)
+					songs[id] = {
+						path = song.path, title = song.title, artist = song.artist,
+						category = if node.parent then node.title else "Music", lyrics = song.lyrics,
+						duration = bridge.durations[song.path],
+						cover = (if song.image ~= nil then assetFor(song.image, node.path) else nil) or cover,
+					}
+				end
+				if #ids > 0 then
+					table.insert(categories, {title = node.title, songs = ids, cover = cover, description = node.description})
+				end
+			end
+			add(root)
+			eachCategory(root, add)
+			bridge.snapshot = {songs = songs, categories = categories}
+			-- Lengths, found by loading each song once (quietly, one at a time)
+			if not bridge.measuring then
+				bridge.measuring = true
+				task.spawn(function()
+					for _, song in pairs(songs) do
+						if not bridge.durations[song.path] then
+							local ok, asset = pcall(getcustomasset, song.path)
+							if ok then
+								local probe = Instance.new("Sound")
+								probe.Volume = 0
+								probe.SoundId = asset
+								probe.Parent = game:GetService("SoundService")
+								local started = os.clock()
+								repeat
+									task.wait(0.1)
+								until probe.TimeLength > 0 or os.clock() - started > 4
+								if probe.TimeLength > 0 then
+									bridge.durations[song.path] = probe.TimeLength
+									song.duration = probe.TimeLength
+								end
+								probe:Destroy()
+							end
+						end
+					end
+					bridge.measuring = false
+				end)
+			end
+		end
+		-- A song's lyrics as the Roblox lyrics document Masters reads
+		bridge.lyrics = function(id)
+			local song = bridge.snapshot.songs[id]
+			local lyrics = song and song.lyrics and readLyrics(song.lyrics)
+			if not lyrics then
+				return nil
+			end
+			local entries, last = {}, 0
+			for i, line in ipairs(lyrics.lines) do
+				local start = line.start or 0
+				local finish = if line.finish and line.finish ~= math.huge then line.finish else start + 5
+				last = math.max(last, finish)
+				table.insert(entries, {
+					Line = line.text, TimeStart = start, TimeEnd = finish, RightAligned = false, Adlibs = {},
+					Id = if line.gap then "GAP_" .. i else "L" .. i,
+				})
+			end
+			if lyrics.credit then
+				table.insert(entries, {
+					Line = (lyrics.credit:gsub("  ·  ", "\n")), TimeStart = last, TimeEnd = last + 30,
+					RightAligned = false, Adlibs = {}, Id = "CERTIFICATION",
+				})
+			end
+			return {SoundId = id, Unsynced = not lyrics.synced, Lyrics = entries}
+		end
+
 		appBuilders.music = function(args)
 			local sidebarWidth = 214
 			openWindow({
@@ -7431,6 +8201,7 @@ local function createMacDesktop(session)
 					end)
 
 					local library, fingerprint = readLibrary()
+					updateBridge(library)
 					local page = {kind = "home"}
 					local expanded = {[library.path:lower()] = true}
 					local queue, queueIndex, current = {}, 0, nil
@@ -7530,8 +8301,106 @@ local function createMacDesktop(session)
 					hover(lyricsButton, function()
 						return lyricsOpen
 					end)
+
+					-- The style (a pill left of Lyrics, with a menu): macOS (this
+					-- app), Masters (the Masters player, with the Mac's songs too) or
+					-- Masters lyrics (this app, with Masters' lyrics view)
+					local STYLES = {
+						{key = "macos", name = "macOS"},
+						{key = "masters", name = "Masters"},
+						{key = "masters_lyrics", name = "Masters lyrics"},
+					}
+					local function styleName(key)
+						for _, style in ipairs(STYLES) do
+							if style.key == key then
+								return style.name
+							end
+						end
+						return "macOS"
+					end
+					local styleButton = macButton(body, {
+						AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -54, 0, 26), Size = UDim2.fromOffset(118, 28),
+						BackgroundColor3 = C.line, BackgroundTransparency = 0.92, ZIndex = 3,
+					})
+					macCorner(styleButton, 8)
+					local styleLabel = macLabel(styleButton, "macOS", 12, Enum.FontWeight.SemiBold, C.ink, {
+						Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -30, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+					})
+					macImage(styleButton, I.forward, 11, C.inkSoft, {AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -9, 0.5, 0), Rotation = 90})
+					styleButton.MouseEnter:Connect(function()
+						styleButton.BackgroundTransparency = 0.86
+					end)
+					styleButton.MouseLeave:Connect(function()
+						styleButton.BackgroundTransparency = 0.92
+					end)
+					local styleCatcher = macButton(body, {Size = UDim2.fromScale(1, 1), Visible = false, ZIndex = 29})
+					local styleMenu = macNew("Frame", {
+						AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -54, 0, 44), Size = UDim2.fromOffset(196, 8 + #STYLES * 30),
+						BackgroundColor3 = C.menu, BorderSizePixel = 0, Visible = false, ZIndex = 30, Parent = body,
+					})
+					macCorner(styleMenu, 10)
+					macStroke(styleMenu, C.line, 0.86, 1)
+					local styleRows = {}
+					local applyStyle -- (below, once everything it switches exists)
+					for i, style in ipairs(STYLES) do
+						local row = macButton(styleMenu, {
+							Position = UDim2.fromOffset(4, 4 + (i - 1) * 30), Size = UDim2.new(1, -8, 0, 28),
+							BackgroundColor3 = C.accent, ZIndex = 31,
+						})
+						macCorner(row, 6)
+						local check = macImage(row, I.check, 13, C.ink, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 8, 0.5, 0), ZIndex = 32})
+						local label = macLabel(row, style.name, 13, Enum.FontWeight.Medium, C.ink, {
+							Position = UDim2.fromOffset(28, 0), Size = UDim2.new(1, -32, 1, 0), ZIndex = 32,
+						})
+						row.MouseEnter:Connect(function()
+							row.BackgroundTransparency = 0
+							label.TextColor3 = white
+							check.ImageColor3 = white
+						end)
+						row.MouseLeave:Connect(function()
+							row.BackgroundTransparency = 1
+							label.TextColor3 = C.ink
+							check.ImageColor3 = C.ink
+						end)
+						row.MouseButton1Click:Connect(function()
+							styleMenu.Visible = false
+							styleCatcher.Visible = false
+							applyStyle(style.key)
+						end)
+						styleRows[style.key] = {row = row, check = check}
+					end
+					local function closeStyleMenu()
+						styleMenu.Visible = false
+						styleCatcher.Visible = false
+					end
+					styleCatcher.MouseButton1Click:Connect(closeStyleMenu)
+					styleButton.MouseButton1Click:Connect(function()
+						local open = not styleMenu.Visible
+						for key, entry in pairs(styleRows) do
+							entry.check.Visible = key == (macSettings.musicMode or "macos")
+							entry.row.BackgroundTransparency = 1
+						end
+						styleMenu.Visible = open
+						styleCatcher.Visible = open
+					end)
+
+					-- Masters (the whole window below the title bar) and its title
+					local mastersTitle = macLabel(body, "Masters", 14, Enum.FontWeight.SemiBold, C.ink, {
+						Position = UDim2.fromOffset(92, 0), Size = UDim2.fromOffset(200, 52), Visible = false, ZIndex = 3,
+					})
+					local mastersHolder = macNew("Frame", {
+						Position = UDim2.fromOffset(6, 50), Size = UDim2.new(1, -12, 1, -56), BackgroundColor3 = Color3.fromRGB(14, 14, 17),
+						BorderSizePixel = 0, Visible = false, ZIndex = 4, Parent = body,
+					})
+					macCorner(mastersHolder, 14)
+					local mastersStatus = macLabel(mastersHolder, "", 15, Enum.FontWeight.Medium, white, {
+						AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(1, -80, 0, 0),
+						AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Center,
+						RichText = true, Visible = false,
+					})
+
 					local lcd = macNew("Frame", {
-						Position = UDim2.fromOffset(lcdX, 5), Size = UDim2.new(1, -(lcdX + 58), 0, 42), BackgroundColor3 = C.line,
+						Position = UDim2.fromOffset(lcdX, 5), Size = UDim2.new(1, -(lcdX + 58 + 124), 0, 42), BackgroundColor3 = C.line,
 						BackgroundTransparency = 0.955, BorderSizePixel = 0, ZIndex = 3, Parent = body,
 					})
 					macCorner(lcd, 9)
@@ -7820,6 +8689,7 @@ local function createMacDesktop(session)
 							return false
 						end
 						library, fingerprint = newLibrary, newPrint
+						updateBridge(library)
 						table.clear(images) -- a picture may have been swapped for another of the same name
 						local byPath = {}
 						for _, song in ipairs(songsUnder(library)) do
@@ -7922,7 +8792,238 @@ local function createMacDesktop(session)
 					})
 					-- (lines ahead, lines already sung, and the line being sung)
 					local LINE_AHEAD, LINE_SUNG, LINE_NOW = 0.5, 0.62, 0
-					local shownLyrics = {lyrics = nil, rows = {}, active = 0, song = nil}
+					local shownLyrics = {lyrics = nil, rows = {}, active = 0, song = nil, style = nil}
+
+					-- ---- Masters lyrics: the same lyrics, Masters' look ----
+					-- (Music's "Masters lyrics" style) Lines in Inter that light up as
+					-- they're sung with Masters' easing (1 - e^(-rate * dt) each frame),
+					-- fading out above and below; breaks shown as three dots that fill
+					-- up; and a background made from the cover that breathes with the
+					-- music: its brightness, glow and grain follow the song's loudness.
+					local INTER = "rbxassetid://12187365364"
+					local function mastersStyle()
+						return macSettings.musicMode == "masters_lyrics"
+					end
+					local function ease(rate, dt)
+						return 1 - math.exp(-rate * dt)
+					end
+					local function map(value, fromLow, fromHigh, toLow, toHigh)
+						if fromHigh == fromLow then
+							return toLow
+						end
+						return toLow + (value - fromLow) * (toHigh - toLow) / (fromHigh - fromLow)
+					end
+					local mBack = macNew("CanvasGroup", {
+						Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(30, 30, 30), BorderSizePixel = 0,
+						Visible = false, ZIndex = 0, Parent = lyricsPanel,
+					})
+					macCorner(mBack, 14)
+					macNew("UIGradient", {Rotation = 90, Color = ColorSequence.new(white, Color3.fromRGB(152, 152, 152)), Parent = mBack})
+					-- The cover, blown up so a pixel or two fills the panel: a soft colour
+					-- field that drifts slowly from corner to corner
+					local mGlow = macNew("CanvasGroup", {
+						Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, GroupColor3 = Color3.fromRGB(30, 30, 30), Parent = mBack,
+					})
+					local mField = macNew("ImageLabel", {
+						Size = UDim2.fromOffset(1000, 1000), BackgroundTransparency = 1, ScaleType = Enum.ScaleType.Crop, Parent = mGlow,
+					})
+					macNew("UIScale", {Scale = 500, Parent = mField})
+					local mNoise = macNew("ImageLabel", {
+						AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(2.5, 2.5),
+						BackgroundTransparency = 1, Image = "rbxassetid://106566762094574", ImageTransparency = 1, ZIndex = 2, Parent = mBack,
+					})
+					local mNoiseScale = macNew("UIScale", {Parent = mNoise})
+					local mMask = macNew("CanvasGroup", {BackgroundTransparency = 1, Visible = false, ZIndex = 2, Parent = lyricsPanel})
+					macNew("UIGradient", {
+						Rotation = 90, Parent = mMask,
+						Transparency = NumberSequence.new({
+							NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.1, 0),
+							NumberSequenceKeypoint.new(0.399, 0), NumberSequenceKeypoint.new(1, 1),
+						}),
+					})
+					local mList = macNew("ScrollingFrame", {
+						BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), CanvasSize = UDim2.new(),
+						AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 0, ScrollBarImageTransparency = 1,
+						ScrollingDirection = Enum.ScrollingDirection.Y, Parent = mMask,
+					})
+					macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 10), Parent = mList})
+					macNew("UIPadding", {
+						PaddingTop = UDim.new(0, 60), PaddingBottom = UDim.new(0, 260), PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10), Parent = mList,
+					})
+					local mRows = {}
+					-- (the corners the colour field drifts between, and when the list
+					-- may scroll itself again after you've scrolled it)
+					local SPOTS = {Vector2.new(0, 0), Vector2.new(1, 0), Vector2.new(0.5, 0.5), Vector2.new(1, 1), Vector2.new(0, 1), Vector2.new(0.5, 0.5)}
+					local mState = {spot = 1, quietUntil = 0}
+					mList.InputChanged:Connect(function(input)
+						if input.UserInputType == Enum.UserInputType.MouseWheel then
+							mState.quietUntil = os.clock() + 4
+						end
+					end)
+
+					local function mClear()
+						for _, child in ipairs(mList:GetChildren()) do
+							if child:IsA("GuiObject") then
+								child:Destroy()
+							end
+						end
+						table.clear(mRows)
+					end
+
+					local function mBuild(lyrics)
+						mClear()
+						local bold, semibold = Font.new(INTER, Enum.FontWeight.Bold), Font.new(INTER, Enum.FontWeight.SemiBold)
+						if not lyrics.synced then
+							macLabel(mList, "These lyrics aren't synced to the song", 12, Enum.FontWeight.SemiBold, white, {
+								Size = UDim2.new(1, 0, 0, 18), TextTransparency = 0.5, LayoutOrder = 0, FontFace = semibold,
+							})
+						end
+						for i, line in ipairs(lyrics.lines) do
+							if line.gap then
+								-- A break (only long ones: short pauses just pass)
+								local length = (line.finish or 0) - (line.start or 0)
+								if lyrics.synced and line.start and length > 5 and length < math.huge then
+									local gap = macNew("Frame", {
+										Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1, ClipsDescendants = true, LayoutOrder = i, Parent = mList,
+									})
+									local canvas = macNew("Frame", {
+										AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0.5, 0), Size = UDim2.fromOffset(40, 40),
+										BackgroundTransparency = 1, Parent = gap,
+									})
+									local canvasScale = macNew("UIScale", {Scale = 0.6, Parent = canvas})
+									local glow = macNew("ImageLabel", {
+										AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(70, 40),
+										BackgroundTransparency = 1, Image = "rbxassetid://122971705612181", ImageTransparency = 1, Parent = canvas,
+									})
+									local back = macNew("ImageLabel", {
+										Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Image = "rbxassetid://76210991965982",
+										ImageTransparency = 1, Parent = canvas,
+									})
+									local fill = macNew("Frame", {Size = UDim2.fromScale(0, 1), BackgroundTransparency = 1, ClipsDescendants = true, Parent = canvas})
+									macNew("ImageLabel", {
+										Size = UDim2.fromOffset(40, 40), BackgroundTransparency = 1, Image = "rbxassetid://76210991965982", Parent = fill,
+									})
+									table.insert(mRows, {gap = true, item = gap, scale = canvasScale, glow = glow, back = back, fill = fill, start = line.start, finish = line.finish})
+								end
+							elseif lyrics.synced and line.start then
+								local row = macButton(mList, {
+									Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = i,
+									BackgroundColor3 = white, BackgroundTransparency = 1, Text = line.text, TextWrapped = true,
+									TextXAlignment = Enum.TextXAlignment.Left, FontFace = bold, TextSize = 26, TextColor3 = white,
+									TextTransparency = 0.9,
+								})
+								macCorner(row, 10)
+								macNew("UIPadding", {
+									PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10), PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12), Parent = row,
+								})
+								row.MouseEnter:Connect(function()
+									row.BackgroundTransparency = 0.95
+								end)
+								row.MouseLeave:Connect(function()
+									row.BackgroundTransparency = 1
+								end)
+								row.MouseButton1Click:Connect(function()
+									if current then
+										sound.TimePosition = line.start
+										if not sound.IsPlaying then
+											sound:Resume()
+										end
+										mState.quietUntil = 0
+									end
+								end)
+								table.insert(mRows, {item = row, start = line.start, finish = line.finish})
+							else
+								macLabel(mList, line.text, 20, Enum.FontWeight.Bold, white, {
+									Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
+									LayoutOrder = i, FontFace = bold, TextTransparency = 0.1,
+								})
+							end
+						end
+						if lyrics.credit then
+							macLabel(mList, lyrics.credit, 14, Enum.FontWeight.SemiBold, white, {
+								Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
+								FontFace = semibold, TextTransparency = 0.5, LayoutOrder = #lyrics.lines + 1,
+							})
+						end
+						mList.CanvasPosition = Vector2.zero
+					end
+
+					-- The colour field: the song's (or its category's) picture, else its colour
+					local function mPaintBackground()
+						local node = if current and current.category and current.category.parent then current.category else nil
+						mField.Image = ""
+						mField.BackgroundTransparency = 0
+						mField.BackgroundColor3 = if node then node.color else PINK
+						if current and current.image ~= nil and current.category then
+							showImage(mField, current.image, current.category.path)
+						elseif node and node.image ~= nil then
+							showImage(mField, node.image, node.path)
+						end
+					end
+
+					-- Every frame while it's showing (Masters' numbers: brightness 0.3-1
+					-- and grain 1-0.7 from loudness 0-1000 and 0-500, grain size 1-5)
+					local function mFrame(dt)
+						local playing = sound.IsPlaying
+						local loud = if playing then sound.PlaybackLoudness else 0
+						if playing then
+							mGlow.GroupColor3 = mGlow.GroupColor3:Lerp(Color3.fromHSV(0, 0, math.clamp(map(loud, 0, 1000, 0.3, 1), 0, 1)), ease(1.6, dt))
+							mNoise.ImageTransparency += (math.clamp(map(loud, 0, 500, 1, 0.7), 0, 1) - mNoise.ImageTransparency) * ease(8, dt)
+							mNoiseScale.Scale += (map(loud, 0, 1000, 1, 5) - mNoiseScale.Scale) * ease(8, dt)
+						else
+							mGlow.GroupColor3 = mGlow.GroupColor3:Lerp(Color3.fromRGB(30, 30, 30), ease(1.6, dt))
+							mNoise.ImageTransparency += (1 - mNoise.ImageTransparency) * ease(1.6, dt)
+							mNoiseScale.Scale += (1 - mNoiseScale.Scale) * ease(8, dt)
+						end
+						mNoise.Rotation = (mNoise.Rotation + dt * 7.2) % 360
+						local target = SPOTS[mState.spot]
+						local drift = ease(0.02 + loud * 0.0000004, dt)
+						local position = Vector2.new(mField.Position.X.Scale, mField.Position.Y.Scale):Lerp(target, drift)
+						mField.Position = UDim2.fromScale(position.X, position.Y)
+						mField.AnchorPoint = mField.AnchorPoint:Lerp(target, drift)
+						if (position - target).Magnitude < 0.05 then
+							mState.spot = mState.spot % #SPOTS + 1
+						end
+						if shownLyrics.coverScale then
+							shownLyrics.coverScale.Scale += ((if playing then 1 else 0.8) - shownLyrics.coverScale.Scale) * ease(10, dt)
+						end
+
+						local lyrics = shownLyrics.lyrics
+						if not lyrics or not lyrics.synced then
+							return
+						end
+						local time = sound.TimePosition
+						local active = nil
+						for _, row in ipairs(mRows) do
+							local on = active == nil and time >= row.start and time <= row.finish
+							if on then
+								active = row
+							end
+							if row.gap then
+								local progress = math.clamp(map(time, row.start, row.finish, 0, 1), 0, 1)
+								local height = row.item.Size.Y.Offset
+								row.item.Size = UDim2.new(1, 0, 0, height + ((if on then 72 else 0) - height) * ease(8, dt))
+								row.scale.Scale += ((if on then map(progress, 0, 1, 0.6, 1.2) else 0.6) - row.scale.Scale) * ease(16, dt)
+								local width = row.fill.Size.X.Scale
+								row.fill.Size = UDim2.fromScale(width + ((if on then progress else 0) - width) * ease(16, dt), 1)
+								row.back.ImageTransparency += ((if on then 0.9 else 1) - row.back.ImageTransparency) * ease(16, dt)
+								row.glow.ImageTransparency += ((if on then map(progress, 0, 1, 1, 0.9) else 1) - row.glow.ImageTransparency) * ease(16, dt)
+							else
+								row.item.TextTransparency += ((if on then 0 else 0.9) - row.item.TextTransparency) * ease(10, dt)
+							end
+						end
+						-- The sung line slides up into the clear band near the top
+						if active and os.clock() > mState.quietUntil then
+							local scale = getScale()
+							local goal = (active.item.AbsolutePosition.Y - mList.AbsolutePosition.Y) / scale + mList.CanvasPosition.Y
+								- mList.AbsoluteSize.Y / scale * 0.14
+							goal = math.clamp(goal, 0, math.max(0, (mList.AbsoluteCanvasSize.Y - mList.AbsoluteWindowSize.Y) / scale))
+							local y = mList.CanvasPosition.Y
+							if math.abs(goal - y) > 0.5 then
+								mList.CanvasPosition = Vector2.new(0, y + (goal - y) * ease(4, dt))
+							end
+						end
+					end
 
 					-- Narrow windows: just the lines
 					local function layoutLyrics()
@@ -7930,6 +9031,8 @@ local function createMacDesktop(session)
 						lyricsInfo.Visible = wide
 						lyricsList.Position = UDim2.fromOffset(if wide then 268 else 10, 0)
 						lyricsList.Size = UDim2.new(1, if wide then -290 else -20, 1, 0)
+						mMask.Position = lyricsList.Position
+						mMask.Size = lyricsList.Size
 						lyricsMessage.Position = UDim2.new(0.5, if wide then 130 else 0, 0.5, 0)
 						lyricsMessage.Size = UDim2.new(1, if wide then -330 else -60, 0, 0)
 					end
@@ -7940,7 +9043,13 @@ local function createMacDesktop(session)
 						local color = if node then node.color else PINK
 						lyricsGradient.Color = ColorSequence.new(color:Lerp(black, 0.3), color:Lerp(black, 0.74))
 						lyricsInfo:ClearAllChildren()
-						makeCover(lyricsInfo, node, 200, 12, {Position = UDim2.fromOffset(0, 0)}, current)
+						local cover = makeCover(lyricsInfo, node, 200, 12, {Position = UDim2.fromOffset(0, 0)}, current)
+						-- (Masters lyrics: the cover breathes, and the background is made from it)
+						shownLyrics.coverScale = nil
+						if mastersStyle() then
+							shownLyrics.coverScale = macNew("UIScale", {Scale = if sound.IsPlaying then 1 else 0.8, Parent = cover})
+							mPaintBackground()
+						end
 						macLabel(lyricsInfo, if current then current.title else "Not Playing", 18, Enum.FontWeight.Bold, white, {
 							Position = UDim2.fromOffset(0, 214), Size = UDim2.new(1, 0, 0, 24), TextTruncate = Enum.TextTruncate.AtEnd,
 						})
@@ -7958,6 +9067,7 @@ local function createMacDesktop(session)
 						table.clear(shownLyrics.rows)
 						shownLyrics.lyrics = nil
 						shownLyrics.active = 0
+						mClear()
 					end
 
 					local function buildLyrics(lyrics)
@@ -8000,6 +9110,15 @@ local function createMacDesktop(session)
 						if not lyricsOpen then
 							return
 						end
+						-- (switching between the macOS and Masters looks rebuilds everything)
+						local masters = mastersStyle()
+						if shownLyrics.style ~= masters then
+							shownLyrics.style = masters
+							shownLyrics.song = false
+							clearLyrics()
+							lyricsGradient.Enabled = not masters
+							mBack.Visible = masters
+						end
 						if shownLyrics.song ~= current then
 							shownLyrics.song = current
 							paintLyricsInfo()
@@ -8020,13 +9139,20 @@ local function createMacDesktop(session)
 							end
 						end
 						lyricsMessage.Visible = message ~= nil
-						lyricsList.Visible = message == nil
+						lyricsList.Visible = message == nil and not masters
+						mMask.Visible = message == nil and masters
 						if message then
 							lyricsMessage.Text = message
 							clearLyrics()
 						elseif shownLyrics.lyrics ~= lyrics then
 							-- (readLyrics hands back the same table while the file is unchanged)
-							buildLyrics(lyrics)
+							if masters then
+								clearLyrics()
+								shownLyrics.lyrics = lyrics
+								mBuild(lyrics)
+							else
+								buildLyrics(lyrics)
+							end
 						end
 					end
 
@@ -8048,7 +9174,11 @@ local function createMacDesktop(session)
 					end)
 
 					-- The line being sung: lit, and scrolled to a third of the way down
-					local follow = RunService.Heartbeat:Connect(function()
+					local follow = RunService.Heartbeat:Connect(function(dt)
+						if lyricsOpen and shownLyrics.style then
+							mFrame(dt)
+							return
+						end
 						local lyrics = shownLyrics.lyrics
 						if not lyricsOpen or not lyrics or not lyrics.synced then
 							return
@@ -8564,7 +9694,75 @@ local function createMacDesktop(session)
 						}
 					end
 
+					-- ---- Styles: macOS, Masters, Masters lyrics ----
+					local function setMacChrome(visible)
+						sidebar.Visible = visible
+						content.Visible = visible
+						prevButton.Visible = visible
+						playButton.Visible = visible
+						nextButton.Visible = visible
+						lcd.Visible = visible
+						lyricsButton.Visible = visible
+					end
+					-- Masters in the window (it starts once, the first time; downloads
+					-- itself if it isn't on this PC)
+					local mastersAttempt = 0
+					local function showMasters()
+						mastersAttempt += 1
+						local attempt = mastersAttempt
+						mastersStatus.Visible = true
+						mastersStatus.Text = "Starting Masters…"
+						task.spawn(function()
+							local ok, problem = macMasters.start(function(title, detail)
+								if attempt == mastersAttempt and not win.closed then
+									mastersStatus.Text = title .. (if detail and detail ~= "" then "\n<font size=\"12\" transparency=\"0.45\">" .. detail .. "</font>" else "")
+								end
+							end)
+							if win.closed or attempt ~= mastersAttempt or macSettings.musicMode ~= "masters" then
+								return
+							end
+							if ok then
+								mastersStatus.Visible = false
+								macMasters.attach(mastersHolder, function()
+									if not win.closed then
+										win.close()
+									end
+								end)
+							else
+								mastersStatus.Text = "<b>Masters couldn't start</b>\n\n<font size=\"13\">" .. tostring(problem) .. "</font>"
+							end
+						end)
+					end
+					function applyStyle(key)
+						if macSettings.musicMode ~= key then
+							macSettings.musicMode = key
+							saveMacSettings()
+						end
+						local masters = key == "masters"
+						styleLabel.Text = styleName(key)
+						setMacChrome(not masters)
+						mastersTitle.Visible = masters
+						mastersHolder.Visible = masters
+						styleButton.Position = UDim2.new(1, if masters then -14 else -54, 0, 26)
+						styleMenu.Position = UDim2.new(1, if masters then -14 else -54, 0, 44)
+						if masters then
+							if sound.IsPlaying then
+								sound:Pause()
+							end
+							showMasters()
+						else
+							mastersAttempt += 1
+							macMasters.detach()
+							refreshLyrics()
+						end
+					end
+					table.insert(win.cleanup, function()
+						mastersAttempt += 1
+						macMasters.detach()
+					end)
+
 					showCategoryArg(args.category)
+					applyStyle(macSettings.musicMode or "macos")
 					if args.path then
 						win.openPath(args.path)
 					end

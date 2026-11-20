@@ -62,6 +62,20 @@ screen with Liquid Glass, then a desktop:
   click a line to jump there. Lyric Studio (see below) makes the lyrics and
   adds songs to your own Music. Ask can play a song or a whole category
   ("play some lofi")
+- Music's style switch (top right) picks how Music looks:
+  - **macOS**: the Music app above.
+  - **Masters**: the [Masters](https://github.com/DanielNov2014/Masters-client-sided)
+    player, inside the Music window. It starts the first time you pick it
+    (downloading itself into the workspace if it isn't there yet) and stays
+    loaded for the rest of the server, paused while Music is closed. Your
+    songs show up in it as Discovery rows and stations, one per category, and
+    play with their covers and lyrics. Settings › Extras › **Public music**
+    turns Roblox's catalogue (For You, Explore, search, stations) on or off.
+    If Masters was already started from its own loader in that server, Music
+    can't take it over; rejoin and open it from Music.
+  - **Masters lyrics**: the macOS Music app, with Masters' lyrics view: lines
+    that light up with Masters' easing, three-dot breaks that fill up, and a
+    background made from the cover whose glow and grain follow the music
 - Timer: a countdown with a ring that empties as it runs (it chimes and shows
   a banner when it's done) and a stopwatch with laps. Ask can start timers
 - YouTube: search, Home, Shorts and Live tabs, and real playback of videos
