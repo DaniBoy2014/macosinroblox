@@ -40,8 +40,25 @@ screen with Liquid Glass, then a desktop:
 - windows you can drag, stretch by their edges and corners, zoom, minimize to
   the Dock and close; their red, yellow and green buttons stretch like jelly
   when you pull on them
-- Finder (browses the executor's workspace folder), Notes, Terminal (shell
-  commands plus Luau), Music, YouTube, System Settings and Preview
+- Finder (browses the executor's workspace folder), Notes, Chat, Terminal
+  (shell commands plus Luau), Music, YouTube, Timer, System Settings and
+  Preview
+- Chat: the game's own chat in a window (Roblox's chat window stays hidden):
+  the server channel, Roblox's Global chat (everyone playing the game, in any
+  server) when Roblox has it on, team chat when the game has teams, and
+  private whispers. Type "/w name message" with a username or a display name, or pick
+  someone from the + list. It goes through Roblox's chat, so its filter and
+  rules apply; whispers you get while Chat is in the background show a
+  banner. Some games turn typing in chat off, and Chat says so
+- Music: a library built from folders. `coolui_music/` is the library, every
+  folder in it is a category (it starts with lofi, fun and dance), and
+  categories can hold more categories. Each one can have an `info.json` with
+  its title, picture and description (see "The music library" below). The
+  sidebar shows the tree, each category has a page with its cover, Play,
+  Shuffle and its songs, and changes to the folders show up by themselves.
+  Ask can play a song or a whole category ("play some lofi")
+- Timer: a countdown with a ring that empties as it runs (it chimes and shows
+  a banner when it's done) and a stopwatch with laps. Ask can start timers
 - YouTube: search, Home, Shorts and Live tabs, and real playback of videos
   (seek, pause), Shorts (upright, with next and previous) and live streams,
   with sound. Paste a YouTube link to play it. Needs the YouTube helper
@@ -70,8 +87,8 @@ youtube_helper.py                 the YouTube helper (runs on your PC)
 
 The script downloads each asset once and caches it in the executor's
 workspace (`coolui_music/` and `coolui_assets/`), so later runs don't download
-again. Notes saves to `coolui_assets/Notes.txt`, and any mp3 you put in
-`coolui_music/` shows up in Music. Settings (appearance, the startup screen,
+again. Notes saves to `coolui_assets/Notes.txt`, and any mp3, ogg or wav you
+put in `coolui_music/` (or a category folder in it) shows up in Music. Settings (appearance, the startup screen,
 windows to reopen) are kept in `coolui_assets/settings.json`. If a file is
 missing from this repo, the script falls back to its old download source.
 
@@ -84,6 +101,65 @@ request is billed to your Anthropic account: each question is one or more
 Claude Opus 5.5 calls plus a tiny Claude Haiku 5.5 call that names the topic
 for the Working pill, and web searches cost about a cent each (System
 Settings > Ask can turn searching and desktop control off).
+
+## The music library
+
+Music reads its library from folders in the executor's workspace:
+
+```
+coolui_music/
+  info.json           (optional) the library's own title and description
+  lofi/
+    info.json
+    cover.png         found by itself if info.json doesn't name a picture
+    rainy day.mp3
+    rainy day.png     a picture named like a song is that song's cover
+    chill/            a category inside a category
+      info.json
+      coffee.mp3
+  fun/
+  dance/
+```
+
+Each category's `info.json` says how it looks. Every key is optional, and a
+folder without one is still a category (named after the folder):
+
+```json
+{
+  "title": "Lofi",
+  "description": "Slow, warm beats to study, read or relax to.",
+  "image": "cover.png",
+  "color": "#8E5CF7",
+  "artist": "Various Artists",
+  "genre": "Lofi Hip-Hop",
+  "year": 2026,
+  "shuffle": false,
+  "volume": 0.8,
+  "songs": {
+    "rainy day.mp3": {"title": "Rainy Day", "artist": "Lo-Fi Kid", "image": "rain.png", "volume": 0.6}
+  }
+}
+```
+
+- `title`, `description`: shown on the category's page and in the sidebar.
+- `image`: a picture in the category's folder, a path in the workspace, an
+  `rbxassetid://` id, or an `https://` link to a PNG or JPEG (downloaded once
+  and kept in `coolui_assets/music_covers/`). Without one, the cover is the
+  category's `color` with its first letter.
+- `artist`: the songs' artist unless a song gives its own (categories inside
+  it inherit it).
+- `genre`, `year`: shown under the title.
+- `shuffle`: Play shuffles this category.
+- `volume`: 0 to 1 (up to 2 for quiet files), for every song in the category.
+- `songs`: a song's title, artist, picture and volume, by file name. It can
+  also be a list, `[{"file": "rainy day.mp3", "title": "Rainy Day"}, …]`,
+  which then sets the order (otherwise it's by file name).
+
+New Category (in the sidebar) makes a folder with a ready-to-fill `info.json`
+inside the category you're looking at and opens it in Notes. The info button
+on a category's page opens its `info.json`, and if the file isn't valid JSON
+the page says so. Play on a category plays everything in it, its
+subcategories included.
 
 ## The YouTube helper
 

@@ -3656,12 +3656,80 @@ local MAC_DESK = {
 	titleBar = 52, windowRadius = 16, shadowBlur = 44,
 }
 
+-- Two icons the Lucide set doesn't have, for the Dock: a stopwatch (Timer)
+-- and a speech bubble (Chat). Drawn once as white on clear, 16 samples a
+-- pixel so the edges are smooth.
+do
+	local function drawIcon(name, inside)
+		local path = MACOS_FOLDER .. "/icon_" .. name .. "_v1.png"
+		local function make()
+			if isfile(path) then
+				return
+			end
+			local size = 64
+			local rows = table.create(size)
+			for y = 0, size - 1 do
+				local row = table.create(size + 1)
+				row[1] = "\0"
+				for x = 0, size - 1 do
+					local hits = 0
+					for sy = 0, 3 do
+						for sx = 0, 3 do
+							if inside(x + (sx + 0.5) / 4, y + (sy + 0.5) / 4) then
+								hits += 1
+							end
+						end
+					end
+					row[x + 2] = "\255" .. string.char(math.floor(hits / 16 * 255 + 0.5))
+				end
+				rows[y + 1] = table.concat(row)
+			end
+			ensureMacFolder()
+			writefile(path, macMakePng(size, size, 4, table.concat(rows)))
+		end
+		macMadeImages.remember(path, make)
+		local ok, id = pcall(function()
+			make()
+			return getcustomasset(path)
+		end)
+		return if ok then id else MAC_DESKTOP_ICONS.apple
+	end
+	local function segmentDistance(px, py, ax, ay, bx, by)
+		local dx, dy = bx - ax, by - ay
+		local t = math.clamp(((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy), 0, 1)
+		return math.sqrt((px - ax - t * dx) ^ 2 + (py - ay - t * dy) ^ 2)
+	end
+	MAC_DESKTOP_ICONS.timer = drawIcon("timer", function(x, y)
+		local d = math.sqrt((x - 32) ^ 2 + (y - 37) ^ 2)
+		return (d >= 17 and d <= 22.5) -- the face's rim
+			or segmentDistance(x, y, 32, 37, 38.5, 26) <= 2.4 -- the hand
+			or d <= 3.4 -- its pivot
+			or (math.abs(x - 32) <= 5.5 and y >= 6 and y <= 10.5) -- the button on top
+			or (math.abs(x - 32) <= 2 and y >= 9 and y <= 15.5) -- and its stem
+			or segmentDistance(x, y, 46.5, 20, 50.5, 16) <= 2.3 -- the side button
+	end)
+	MAC_DESKTOP_ICONS.chat = drawIcon("chat", function(x, y)
+		local ex, ey = (x - 32) / 25, (y - 29) / 19
+		if ex * ex + ey * ey <= 1 then
+			return true
+		end
+		-- The tail, down to the bottom left
+		local function side(ax, ay, bx, by)
+			return (bx - ax) * (y - ay) - (by - ay) * (x - ax)
+		end
+		local a, b, c = side(15, 38, 10, 54), side(10, 54, 29, 44), side(29, 44, 15, 38)
+		return (a >= 0 and b >= 0 and c >= 0) or (a <= 0 and b <= 0 and c <= 0)
+	end)
+end
+
 -- Dock apps, left to right (the Trash goes after a separator)
 local MAC_APPS = {
 	{id = "finder", name = "Finder", icon = MAC_DESKTOP_ICONS.finder, top = Color3.fromRGB(110, 198, 255), bottom = Color3.fromRGB(18, 110, 238)},
 	{id = "notes", name = "Notes", icon = MAC_DESKTOP_ICONS.notes, top = Color3.fromRGB(255, 228, 120), bottom = Color3.fromRGB(247, 184, 34)},
+	{id = "chat", name = "Chat", icon = MAC_DESKTOP_ICONS.chat, top = Color3.fromRGB(104, 232, 116), bottom = Color3.fromRGB(28, 188, 62)},
 	{id = "music", name = "Music", icon = MAC_DESKTOP_ICONS.music, top = Color3.fromRGB(255, 110, 132), bottom = Color3.fromRGB(236, 34, 76)},
 	{id = "youtube", name = "YouTube", icon = MAC_DESKTOP_ICONS.play, top = Color3.fromRGB(255, 78, 78), bottom = Color3.fromRGB(214, 0, 24)},
+	{id = "timer", name = "Timer", icon = MAC_DESKTOP_ICONS.timer, top = Color3.fromRGB(255, 184, 72), bottom = Color3.fromRGB(255, 122, 0)},
 	{id = "terminal", name = "Terminal", icon = MAC_DESKTOP_ICONS.terminal, top = Color3.fromRGB(76, 76, 82), bottom = Color3.fromRGB(26, 26, 30)},
 	{id = "settings", name = "System Settings", icon = MAC_DESKTOP_ICONS.settings, top = Color3.fromRGB(178, 180, 188), bottom = Color3.fromRGB(110, 112, 122)},
 }
@@ -4397,7 +4465,7 @@ end
 -- background choice, the Claude key and your own songs stay. `report(fraction,
 -- title, file)` says what it's on; yields.
 local function rebuildMacAssets(report)
-	local made = {"^glass_", "^glassrim_", "^softglow", "^disc_v", "^edgeglow", "^ripple"}
+	local made = {"^glass_", "^glassrim_", "^softglow", "^disc_v", "^edgeglow", "^ripple", "^icon_", "^ytplay"}
 	local downloadedMusic = {"loadingsuccess.mp3", "shopmusic.mp3"}
 	local doomed = {}
 	pcall(function()
@@ -6213,8 +6281,9 @@ local function createMacDesktop(session)
 			if args.pane and win.showPane then
 				win.showPane(args.pane)
 			end
-			-- (YouTube: a search or a link to play)
-			if (args.query or args.kind) and win.handle then
+			-- (YouTube: a search or a link to play; Timer: seconds to count down;
+			-- Music: a category to show)
+			if (args.query or args.kind or args.seconds or args.category) and win.handle then
 				win.handle(args)
 			end
 			return
@@ -6771,229 +6840,1275 @@ local function createMacDesktop(session)
 		})
 	end
 
-	-- Music: plays the mp3s in coolui_music (and any audio opened from Finder)
-	appBuilders.music = function(args)
-		openWindow({
-			app = "music", title = "Music", width = 600, height = 340, minWidth = 470, minHeight = 300,
-			build = function(win)
-				local sound = macNew("Sound", {Name = "coolui_mac_music", Volume = 0.8, Parent = game:GetService("SoundService")})
-				table.insert(win.cleanup, function()
-					sound:Destroy()
-				end)
-				local tracks = {}
-				local function addTrack(path)
-					for i, track in ipairs(tracks) do
-						if track.path == path then
-							return i
-						end
-					end
-					local fileName = path:match("([^/]+)$") or path
-					table.insert(tracks, {path = path, title = fileName:gsub("%.%w+$", "")})
-					return #tracks
+	-- ---------- Music ----------
+	-- A library made of folders: coolui_music is the library, every folder in
+	-- it is a category (lofi, fun, dance…), and a category can hold more
+	-- categories, as deep as you like. Songs are the mp3, ogg and wav files in
+	-- them. A category's info.json says how it looks (every key is optional,
+	-- and a folder without one is still a category):
+	--   {
+	--     "title": "Lofi",                 shown instead of the folder's name
+	--     "description": "Slow beats to study to.",
+	--     "image": "cover.png",            a picture in the folder, a workspace path,
+	--                                      an rbxassetid:// id or an https:// link
+	--                                      (cover.png or cover.jpg is found by itself)
+	--     "color": "#8E5CF7",              the cover's color when there's no picture
+	--     "artist": "Various Artists",     the songs' artist, unless a song says
+	--     "genre": "Hip-Hop", "year": 2026,
+	--     "shuffle": true,                 Play shuffles
+	--     "volume": 0.8,                   0 to 1 (2 at most)
+	--     "songs": {"rain.mp3": {"title": "Rain", "artist": "Someone", "image": "rain.png", "volume": 0.6}}
+	--   }
+	-- "songs" can also be a list, [{"file": "rain.mp3", …}, …], which sets the
+	-- order. A picture named like a song (rain.png) is that song's cover. The
+	-- library is read again every few seconds, so changes show up by themselves.
+	do
+		local HttpService = game:GetService("HttpService")
+		local COVER_FOLDER = MACOS_FOLDER .. "/music_covers"
+		local PINK = Color3.fromRGB(250, 45, 85)
+		local PALETTE = {
+			Color3.fromRGB(250, 45, 85), Color3.fromRGB(142, 92, 247), Color3.fromRGB(10, 140, 250), Color3.fromRGB(255, 140, 20),
+			Color3.fromRGB(30, 190, 120), Color3.fromRGB(235, 70, 170), Color3.fromRGB(40, 180, 200),
+		}
+		local images = {} -- a picture's path or link -> its asset id (false: it can't be had)
+		local downloads = {} -- link -> what's waiting for it
+
+		local function hashText(text)
+			local hash = 5381
+			for i = 1, #text do
+				hash = (hash * 33 + string.byte(text, i)) % 4294967296
+			end
+			return hash
+		end
+
+		local function fileExists(path)
+			local ok, exists = pcall(isfile, path)
+			return ok and exists == true
+		end
+
+		local function localImage(path)
+			if images[path] ~= nil then
+				return images[path] or nil
+			end
+			local id = false
+			if MAC_IMAGE_EXTENSIONS[macExtension(path)] and fileExists(path) then
+				local ok, asset = pcall(getcustomasset, path)
+				id = ok and asset or false
+			end
+			images[path] = id
+			return id or nil
+		end
+
+		-- Puts an info.json "image" on `label`, now or once it has downloaded
+		local function showImage(label, value, folder)
+			if type(value) == "number" then
+				value = tostring(math.floor(value))
+			end
+			if type(value) ~= "string" then
+				return
+			end
+			value = value:match("^%s*(.-)%s*$")
+			local function show(id)
+				if id and label.Parent then
+					label.Image = id
+					label.Visible = true
 				end
-				pcall(function()
-					for _, entry in ipairs(macListFolder(MUSIC_FOLDER)) do
-						if not entry.folder and MAC_AUDIO_EXTENSIONS[macExtension(entry.name)] then
-							addTrack(entry.path)
-						end
-					end
-				end)
-
-				local content = win.content
-				local art = macNew("Frame", {Position = UDim2.fromOffset(24, 4), Size = UDim2.fromOffset(170, 170), BackgroundColor3 = white, Parent = content})
-				macCorner(art, 14)
-				macNew("UIGradient", {Rotation = 45, Color = ColorSequence.new(Color3.fromRGB(255, 96, 140), Color3.fromRGB(140, 70, 235)), Parent = art})
-				macImage(art, I.music, 84, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
-
-				local titleLabel = macLabel(content, "Not Playing", 20, Enum.FontWeight.Bold, C.ink, {
-					Position = UDim2.fromOffset(214, 8), Size = UDim2.new(1, -234, 0, 26), TextTruncate = Enum.TextTruncate.AtEnd,
-				})
-				macLabel(content, "coolui", 15, Enum.FontWeight.Regular, C.inkSoft, {Position = UDim2.fromOffset(214, 36), Size = UDim2.new(1, -234, 0, 20)})
-
-				-- Progress bar (click to seek)
-				local bar = macButton(content, {
-					Position = UDim2.fromOffset(214, 76), Size = UDim2.new(1, -238, 0, 6),
-					BackgroundTransparency = 0, BackgroundColor3 = C.track,
-				})
-				macCorner(bar, UDim.new(1, 0))
-				local fill = macNew("Frame", {BackgroundColor3 = C.trackFill, BorderSizePixel = 0, Size = UDim2.fromScale(0, 1), Parent = bar})
-				macCorner(fill, UDim.new(1, 0))
-				local elapsedLabel = macLabel(content, "0:00", 12, Enum.FontWeight.Medium, C.inkSoft, {Position = UDim2.fromOffset(214, 86), Size = UDim2.fromOffset(60, 16)})
-				local lengthLabel = macLabel(content, "0:00", 12, Enum.FontWeight.Medium, C.inkSoft, {
-					AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -24, 0, 86), Size = UDim2.fromOffset(60, 16),
-					TextXAlignment = Enum.TextXAlignment.Right,
-				})
-
-				local function controlButton(icon, size, x)
-					local button = macButton(content, {
-						AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, x, 0, 134), Size = UDim2.fromOffset(size + 14, size + 14),
-						BackgroundColor3 = C.line,
-					})
-					macCorner(button, UDim.new(1, 0))
-					local image = macImage(button, icon, size, C.ink, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
-					button.MouseEnter:Connect(function()
-						button.BackgroundTransparency = 0.94
-					end)
-					button.MouseLeave:Connect(function()
-						button.BackgroundTransparency = 1
-					end)
-					return button, image
+			end
+			if value == "" then
+				return
+			elseif value:match("^%d+$") then
+				show("rbxassetid://" .. value)
+			elseif value:match("^rbx%w*://") then
+				show(value)
+			elseif value:match("^https?://") then
+				-- Downloaded once and kept in coolui_assets/music_covers
+				if images[value] ~= nil then
+					show(images[value] or nil)
+					return
 				end
-				local prevButton = controlButton(I.skipBack, 22, 300)
-				local playButton, playIcon = controlButton(I.play, 30, 356)
-				local nextButton = controlButton(I.skipForward, 22, 412)
-
-				local trackList = macNew("ScrollingFrame", {
-					BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(16, 186), Size = UDim2.new(1, -32, 1, -194),
-					CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 5,
-					ScrollBarImageColor3 = C.line, ScrollBarImageTransparency = 0.6,
-					ScrollingDirection = Enum.ScrollingDirection.Y, Parent = content,
-				})
-				macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Parent = trackList})
-
-				local index = 0
-				local rows = {}
-				local function paintRows()
-					for i, row in ipairs(rows) do
-						local on = i == index
-						row.button.BackgroundTransparency = if on then 0 else 1
-						row.label.TextColor3 = if on then white else C.ink
-					end
+				if downloads[value] then
+					table.insert(downloads[value], show)
+					return
 				end
-				local function play(i)
-					local track = tracks[i]
-					if not track then
-						return
-					end
-					local ok, id = pcall(getcustomasset, track.path)
-					if not ok then
-						titleLabel.Text = "Can't play " .. track.title
-						return
-					end
-					index = i
-					sound:Stop()
-					sound.SoundId = id
-					sound.TimePosition = 0
-					sound:Play()
-					titleLabel.Text = track.title
-					paintRows()
-				end
-				local function rebuildRows()
-					for _, row in ipairs(rows) do
-						row.button:Destroy()
-					end
-					table.clear(rows)
-					for i, track in ipairs(tracks) do
-						local button = macButton(trackList, {Size = UDim2.new(1, -6, 0, 28), LayoutOrder = i, BackgroundColor3 = C.accent})
-						macCorner(button, 6)
-						local label = macLabel(button, track.title, 14, Enum.FontWeight.Regular, C.ink, {
-							Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -24, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
-						})
-						button.MouseButton1Click:Connect(function()
-							play(i)
-						end)
-						rows[i] = {button = button, label = label}
-					end
-					paintRows()
-				end
-				rebuildRows()
-
-				playButton.MouseButton1Click:Connect(function()
-					if sound.IsPlaying then
-						sound:Pause()
-					elseif index == 0 then
-						play(1)
-					else
-						sound:Resume()
-					end
-				end)
-				prevButton.MouseButton1Click:Connect(function()
-					if #tracks > 0 then
-						play((index - 2) % #tracks + 1)
-					end
-				end)
-				nextButton.MouseButton1Click:Connect(function()
-					if #tracks > 0 then
-						play(index % #tracks + 1)
-					end
-				end)
-				sound.Ended:Connect(function()
-					if #tracks > 0 then
-						play(index % #tracks + 1)
-					end
-				end)
-				bar.MouseButton1Down:Connect(function(x)
-					if sound.TimeLength > 0 then
-						local fraction = math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
-						sound.TimePosition = fraction * sound.TimeLength
-					end
-				end)
-
-				local function clockText(seconds)
-					seconds = math.max(0, math.floor(seconds))
-					return string.format("%d:%02d", seconds // 60, seconds % 60)
-				end
+				local waiting = {show}
+				downloads[value] = waiting
 				task.spawn(function()
-					while not win.closed do
-						local length = sound.TimeLength
-						fill.Size = UDim2.fromScale(if length > 0 then math.clamp(sound.TimePosition / length, 0, 1) else 0, 1)
-						elapsedLabel.Text = clockText(sound.TimePosition)
-						lengthLabel.Text = clockText(length)
-						playIcon.Image = if sound.IsPlaying then I.pause else I.play
-						task.wait(0.2)
+					local id = false
+					pcall(function()
+						local base = COVER_FOLDER .. "/" .. string.format("%08x", hashText(value))
+						local path = if fileExists(base .. ".png") then base .. ".png" elseif fileExists(base .. ".jpg") then base .. ".jpg" else nil
+						if not path then
+							local data = game:HttpGet(value)
+							local kind = if data:sub(1, 4) == "\137PNG" then ".png" elseif data:sub(1, 3) == "\255\216\255" then ".jpg" else nil
+							if not kind then
+								error("not a PNG or JPEG picture")
+							end
+							ensureMacFolder()
+							if not isfolder(COVER_FOLDER) then
+								makefolder(COVER_FOLDER)
+							end
+							path = base .. kind
+							writefile(path, data)
+						end
+						id = getcustomasset(path)
+					end)
+					images[value] = id
+					downloads[value] = nil
+					for _, callback in ipairs(waiting) do
+						callback(id or nil)
 					end
 				end)
+			else
+				local relative = value:gsub("\\", "/"):gsub("^%./", "")
+				show(localImage(folder .. "/" .. relative) or localImage(relative))
+			end
+		end
 
-				function win.openPath(path)
-					local i = addTrack(path)
-					rebuildRows()
-					play(i)
+		local function colorOf(value)
+			if type(value) == "string" then
+				local hex = value:match("^%s*#?(%x%x%x%x%x%x)%s*$")
+				if hex then
+					return Color3.fromHex(hex)
 				end
-				-- For Ask: "play" (a song whose name contains `song`, or carry
-				-- on), "pause", "next", "previous" or "status". Returns what's
-				-- playing and every song, or nil and what went wrong.
-				function win.control(command, song)
-					if command == "play" then
-						if type(song) == "string" and song ~= "" then
-							local wanted, found = song:lower(), nil
-							for i, track in ipairs(tracks) do
-								if track.title:lower() == wanted then
-									found = i
-									break
+			elseif type(value) == "table" and tonumber(value[1]) and tonumber(value[2]) and tonumber(value[3]) then
+				return Color3.fromRGB(math.clamp(tonumber(value[1]), 0, 255), math.clamp(tonumber(value[2]), 0, 255), math.clamp(tonumber(value[3]), 0, 255))
+			end
+			return nil
+		end
+
+		local function textOf(value)
+			if type(value) == "number" then
+				return tostring(value)
+			elseif type(value) == "string" and value:match("%S") then
+				return value:match("^%s*(.-)%s*$")
+			end
+			return nil
+		end
+
+		-- Reads the whole library. Returns its root (the coolui_music folder) and
+		-- a fingerprint of everything read, to notice changes by.
+		local function readLibrary()
+			local seen = {}
+			local function read(path, parent, depth)
+				local name = path:match("([^/]+)$") or path
+				local node = {path = path, name = name, parent = parent, depth = depth, children = {}, songs = {}, info = {}}
+				table.insert(seen, path)
+				local infoPath = path .. "/info.json"
+				if fileExists(infoPath) then
+					node.hasInfo = true
+					local okRead, raw = pcall(readfile, infoPath)
+					raw = if okRead and type(raw) == "string" then raw else ""
+					table.insert(seen, raw)
+					local ok, decoded = pcall(HttpService.JSONDecode, HttpService, raw)
+					if ok and type(decoded) == "table" then
+						node.info = decoded
+					elseif raw:match("%S") then
+						node.problem = "It isn't valid JSON, so it's being skipped. Look for a missing comma, quote or bracket."
+					end
+				end
+				local info = node.info
+				node.title = textOf(info.title) or (if parent then name else "Music")
+				node.description = textOf(info.description)
+				node.artist = textOf(info.artist) or (parent and parent.artist)
+				node.genre = textOf(info.genre)
+				node.year = textOf(info.year)
+				node.color = colorOf(info.color) or (if parent then PALETTE[hashText(name:lower()) % #PALETTE + 1] else PINK)
+				node.shuffle = info.shuffle == true
+				local volume = tonumber(info.volume)
+				node.volume = if volume then math.clamp(volume, 0, 2) else (parent and parent.volume)
+
+				-- Song details by file name (with or without its extension)
+				local details, order = {}, {}
+				if type(info.songs) == "table" then
+					if #info.songs > 0 then
+						for i, entry in ipairs(info.songs) do
+							local file = if type(entry) == "table" then entry.file elseif type(entry) == "string" then entry else nil
+							if type(file) == "string" then
+								order[file:lower()] = i
+								if type(entry) == "table" then
+									details[file:lower()] = entry
 								end
 							end
-							for i, track in ipairs(tracks) do
-								if not found and track.title:lower():find(wanted, 1, true) then
-									found = i
-								end
-							end
-							if not found then
-								return nil, "There's no song called \"" .. song .. "\""
-							end
-							play(found)
-						elseif index == 0 then
-							play(1)
-						elseif not sound.IsPlaying then
-							sound:Resume()
 						end
-					elseif command == "pause" then
-						sound:Pause()
-					elseif command == "next" and #tracks > 0 then
-						play(index % #tracks + 1)
-					elseif command == "previous" and #tracks > 0 then
-						play((index - 2) % #tracks + 1)
+					else
+						for file, entry in pairs(info.songs) do
+							if type(file) == "string" and type(entry) == "table" then
+								details[file:lower()] = entry
+							end
+						end
 					end
-					local names = {}
-					for _, track in ipairs(tracks) do
-						table.insert(names, track.title)
+				end
+
+				local okList, entries = pcall(macListFolder, path)
+				entries = if okList then entries else {}
+				local pictures = {}
+				for _, entry in ipairs(entries) do
+					table.insert(seen, entry.path)
+					if not entry.folder and MAC_IMAGE_EXTENSIONS[macExtension(entry.name)] then
+						pictures[entry.name:lower()] = entry.name
 					end
-					return {playing = sound.IsPlaying, track = if tracks[index] then tracks[index].title else nil, songs = names}
 				end
-				if args.path then
-					win.openPath(args.path)
+				-- (a picture file that isn't there falls back to cover.png or cover.jpg)
+				local image = info.image
+				if type(image) == "string" and not image:match("^%s*https?://") and not image:match("^%s*rbx%w*://") and not image:match("^%s*%d+%s*$") then
+					local relative = image:match("^%s*(.-)%s*$"):gsub("\\", "/"):gsub("^%./", "")
+					if relative == "" or not (fileExists(path .. "/" .. relative) or fileExists(relative)) then
+						image = nil
+					end
 				end
-			end,
-		})
+				node.image = if image ~= nil then image
+					else pictures["cover.png"] or pictures["cover.jpg"] or pictures["cover.jpeg"] or pictures["folder.png"] or pictures["folder.jpg"]
+				for _, entry in ipairs(entries) do
+					if entry.folder then
+						if depth < 12 then
+							table.insert(node.children, read(entry.path, node, depth + 1))
+						end
+					elseif MAC_AUDIO_EXTENSIONS[macExtension(entry.name)] then
+						local key = entry.name:lower()
+						local bare = key:gsub("%.%w+$", "")
+						local detail = details[key] or details[bare] or {}
+						local songVolume = tonumber(detail.volume)
+						table.insert(node.songs, {
+							path = entry.path, file = entry.name, category = node,
+							title = textOf(detail.title) or (entry.name:gsub("%.%w+$", "")),
+							artist = textOf(detail.artist) or node.artist,
+							image = detail.image or pictures[bare .. ".png"] or pictures[bare .. ".jpg"] or pictures[bare .. ".jpeg"],
+							volume = if songVolume then math.clamp(songVolume, 0, 2) else nil,
+							order = order[key] or order[bare] or math.huge,
+						})
+					end
+				end
+				table.sort(node.songs, function(a, b)
+					if a.order ~= b.order then
+						return a.order < b.order
+					end
+					return a.file:lower() < b.file:lower()
+				end)
+				table.sort(node.children, function(a, b)
+					return a.title:lower() < b.title:lower()
+				end)
+				return node
+			end
+			pcall(function()
+				if not isfolder(MUSIC_FOLDER) then
+					makefolder(MUSIC_FOLDER)
+				end
+			end)
+			local root = read(MUSIC_FOLDER, nil, 0)
+			return root, table.concat(seen, "\n")
+		end
+
+		-- Every song in a category and the categories inside it
+		local function songsUnder(node, into)
+			into = into or {}
+			for _, song in ipairs(node.songs) do
+				table.insert(into, song)
+			end
+			for _, child in ipairs(node.children) do
+				songsUnder(child, into)
+			end
+			return into
+		end
+
+		local function eachCategory(node, callback)
+			for _, child in ipairs(node.children) do
+				callback(child)
+				eachCategory(child, callback)
+			end
+		end
+
+		-- A new category's info.json
+		local function infoTemplate(title, description, color, genre)
+			local function quoted(text)
+				return HttpService:JSONEncode(text)
+			end
+			return table.concat({
+				"{",
+				'  "title": ' .. quoted(title) .. ",",
+				'  "description": ' .. quoted(description) .. ",",
+				'  "image": "cover.png",',
+				'  "color": "' .. color .. '",',
+				'  "artist": "",',
+				'  "genre": ' .. quoted(genre) .. ",",
+				'  "shuffle": false,',
+				'  "songs": {',
+				'    "example.mp3": {"title": "Example Song", "artist": "Someone"}',
+				"  }",
+				"}",
+				"",
+			}, "\n")
+		end
+
+		-- The first time Music opens: lofi, fun and dance, to show how it works
+		local function makeExamples()
+			if macSettings.musicExamples then
+				return
+			end
+			macSettings.musicExamples = true
+			saveMacSettings()
+			pcall(function()
+				if not isfolder(MUSIC_FOLDER) then
+					makefolder(MUSIC_FOLDER)
+				end
+				for _, example in ipairs({
+					{"lofi", "Lofi", "Slow, warm beats to study, read or relax to.", "#8E5CF7", "Lofi Hip-Hop"},
+					{"fun", "Fun", "Bright, bouncy songs that make everything a bit more fun.", "#FF9F0A", "Pop"},
+					{"dance", "Dance", "Fast songs with a big beat, for dancing.", "#FF2D78", "Electronic"},
+				}) do
+					local folder = MUSIC_FOLDER .. "/" .. example[1]
+					if not isfolder(folder) then
+						makefolder(folder)
+						writefile(folder .. "/info.json", infoTemplate(example[2], example[3], example[4], example[5]))
+					end
+				end
+			end)
+		end
+
+		local function clockText(seconds)
+			seconds = math.max(0, math.floor(seconds))
+			return string.format("%d:%02d", seconds // 60, seconds % 60)
+		end
+
+		appBuilders.music = function(args)
+			local sidebarWidth = 214
+			openWindow({
+				app = "music", title = "", menuName = "Music", width = 920, height = 600, minWidth = 720, minHeight = 420,
+				sidebarWidth = sidebarWidth, background = C.window,
+				build = function(win)
+					win.frame.Name = "Music"
+					local body, sidebar, content = win.body, win.sidebar, win.content
+					local sound = macNew("Sound", {Name = "coolui_mac_music", Volume = 0.8, Parent = game:GetService("SoundService")})
+					table.insert(win.cleanup, function()
+						sound:Destroy()
+					end)
+
+					makeExamples()
+					local library, fingerprint = readLibrary()
+					local page = {kind = "home"}
+					local expanded = {[library.path:lower()] = true}
+					local queue, queueIndex, current = {}, 0, nil
+					local listed = {} -- the songs on the page showing (Play with nothing queued plays these)
+					local listedShuffle = false
+					local songRows = {}
+					local showPage, paintTree
+
+					local function findNode(path)
+						path = path:gsub("\\", "/"):gsub("/+$", ""):lower()
+						local function search(node)
+							if node.path:lower() == path then
+								return node
+							end
+							for _, child in ipairs(node.children) do
+								local found = search(child)
+								if found then
+									return found
+								end
+							end
+							return nil
+						end
+						return search(library)
+					end
+
+					local function hover(button, isOn)
+						button.MouseEnter:Connect(function()
+							if not (isOn and isOn()) then
+								button.BackgroundTransparency = 0.93
+							end
+						end)
+						button.MouseLeave:Connect(function()
+							if not (isOn and isOn()) then
+								button.BackgroundTransparency = 1
+							end
+						end)
+					end
+
+					-- A cover: the picture if there is one, over a gradient in the
+					-- category's color with its first letter
+					local function makeCover(parent, node, size, radius, props, song)
+						local cover = macNew("Frame", {Size = UDim2.fromOffset(size, size), BackgroundColor3 = white, BorderSizePixel = 0, Parent = parent})
+						for key, value in pairs(props or {}) do
+							cover[key] = value
+						end
+						macCorner(cover, radius)
+						local color = if node then node.color else PINK
+						macNew("UIGradient", {Rotation = 45, Color = ColorSequence.new(color:Lerp(white, 0.3), color), Parent = cover})
+						if node and node.parent then
+							macLabel(cover, (node.title:match("[%w]") or "?"):upper(), math.max(9, math.round(size * 0.46)), Enum.FontWeight.Bold, white, {
+								Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center, TextTransparency = 0.08,
+							})
+						else
+							macImage(cover, I.music, math.round(size * 0.5), white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
+						end
+						-- The category's picture, and over it the song's own (if it loads)
+						local function art(zIndex)
+							local label = macNew("ImageLabel", {
+								BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ScaleType = Enum.ScaleType.Crop, Visible = false, ZIndex = zIndex, Parent = cover,
+							})
+							macCorner(label, radius)
+							return label
+						end
+						if node and node.image ~= nil then
+							showImage(art(2), node.image, node.path)
+						end
+						if song and song.image ~= nil and song.category then
+							showImage(art(3), song.image, song.category.path)
+						end
+						return cover
+					end
+
+					-- ---- The player, in the title bar ----
+					local x0 = sidebarWidth + 22
+					local function barButton(icon, size, x)
+						local button = macButton(body, {
+							AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(x, 26), Size = UDim2.fromOffset(32, 32),
+							BackgroundColor3 = C.line, ZIndex = 3,
+						})
+						macCorner(button, 8)
+						local image = macImage(button, icon, size, C.ink, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
+						hover(button)
+						return button, image
+					end
+					local prevButton = barButton(I.skipBack, 17, x0 + 16)
+					local playButton, playIcon = barButton(I.play, 21, x0 + 52)
+					local nextButton = barButton(I.skipForward, 17, x0 + 88)
+					local lcdX = x0 + 118
+					local lcd = macNew("Frame", {
+						Position = UDim2.fromOffset(lcdX, 5), Size = UDim2.new(1, -(lcdX + 18), 0, 42), BackgroundColor3 = C.line,
+						BackgroundTransparency = 0.955, BorderSizePixel = 0, ZIndex = 3, Parent = body,
+					})
+					macCorner(lcd, 9)
+					macStroke(lcd, C.line, 0.9, 1)
+					macNew("UISizeConstraint", {MaxSize = Vector2.new(560, 42), Parent = lcd})
+					local lcdArt = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(5, 5), Size = UDim2.fromOffset(32, 32), Parent = lcd})
+					local lcdTitle = macLabel(lcd, "Music", 13, Enum.FontWeight.SemiBold, C.ink, {
+						Position = UDim2.fromOffset(46, 4), Size = UDim2.new(1, -142, 0, 17), TextTruncate = Enum.TextTruncate.AtEnd,
+					})
+					local lcdSub = macLabel(lcd, "Not Playing", 11, Enum.FontWeight.Regular, C.inkSoft, {
+						Position = UDim2.fromOffset(46, 20), Size = UDim2.new(1, -142, 0, 13), TextTruncate = Enum.TextTruncate.AtEnd,
+					})
+					local lcdTime = macLabel(lcd, "", 11, Enum.FontWeight.Medium, C.inkSoft, {
+						AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, 6), Size = UDim2.fromOffset(90, 14),
+						TextXAlignment = Enum.TextXAlignment.Right,
+					})
+					-- (click it to jump)
+					local seek = macButton(lcd, {Position = UDim2.new(0, 46, 1, -10), Size = UDim2.new(1, -56, 0, 9)})
+					local seekTrack = macNew("Frame", {
+						AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.new(1, 0, 0, 3),
+						BackgroundColor3 = C.track, BorderSizePixel = 0, Parent = seek,
+					})
+					macCorner(seekTrack, UDim.new(1, 0))
+					local seekFill = macNew("Frame", {BackgroundColor3 = C.trackFill, BorderSizePixel = 0, Size = UDim2.fromScale(0, 1), Parent = seekTrack})
+					macCorner(seekFill, UDim.new(1, 0))
+
+					local function paintPlayer()
+						lcdArt:ClearAllChildren()
+						if current then
+							makeCover(lcdArt, if current.category and current.category.parent then current.category else nil, 32, 6, {}, current)
+							lcdTitle.Text = current.title
+							local parts = {}
+							if current.artist then
+								table.insert(parts, current.artist)
+							end
+							if current.category and current.category.parent then
+								table.insert(parts, current.category.title)
+							end
+							lcdSub.Text = if #parts > 0 then table.concat(parts, " — ") else "coolui"
+						else
+							makeCover(lcdArt, nil, 32, 6, {})
+							lcdTitle.Text = "Music"
+							lcdSub.Text = "Not Playing"
+						end
+					end
+					paintPlayer()
+
+					local playingSpeakers = {}
+					local function paintSongRows()
+						table.clear(playingSpeakers)
+						for _, row in ipairs(songRows) do
+							local on = current ~= nil and row.song.path == current.path
+							row.title.TextColor3 = if on then C.accent else C.ink
+							row.number.Visible = not on
+							row.speaker.Visible = on
+							if on then
+								table.insert(playingSpeakers, row.speaker)
+							end
+						end
+					end
+
+					local function play(i)
+						local song = queue[i]
+						if not song then
+							return false
+						end
+						local ok, id = pcall(getcustomasset, song.path)
+						if not ok then
+							lcdTitle.Text = "Can't play " .. song.title
+							lcdSub.Text = "The file couldn't be loaded"
+							return false
+						end
+						queueIndex, current = i, song
+						sound:Stop()
+						sound.SoundId = id
+						sound.Volume = song.volume or (song.category and song.category.volume) or 0.8
+						sound.TimePosition = 0
+						sound:Play()
+						paintPlayer()
+						paintSongRows()
+						return true
+					end
+
+					-- Plays `songs` from `start`; shuffled, `start` still goes first
+					local function playSongs(songs, start, shuffle)
+						if #songs == 0 then
+							return
+						end
+						if shuffle then
+							local first = songs[start or 0]
+							queue = table.clone(songs)
+							for i = #queue, 2, -1 do
+								local j = math.random(i)
+								queue[i], queue[j] = queue[j], queue[i]
+							end
+							if first then
+								table.remove(queue, table.find(queue, first))
+								table.insert(queue, 1, first)
+							end
+							play(1)
+						else
+							queue = table.clone(songs)
+							play(start or 1)
+						end
+					end
+
+					local function step(direction)
+						if #queue == 0 then
+							playSongs(listed, 1, listedShuffle)
+							return
+						end
+						if direction < 0 and sound.TimePosition > 3 then
+							sound.TimePosition = 0
+							return
+						end
+						play((queueIndex - 1 + direction) % #queue + 1)
+					end
+
+					playButton.MouseButton1Click:Connect(function()
+						if sound.IsPlaying then
+							sound:Pause()
+						elseif current then
+							sound:Resume()
+						else
+							playSongs(listed, 1, listedShuffle)
+						end
+					end)
+					prevButton.MouseButton1Click:Connect(function()
+						step(-1)
+					end)
+					nextButton.MouseButton1Click:Connect(function()
+						step(1)
+					end)
+					sound.Ended:Connect(function()
+						step(1)
+					end)
+					seek.MouseButton1Down:Connect(function(x)
+						if sound.TimeLength > 0 then
+							local fraction = math.clamp((x - seek.AbsolutePosition.X) / seek.AbsoluteSize.X, 0, 1)
+							sound.TimePosition = fraction * sound.TimeLength
+						end
+					end)
+					task.spawn(function()
+						while not win.closed do
+							local length = sound.TimeLength
+							seekFill.Size = UDim2.fromScale(if length > 0 then math.clamp(sound.TimePosition / length, 0, 1) else 0, 1)
+							lcdTime.Text = if current and length > 0 then clockText(sound.TimePosition) .. " / " .. clockText(length) else ""
+							playIcon.Image = if sound.IsPlaying then I.pause else I.play
+							for _, speaker in ipairs(playingSpeakers) do
+								speaker.ImageTransparency = if sound.IsPlaying then 0 else 0.5
+							end
+							task.wait(0.2)
+						end
+					end)
+
+					-- ---- The sidebar: Songs, and the tree of categories ----
+					local tree = macNew("ScrollingFrame", {
+						BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(6, 46), Size = UDim2.new(1, -12, 1, -46 - 82),
+						CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 4,
+						ScrollBarImageColor3 = C.line, ScrollBarImageTransparency = 0.6, ScrollingDirection = Enum.ScrollingDirection.Y, Parent = sidebar,
+					})
+					macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 1), Parent = tree})
+					local treeItems = {}
+
+					local function pageKey()
+						return if page.kind == "category" then page.path:lower() else page.kind
+					end
+
+					function paintTree()
+						for _, item in ipairs(treeItems) do
+							item:Destroy()
+						end
+						table.clear(treeItems)
+						local order = 0
+						local function heading(text)
+							order += 1
+							local label = macLabel(tree, text, 11, Enum.FontWeight.SemiBold, C.inkSoft, {
+								Size = UDim2.new(1, 0, 0, 28), LayoutOrder = order, TextYAlignment = Enum.TextYAlignment.Bottom,
+							})
+							macNew("UIPadding", {PaddingLeft = UDim.new(0, 10), PaddingBottom = UDim.new(0, 6), Parent = label})
+							table.insert(treeItems, label)
+						end
+						local function row(depth, title, node, kind)
+							order += 1
+							local key = if node then node.path:lower() else kind
+							local on = key == pageKey()
+							local hasChildren = node ~= nil and #node.children > 0
+							local button = macButton(tree, {
+								Size = UDim2.new(1, -2, 0, 28), LayoutOrder = order, BackgroundTransparency = if on then 0 else 1,
+								BackgroundColor3 = if on then C.accent else C.line,
+							})
+							macCorner(button, 7)
+							if not on then
+								hover(button)
+							end
+							local ink = if on then white else C.ink
+							local x = 6 + depth * 14
+							if hasChildren then
+								local toggle = macButton(button, {Position = UDim2.fromOffset(x, 4), Size = UDim2.fromOffset(16, 20)})
+								macImage(toggle, I.forward, 12, if on then white else C.inkSoft, {
+									AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Rotation = if expanded[key] then 90 else 0,
+								})
+								toggle.MouseButton1Click:Connect(function()
+									expanded[key] = not expanded[key]
+									paintTree()
+								end)
+							end
+							x += 18
+							if node then
+								makeCover(button, node, 20, 5, {Position = UDim2.fromOffset(x, 4)})
+							else
+								macImage(button, I.music, 16, if on then white else C.accent, {Position = UDim2.fromOffset(x + 2, 6)})
+							end
+							macLabel(button, title, 13, Enum.FontWeight.Medium, ink, {
+								Position = UDim2.fromOffset(x + 28, 0), Size = UDim2.new(1, -(x + 34), 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+							})
+							button.MouseButton1Click:Connect(function()
+								showPage(if node and node.parent then {kind = "category", path = node.path} elseif node then {kind = "home"} else {kind = kind})
+							end)
+							table.insert(treeItems, button)
+						end
+						heading("Library")
+						row(0, "Songs", nil, "songs")
+						heading("Categories")
+						-- The library itself is the tree's top ("Music"), so the home page
+						-- is its row (the key for that row is "home")
+						order += 1
+						do
+							local key = library.path:lower()
+							local on = page.kind == "home"
+							local button = macButton(tree, {
+								Size = UDim2.new(1, -2, 0, 28), LayoutOrder = order, BackgroundTransparency = if on then 0 else 1,
+								BackgroundColor3 = if on then C.accent else C.line,
+							})
+							macCorner(button, 7)
+							if not on then
+								hover(button)
+							end
+							if #library.children > 0 then
+								local toggle = macButton(button, {Position = UDim2.fromOffset(6, 4), Size = UDim2.fromOffset(16, 20)})
+								macImage(toggle, I.forward, 12, if on then white else C.inkSoft, {
+									AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Rotation = if expanded[key] then 90 else 0,
+								})
+								toggle.MouseButton1Click:Connect(function()
+									expanded[key] = not expanded[key]
+									paintTree()
+								end)
+							end
+							makeCover(button, library, 20, 5, {Position = UDim2.fromOffset(24, 4)})
+							macLabel(button, library.title, 13, Enum.FontWeight.Medium, if on then white else C.ink, {
+								Position = UDim2.fromOffset(52, 0), Size = UDim2.new(1, -58, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+							})
+							button.MouseButton1Click:Connect(function()
+								showPage({kind = "home"})
+							end)
+							table.insert(treeItems, button)
+						end
+						local function walk(node, depth)
+							for _, child in ipairs(node.children) do
+								row(depth, child.title, child)
+								if #child.children > 0 and expanded[child.path:lower()] then
+									walk(child, depth + 1)
+								end
+							end
+						end
+						if expanded[library.path:lower()] then
+							walk(library, 1)
+						end
+						if #library.children == 0 then
+							order += 1
+							local note = macLabel(tree, "No categories yet. Every folder in coolui_music is one.", 12, Enum.FontWeight.Regular, C.inkSoft, {
+								Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true, LayoutOrder = order,
+							})
+							macNew("UIPadding", {PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 4), Parent = note})
+							table.insert(treeItems, note)
+						end
+					end
+
+					-- Reads the library again; true if anything changed
+					local function reload()
+						local ok, newLibrary, newPrint = pcall(readLibrary)
+						if not ok or newPrint == fingerprint then
+							return false
+						end
+						library, fingerprint = newLibrary, newPrint
+						table.clear(images) -- a picture may have been swapped for another of the same name
+						local byPath = {}
+						for _, song in ipairs(songsUnder(library)) do
+							byPath[song.path] = song
+						end
+						local kept = {}
+						for _, song in ipairs(queue) do
+							if byPath[song.path] then
+								table.insert(kept, byPath[song.path])
+							end
+						end
+						queue = kept
+						if current and byPath[current.path] then
+							current = byPath[current.path]
+						end
+						queueIndex = if current then table.find(queue, current) or 0 else 0
+						paintPlayer()
+						return true
+					end
+
+					-- Puts a new category in the one showing (or the library) and opens
+					-- its info.json in Notes, to name it
+					local function newCategory()
+						local parentNode = if page.kind == "category" then findNode(page.path) or library else library
+						local base = parentNode.path .. "/New Category"
+						local path, n = base, 1
+						while isfolder(path) do
+							n += 1
+							path = base .. " " .. n
+						end
+						local made = pcall(function()
+							makefolder(path)
+							writefile(path .. "/info.json", infoTemplate("New Category", "What's in this category.", "#5E5CE6", ""))
+						end)
+						if not made then
+							return
+						end
+						expanded[parentNode.path:lower()] = true
+						reload()
+						showPage({kind = "category", path = path})
+						openApp("notes", {path = path .. "/info.json", newWindow = true})
+					end
+
+					local function sidebarAction(icon, text, bottom, onClick)
+						local button = macButton(sidebar, {
+							AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 8, 1, -bottom), Size = UDim2.new(1, -16, 0, 30),
+							BackgroundColor3 = C.line,
+						})
+						macCorner(button, 8)
+						macImage(button, icon, 16, C.inkSoft, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 9, 0.5, 0)})
+						macLabel(button, text, 13, Enum.FontWeight.Medium, C.ink, {Position = UDim2.fromOffset(34, 0), Size = UDim2.new(1, -40, 1, 0)})
+						hover(button)
+						button.MouseButton1Click:Connect(onClick)
+					end
+					sidebarAction(I.plus, "New Category", 42, newCategory)
+					sidebarAction(I.folder, "Show in Finder", 8, function()
+						local node = if page.kind == "category" then findNode(page.path) else nil
+						openApp("finder", {path = if node then node.path else MUSIC_FOLDER, newWindow = true})
+					end)
+
+					-- ---- The page ----
+					local scroller = macNew("ScrollingFrame", {
+						BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1),
+						CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 5,
+						ScrollBarImageColor3 = C.line, ScrollBarImageTransparency = 0.6, ScrollingDirection = Enum.ScrollingDirection.Y, Parent = content,
+					})
+					macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8), Parent = scroller})
+					macNew("UIPadding", {
+						PaddingLeft = UDim.new(0, 22), PaddingRight = UDim.new(0, 22), PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 22), Parent = scroller,
+					})
+
+					local function countText(node)
+						local songs, categories = #songsUnder(node), 0
+						eachCategory(node, function()
+							categories += 1
+						end)
+						local parts = {}
+						if categories > 0 then
+							table.insert(parts, categories .. (if categories == 1 then " category" else " categories"))
+						end
+						table.insert(parts, songs .. (if songs == 1 then " song" else " songs"))
+						return table.concat(parts, " · ")
+					end
+
+					local function editInfo(node)
+						local infoPath = node.path .. "/info.json"
+						if not fileExists(infoPath) then
+							pcall(writefile, infoPath, infoTemplate(node.title, node.description or "What's in this category.",
+								"#" .. node.color:ToHex():upper(), node.genre or ""))
+						end
+						openApp("notes", {path = infoPath, newWindow = true})
+					end
+
+					local function sectionTitle(order, text)
+						macLabel(scroller, text, 18, Enum.FontWeight.Bold, C.ink, {
+							Size = UDim2.new(1, 0, 0, 34), LayoutOrder = order, TextYAlignment = Enum.TextYAlignment.Bottom,
+						})
+					end
+
+					local function pill(parent, text, icon, x, width, filled, color, onClick)
+						local button = macButton(parent, {
+							Position = UDim2.fromOffset(x, 158), Size = UDim2.fromOffset(width, 30), BackgroundTransparency = if filled then 0 else 0.92,
+							BackgroundColor3 = if filled then color else C.line,
+						})
+						macCorner(button, 8)
+						local ink = if filled then white else color
+						local label = macLabel(button, text, 13, Enum.FontWeight.SemiBold, ink, {Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center})
+						if icon then
+							macImage(button, icon, 14, ink, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0.5, 0)})
+							label.Position = UDim2.fromOffset(10, 0)
+						end
+						button.MouseEnter:Connect(function()
+							button.BackgroundTransparency = if filled then 0.12 else 0.86
+						end)
+						button.MouseLeave:Connect(function()
+							button.BackgroundTransparency = if filled then 0 else 0.92
+						end)
+						button.MouseButton1Click:Connect(onClick)
+						return button
+					end
+
+					local function iconButton(parent, icon, x, onClick)
+						local button = macButton(parent, {
+							Position = UDim2.fromOffset(x, 158), Size = UDim2.fromOffset(30, 30), BackgroundTransparency = 0.92, BackgroundColor3 = C.line,
+						})
+						macCorner(button, UDim.new(1, 0))
+						macImage(button, icon, 15, C.ink, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
+						button.MouseEnter:Connect(function()
+							button.BackgroundTransparency = 0.86
+						end)
+						button.MouseLeave:Connect(function()
+							button.BackgroundTransparency = 0.92
+						end)
+						button.MouseButton1Click:Connect(onClick)
+					end
+
+					-- The top of a page: cover, title, what's in it, Play and Shuffle
+					local function header(order, spec)
+						local frame = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 204), LayoutOrder = order, Parent = scroller})
+						makeCover(frame, spec.node, 176, 12, {Position = UDim2.fromOffset(0, 14)})
+						local x = 198
+						local color = if spec.node then spec.node.color else PINK
+						macLabel(frame, spec.kicker, 12, Enum.FontWeight.SemiBold, C.inkSoft, {
+							Position = UDim2.fromOffset(x, 22), Size = UDim2.new(1, -x, 0, 16), TextTruncate = Enum.TextTruncate.AtEnd,
+						})
+						macLabel(frame, spec.title, 28, Enum.FontWeight.Bold, C.ink, {
+							Position = UDim2.fromOffset(x, 40), Size = UDim2.new(1, -x, 0, 34), TextTruncate = Enum.TextTruncate.AtEnd,
+						})
+						macLabel(frame, spec.subtitle or "", 15, Enum.FontWeight.Medium, color, {
+							Position = UDim2.fromOffset(x, 76), Size = UDim2.new(1, -x, 0, 20), TextTruncate = Enum.TextTruncate.AtEnd,
+						})
+						macLabel(frame, spec.meta or "", 12, Enum.FontWeight.Regular, C.inkSoft, {
+							Position = UDim2.fromOffset(x, 98), Size = UDim2.new(1, -x, 0, 16), TextTruncate = Enum.TextTruncate.AtEnd,
+						})
+						macLabel(frame, spec.description or "", 13, Enum.FontWeight.Regular, C.ink, {
+							Position = UDim2.fromOffset(x, 118), Size = UDim2.new(1, -x, 0, 34), TextWrapped = true,
+							TextYAlignment = Enum.TextYAlignment.Top, TextTruncate = Enum.TextTruncate.AtEnd,
+						})
+						local songs = spec.songs
+						pill(frame, "Play", I.play, x, 92, true, color, function()
+							playSongs(songs, 1, spec.shuffle)
+						end)
+						pill(frame, "Shuffle", nil, x + 102, 92, false, color, function()
+							playSongs(songs, nil, true)
+						end)
+						local nextX = x + 204
+						if spec.node then
+							iconButton(frame, I.info, nextX, function()
+								editInfo(spec.node)
+							end)
+							nextX += 40
+						end
+						iconButton(frame, I.folder, nextX, function()
+							openApp("finder", {path = if spec.node then spec.node.path else MUSIC_FOLDER, newWindow = true})
+						end)
+					end
+
+					-- A list of songs; `withCategory` adds a column saying where each is
+					local function songList(order, songs, withCategory, shuffle)
+						local holder = macNew("Frame", {
+							BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = order, Parent = scroller,
+						})
+						macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Parent = holder})
+						local titleWidth, artistWidth = if withCategory then 0.44 else 0.6, if withCategory then 0.28 else 0.4
+						local headings = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 26), LayoutOrder = 0, Parent = holder})
+						local function heading(text, position, size)
+							return macLabel(headings, text, 11, Enum.FontWeight.SemiBold, C.inkSoft, {Position = position, Size = size, TextTruncate = Enum.TextTruncate.AtEnd})
+						end
+						heading("#", UDim2.fromOffset(6, 0), UDim2.fromOffset(30, 26)).TextXAlignment = Enum.TextXAlignment.Center
+						heading("Title", UDim2.fromOffset(84, 0), UDim2.new(titleWidth, -90, 1, 0))
+						heading("Artist", UDim2.new(titleWidth, 0, 0, 0), UDim2.new(artistWidth, -10, 1, 0))
+						if withCategory then
+							heading("Category", UDim2.new(titleWidth + artistWidth, 0, 0, 0), UDim2.new(1 - titleWidth - artistWidth, -10, 1, 0))
+						end
+						macNew("Frame", {
+							BackgroundColor3 = C.line, BackgroundTransparency = 0.9, BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 1),
+							Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 1), Parent = headings,
+						})
+						for i, song in ipairs(songs) do
+							local striped = i % 2 == 0
+							local button = macButton(holder, {
+								Size = UDim2.new(1, 0, 0, 40), LayoutOrder = i, BackgroundTransparency = if striped then 0 else 1, BackgroundColor3 = C.zebra,
+							})
+							macCorner(button, 6)
+							button.MouseEnter:Connect(function()
+								button.BackgroundColor3 = C.line
+								button.BackgroundTransparency = 0.93
+							end)
+							button.MouseLeave:Connect(function()
+								button.BackgroundColor3 = C.zebra
+								button.BackgroundTransparency = if striped then 0 else 1
+							end)
+							local number = macLabel(button, tostring(i), 12, Enum.FontWeight.Regular, C.inkSoft, {
+								Position = UDim2.fromOffset(6, 0), Size = UDim2.fromOffset(30, 40), TextXAlignment = Enum.TextXAlignment.Center,
+							})
+							local speaker = macImage(button, I.music, 14, C.accent, {
+								AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(21, 20), Visible = false,
+							})
+							makeCover(button, if song.category and song.category.parent then song.category else nil, 28, 5, {Position = UDim2.fromOffset(44, 6)}, song)
+							local title = macLabel(button, song.title, 13, Enum.FontWeight.Medium, C.ink, {
+								Position = UDim2.fromOffset(84, 0), Size = UDim2.new(titleWidth, -90, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+							})
+							macLabel(button, song.artist or "", 13, Enum.FontWeight.Regular, C.inkSoft, {
+								Position = UDim2.new(titleWidth, 0, 0, 0), Size = UDim2.new(artistWidth, -10, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+							})
+							if withCategory then
+								macLabel(button, if song.category and song.category.parent then song.category.title else "", 13, Enum.FontWeight.Regular, C.inkSoft, {
+									Position = UDim2.new(titleWidth + artistWidth, 0, 0, 0), Size = UDim2.new(1 - titleWidth - artistWidth, -10, 1, 0),
+									TextTruncate = Enum.TextTruncate.AtEnd,
+								})
+							end
+							button.MouseButton1Click:Connect(function()
+								playSongs(songs, i, shuffle)
+							end)
+							table.insert(songRows, {song = song, title = title, number = number, speaker = speaker})
+						end
+					end
+
+					-- Categories as cards with their covers; hover one to play it
+					local function cardGrid(order, nodes)
+						local holder = macNew("Frame", {
+							BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = order, Parent = scroller,
+						})
+						macNew("UIGridLayout", {
+							CellSize = UDim2.fromOffset(140, 186), CellPadding = UDim2.fromOffset(18, 10), SortOrder = Enum.SortOrder.LayoutOrder, Parent = holder,
+						})
+						for i, node in ipairs(nodes) do
+							local card = macButton(holder, {LayoutOrder = i})
+							local cover = makeCover(card, node, 140, 10, {})
+							macStroke(cover, C.line, 0.92, 1)
+							macLabel(card, node.title, 13, Enum.FontWeight.SemiBold, C.ink, {
+								Position = UDim2.fromOffset(2, 146), Size = UDim2.new(1, -4, 0, 18), TextTruncate = Enum.TextTruncate.AtEnd,
+							})
+							macLabel(card, countText(node), 12, Enum.FontWeight.Regular, C.inkSoft, {
+								Position = UDim2.fromOffset(2, 164), Size = UDim2.new(1, -4, 0, 16), TextTruncate = Enum.TextTruncate.AtEnd,
+							})
+							local quick = macButton(cover, {
+								AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 8, 1, -8), Size = UDim2.fromOffset(32, 32),
+								BackgroundTransparency = 0.35, BackgroundColor3 = Color3.new(0, 0, 0), Visible = false, ZIndex = 4,
+							})
+							macCorner(quick, UDim.new(1, 0))
+							macImage(quick, I.play, 16, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 1, 0.5, 0)})
+							card.MouseEnter:Connect(function()
+								quick.Visible = true
+							end)
+							card.MouseLeave:Connect(function()
+								quick.Visible = false
+							end)
+							quick.MouseButton1Click:Connect(function()
+								playSongs(songsUnder(node), 1, node.shuffle)
+							end)
+							card.MouseButton1Click:Connect(function()
+								showPage({kind = "category", path = node.path})
+							end)
+						end
+					end
+
+					local function note(order, text, color, onClick)
+						local button = macButton(scroller, {
+							Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = order,
+							BackgroundTransparency = if color then 0.85 else 1, BackgroundColor3 = color or C.line, Active = onClick ~= nil,
+						})
+						macCorner(button, 8)
+						macNew("UIPadding", {
+							PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12), PaddingTop = UDim.new(0, 9), PaddingBottom = UDim.new(0, 9), Parent = button,
+						})
+						macLabel(button, text, 13, Enum.FontWeight.Regular, C.inkSoft, {
+							Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true, RichText = true,
+						})
+						if onClick then
+							button.MouseButton1Click:Connect(onClick)
+						end
+					end
+
+					function showPage(target, keepScroll)
+						local node = nil
+						if target.kind == "category" then
+							node = findNode(target.path)
+							if not node or not node.parent then
+								node = nil
+								target = {kind = "home"}
+							else
+								target = {kind = "category", path = node.path}
+							end
+						end
+						page = target
+						win.reopenArgs = {category = if node then node.path elseif target.kind == "songs" then "::songs" else ""}
+						-- Opening a category shows it, and what's in it, in the tree
+						if node and not keepScroll then
+							expanded[node.path:lower()] = true
+						end
+						local up = node and node.parent
+						while up do
+							expanded[up.path:lower()] = true
+							up = up.parent
+						end
+
+						local scroll = scroller.CanvasPosition
+						for _, child in ipairs(scroller:GetChildren()) do
+							if child:IsA("GuiObject") then
+								child:Destroy()
+							end
+						end
+						table.clear(songRows)
+
+						if target.kind == "songs" then
+							local songs = songsUnder(library)
+							listed, listedShuffle = songs, false
+							header(1, {
+								kicker = "Library", title = "Songs", subtitle = countText(library),
+								meta = "Every song in coolui_music and its categories",
+								songs = songs, shuffle = false,
+							})
+							if #songs > 0 then
+								songList(3, songs, true, false)
+							else
+								note(3, "No songs yet. Put mp3, ogg or wav files in <b>coolui_music</b>, or in one of its categories.")
+							end
+						elseif node then
+							local songs = songsUnder(node)
+							listed, listedShuffle = songs, node.shuffle
+							local crumbs = {}
+							local up2 = node.parent
+							while up2 do
+								table.insert(crumbs, 1, up2.title)
+								up2 = up2.parent
+							end
+							local meta = {}
+							if node.artist and node.genre then
+								table.insert(meta, node.genre)
+							end
+							if node.year then
+								table.insert(meta, node.year)
+							end
+							table.insert(meta, countText(node))
+							header(1, {
+								node = node, kicker = table.concat(crumbs, " › "), title = node.title,
+								subtitle = node.artist or node.genre or (if node.depth > 1 then "Subcategory" else "Category"),
+								meta = table.concat(meta, " · "), description = node.description,
+								songs = songs, shuffle = node.shuffle,
+							})
+							if node.problem then
+								note(2, "<b>Problem with info.json.</b> " .. node.problem .. " Click here to open it.", Color3.fromRGB(255, 159, 10), function()
+									editInfo(node)
+								end)
+							end
+							if #node.children > 0 then
+								sectionTitle(3, "Categories")
+								cardGrid(4, node.children)
+							end
+							if #songs > 0 then
+								if #node.children > 0 then
+									sectionTitle(5, "Songs")
+								end
+								songList(6, songs, #node.children > 0, node.shuffle)
+							else
+								note(6, "No songs here yet. Put mp3, ogg or wav files in <b>" .. node.path .. "</b> (Show in Finder opens it).")
+							end
+						else
+							listed, listedShuffle = songsUnder(library), false
+							header(1, {
+								node = library, kicker = "Library", title = library.title, subtitle = countText(library),
+								description = library.description or "Every folder in coolui_music is a category, and categories can hold more. Give one an info.json for its title, picture and description.",
+								songs = listed, shuffle = false,
+							})
+							if library.problem then
+								note(2, "<b>Problem with info.json.</b> " .. library.problem .. " Click here to open it.", Color3.fromRGB(255, 159, 10), function()
+									editInfo(library)
+								end)
+							end
+							if #library.children > 0 then
+								sectionTitle(3, "Categories")
+								cardGrid(4, library.children)
+							else
+								note(4, "No categories yet. Click <b>New Category</b>, or make folders in coolui_music.")
+							end
+							if #library.songs > 0 then
+								sectionTitle(5, "Not in a Category")
+								songList(6, library.songs, false, false)
+							end
+						end
+						paintSongRows()
+						paintTree()
+						if keepScroll then
+							task.defer(function()
+								scroller.CanvasPosition = scroll
+							end)
+						else
+							scroller.CanvasPosition = Vector2.zero
+						end
+					end
+
+					-- Folder changes (from Finder, Notes or anywhere) show up by themselves
+					task.spawn(function()
+						while not win.closed do
+							task.wait(2.5)
+							if not win.closed and reload() then
+								showPage(page, true)
+							end
+						end
+					end)
+
+					local function showCategoryArg(value)
+						if value == "::songs" then
+							showPage({kind = "songs"})
+						elseif type(value) == "string" and value ~= "" then
+							showPage({kind = "category", path = value})
+						else
+							showPage({kind = "home"})
+						end
+					end
+
+					-- An audio file from Finder: played in its category, or by itself
+					-- if it's somewhere else; a category's folder: shown
+					function win.openPath(path)
+						path = path:gsub("\\", "/")
+						reload()
+						local okFolder, isFolder = pcall(isfolder, path)
+						if okFolder and isFolder then
+							showCategoryArg(path)
+							return
+						end
+						for _, song in ipairs(songsUnder(library)) do
+							if song.path:lower() == path:lower() then
+								local songs = song.category.songs
+								if song.category.parent then
+									showPage({kind = "category", path = song.category.path})
+								end
+								playSongs(songs, table.find(songs, song), false)
+								return
+							end
+						end
+						local fileName = path:match("([^/]+)$") or path
+						queue = {{path = path, file = fileName, title = (fileName:gsub("%.%w+$", ""))}}
+						play(1)
+					end
+					function win.handle(handleArgs)
+						if handleArgs.category then
+							showCategoryArg(handleArgs.category)
+						end
+					end
+
+					-- For Ask: "play" (a song or a category whose name contains `wanted`,
+					-- or carry on), "pause", "next", "previous" or "status". Returns
+					-- what's playing, every song and every category, or nil and what
+					-- went wrong.
+					function win.control(command, wanted)
+						reload()
+						local everything = songsUnder(library)
+						if command == "play" then
+							if type(wanted) == "string" and wanted:match("%S") then
+								local lower = wanted:lower():match("^%s*(.-)%s*$")
+								local found = nil
+								for _, song in ipairs(everything) do
+									if song.title:lower() == lower or song.file:lower() == lower then
+										found = song
+										break
+									end
+								end
+								local category = nil
+								eachCategory(library, function(node)
+									if not category and (node.title:lower() == lower or node.name:lower() == lower) then
+										category = node
+									end
+								end)
+								if not found and not category then
+									for _, song in ipairs(everything) do
+										if song.title:lower():find(lower, 1, true) then
+											found = song
+											break
+										end
+									end
+								end
+								if not found and not category then
+									eachCategory(library, function(node)
+										if not category and (node.title:lower():find(lower, 1, true) or node.name:lower():find(lower, 1, true)) then
+											category = node
+										end
+									end)
+								end
+								if found then
+									local songs = found.category.songs
+									playSongs(songs, table.find(songs, found), false)
+								elseif category then
+									local songs = songsUnder(category)
+									if #songs == 0 then
+										return nil, "The " .. category.title .. " category has no songs yet (put audio files in " .. category.path .. ")"
+									end
+									showPage({kind = "category", path = category.path})
+									playSongs(songs, 1, category.shuffle)
+								else
+									return nil, "There's no song or category called \"" .. wanted .. "\""
+								end
+							elseif not current then
+								playSongs(if #listed > 0 then listed else everything, 1, listedShuffle)
+							elseif not sound.IsPlaying then
+								sound:Resume()
+							end
+						elseif command == "pause" then
+							sound:Pause()
+						elseif command == "next" then
+							step(1)
+						elseif command == "previous" then
+							step(-1)
+						end
+						local names, categories = {}, {}
+						for i, song in ipairs(everything) do
+							if i > 150 then
+								table.insert(names, "and " .. (#everything - 150) .. " more")
+								break
+							end
+							table.insert(names, if song.category.parent then song.title .. " (" .. song.category.title .. ")" else song.title)
+						end
+						eachCategory(library, function(node)
+							local count = #songsUnder(node)
+							table.insert(categories, node.title .. " (" .. count .. (if count == 1 then " song)" else " songs)"))
+						end)
+						return {
+							playing = sound.IsPlaying, track = if current then current.title else nil,
+							songs = names, categories = categories,
+						}
+					end
+
+					showCategoryArg(args.category)
+					if args.path then
+						win.openPath(args.path)
+					end
+				end,
+			})
+		end
 	end
 
 	-- ---------- YouTube ----------
@@ -7954,6 +9069,1159 @@ local function createMacDesktop(session)
 		})
 	end
 
+	-- ---------- Notifications ----------
+	-- A banner in the top right, like macOS's: an app's icon, a title and a
+	-- line of text. It slides in, stays 5 seconds, and clicking it runs
+	-- `spec.onClick`. Banners stack downward.
+	local banners = {}
+	local function notify(spec)
+		if not alive then
+			return
+		end
+		local app = nil
+		for _, candidate in ipairs(MAC_APPS) do
+			if candidate.id == spec.app then
+				app = candidate
+			end
+		end
+		local holder = macButton(overlay, {
+			AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, 380, 0, 0), Size = UDim2.fromOffset(344, 66),
+			BackgroundTransparency = 0.04, BackgroundColor3 = C.menu, ZIndex = 24,
+		})
+		macCorner(holder, 18)
+		macStroke(holder, C.line, 0.88, 1)
+		if app then
+			macAppTile(holder, app, 38).Position = UDim2.fromOffset(12, 14)
+		end
+		macLabel(holder, spec.title or "", 13, Enum.FontWeight.SemiBold, C.ink, {
+			Position = UDim2.fromOffset(60, 13), Size = UDim2.new(1, -72, 0, 18), TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 25,
+		})
+		macLabel(holder, spec.text or "", 13, Enum.FontWeight.Regular, C.ink, {
+			Position = UDim2.fromOffset(60, 33), Size = UDim2.new(1, -72, 0, 18), TextTruncate = Enum.TextTruncate.AtEnd,
+			TextTransparency = 0.15, ZIndex = 25,
+		})
+		local entry = {holder = holder}
+		table.insert(banners, entry)
+		local function place(animate)
+			for i, banner in ipairs(banners) do
+				local target = UDim2.new(1, -12, 0, D.menuHeight + 10 + (i - 1) * 74)
+				if animate or banner ~= entry then
+					tween(banner.holder, 0.35, {Position = target})
+				end
+			end
+		end
+		holder.Position = UDim2.new(1, 380, 0, D.menuHeight + 10 + (#banners - 1) * 74)
+		place(true)
+		local function dismiss()
+			local i = table.find(banners, entry)
+			if not i then
+				return
+			end
+			table.remove(banners, i)
+			local out = tween(holder, 0.3, {Position = UDim2.new(1, 380, 0, holder.Position.Y.Offset)}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			out.Completed:Once(function()
+				holder:Destroy()
+			end)
+			place(false)
+		end
+		holder.MouseButton1Click:Connect(function()
+			dismiss()
+			if spec.onClick then
+				task.spawn(spec.onClick)
+			end
+		end)
+		task.delay(spec.duration or 5, dismiss)
+	end
+
+	-- ---------- Timer ----------
+	-- A countdown timer, with a ring that empties as it runs, and a
+	-- stopwatch, like the Clock app's. When the timer's done it chimes and a
+	-- banner says so (even with the window minimized).
+	appBuilders.timer = function(args)
+		openWindow({
+			app = "timer", title = "Timer", width = 400, height = 520, minWidth = 360, minHeight = 480, dark = true, fixedSize = true,
+			background = Color3.fromRGB(28, 28, 30),
+			build = function(win)
+				local content = win.content
+				local ORANGE = Color3.fromRGB(255, 159, 10)
+				local GREEN = Color3.fromRGB(48, 209, 88)
+				local RED = Color3.fromRGB(255, 69, 58)
+				local GREY = Color3.fromRGB(152, 152, 158)
+				local TRACK = Color3.fromRGB(58, 58, 62)
+				local mono = Font.new("rbxasset://fonts/families/RobotoMono.json", Enum.FontWeight.Light)
+
+				-- Timer | Stopwatch
+				local switcher = macNew("Frame", {
+					BackgroundColor3 = Color3.fromRGB(46, 46, 50), BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0),
+					Position = UDim2.new(0.5, 0, 0, 2), Size = UDim2.fromOffset(220, 30), Parent = content,
+				})
+				macCorner(switcher, 9)
+				local pages, switchButtons = {}, {}
+				local function showPage(name)
+					for key, page in pairs(pages) do
+						page.Visible = key == name
+						switchButtons[key].BackgroundTransparency = if key == name then 0 else 1
+					end
+					win.setTitle(if name == "timer" then "Timer" else "Stopwatch")
+				end
+				for i, name in ipairs({"timer", "stopwatch"}) do
+					local button = macButton(switcher, {
+						Position = UDim2.new((i - 1) / 2, 2, 0, 2), Size = UDim2.new(0.5, -4, 1, -4),
+						BackgroundTransparency = 1, BackgroundColor3 = Color3.fromRGB(100, 100, 106),
+					})
+					macCorner(button, 7)
+					macLabel(button, if name == "timer" then "Timer" else "Stopwatch", 13, Enum.FontWeight.Medium, white, {
+						Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center,
+					})
+					switchButtons[name] = button
+					pages[name] = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 44), Size = UDim2.new(1, 0, 1, -44), Parent = content})
+					button.MouseButton1Click:Connect(function()
+						showPage(name)
+					end)
+				end
+
+				-- A round button with its word in the middle (tinted, like the Clock app's)
+				local function roundButton(parent, text, color, x)
+					local button = macButton(parent, {
+						AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, x, 1, -64), Size = UDim2.fromOffset(78, 78),
+						BackgroundTransparency = 0.72, BackgroundColor3 = color,
+					})
+					macCorner(button, UDim.new(1, 0))
+					local label = macLabel(button, text, 15, Enum.FontWeight.Medium, color, {
+						Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center,
+					})
+					local api = {button = button}
+					function api.set(newText, newColor)
+						label.Text = newText
+						label.TextColor3 = newColor
+						button.BackgroundColor3 = newColor
+					end
+					return api
+				end
+				local function clockText(seconds, tenths)
+					seconds = math.max(0, seconds)
+					local whole = math.floor(seconds)
+					local h, m, s = whole // 3600, whole // 60 % 60, whole % 60
+					local text = if h > 0 then string.format("%d:%02d:%02d", h, m, s) else string.format("%02d:%02d", m, s)
+					if tenths then
+						text ..= string.format(".%02d", math.floor((seconds - whole) * 100))
+					end
+					return text
+				end
+
+				-- ---- Timer ----
+				local timerPage = pages.timer
+				-- Setting it: hours, minutes and seconds you can type into, and presets
+				local setter = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 40), Size = UDim2.new(1, 0, 0, 220), Parent = timerPage})
+				local fields = {}
+				for i, part in ipairs({{"h", "hours", 0}, {"m", "min", 5}, {"s", "sec", 0}}) do
+					local x = (i - 2) * 104
+					local field = macNew("TextBox", {
+						BackgroundColor3 = Color3.fromRGB(44, 44, 48), BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0),
+						Position = UDim2.new(0.5, x, 0, 20), Size = UDim2.fromOffset(88, 70), ClearTextOnFocus = true,
+						Text = string.format("%02d", part[3]), TextColor3 = white, FontFace = mono, TextSize = 40,
+						TextXAlignment = Enum.TextXAlignment.Center, Parent = setter,
+					})
+					macCorner(field, 12)
+					macLabel(setter, part[2], 12, Enum.FontWeight.Medium, GREY, {
+						AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, x, 0, 96), Size = UDim2.fromOffset(88, 16),
+						TextXAlignment = Enum.TextXAlignment.Center,
+					})
+					field.FocusLost:Connect(function()
+						local n = math.clamp(tonumber(field.Text:match("%d+") or "0") or 0, 0, if part[1] == "h" then 23 else 59)
+						field.Text = string.format("%02d", n)
+					end)
+					fields[part[1]] = field
+				end
+				local presets = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 140), Size = UDim2.new(1, 0, 0, 34), Parent = setter})
+				macNew("UIListLayout", {
+					FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Center,
+					Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = presets,
+				})
+				for i, minutes in ipairs({1, 3, 5, 10, 15, 30}) do
+					local chip = macButton(presets, {
+						Size = UDim2.fromOffset(46, 30), BackgroundTransparency = 0, BackgroundColor3 = Color3.fromRGB(44, 44, 48), LayoutOrder = i,
+					})
+					macCorner(chip, UDim.new(1, 0))
+					macLabel(chip, minutes .. "m", 13, Enum.FontWeight.Medium, white, {Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center})
+					chip.MouseButton1Click:Connect(function()
+						fields.h.Text, fields.m.Text, fields.s.Text = "00", string.format("%02d", minutes), "00"
+					end)
+				end
+
+				-- Running: a ring of short bars that empties clockwise, and the time left
+				local runner = macNew("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 6), Size = UDim2.new(1, 0, 0, 280), Visible = false, Parent = timerPage})
+				local RING_RADIUS, RING_BARS = 116, 96
+				local ring = macNew("Frame", {
+					BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0, 132),
+					Size = UDim2.fromOffset(2 * RING_RADIUS, 2 * RING_RADIUS), Parent = runner,
+				})
+				local bars = {}
+				local barLength = 2 * math.pi * RING_RADIUS / RING_BARS * 1.25
+				for i = 1, RING_BARS do
+					local angle = (i - 0.5) / RING_BARS * math.pi * 2
+					local bar = macNew("Frame", {
+						BackgroundColor3 = ORANGE, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5),
+						Position = UDim2.new(0.5, math.sin(angle) * RING_RADIUS, 0.5, -math.cos(angle) * RING_RADIUS),
+						Size = UDim2.fromOffset(barLength, 7), Rotation = math.deg(angle), Parent = ring,
+					})
+					bars[i] = bar
+				end
+				local remainingLabel = macLabel(ring, "", 46, Enum.FontWeight.Light, white, {
+					FontFace = mono, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.46), Size = UDim2.fromOffset(220, 56),
+					TextXAlignment = Enum.TextXAlignment.Center,
+				})
+				local endsLabel = macLabel(ring, "", 13, Enum.FontWeight.Medium, GREY, {
+					AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.64), Size = UDim2.fromOffset(200, 18),
+					TextXAlignment = Enum.TextXAlignment.Center,
+				})
+
+				local cancel = roundButton(timerPage, "Cancel", GREY, -110)
+				local startPause = roundButton(timerPage, "Start", GREEN, 110)
+				-- total: the length set; endsAt (os.clock) while running; left while paused
+				local timer = {state = "idle", total = 0, left = 0, endsAt = 0}
+				local function paintTimer()
+					local idle = timer.state == "idle"
+					setter.Visible = idle
+					runner.Visible = not idle
+					cancel.button.BackgroundTransparency = if idle then 0.88 else 0.72
+					if timer.state == "running" then
+						startPause.set("Pause", ORANGE)
+					elseif timer.state == "paused" then
+						startPause.set("Resume", GREEN)
+					else
+						startPause.set("Start", GREEN)
+					end
+				end
+				local function timeLeft()
+					return if timer.state == "running" then timer.endsAt - os.clock() elseif timer.state == "paused" then timer.left else timer.total
+				end
+				local function startTimer(seconds)
+					if seconds <= 0 then
+						return
+					end
+					timer.total, timer.state, timer.endsAt = seconds, "running", os.clock() + seconds
+					endsLabel.Text = "Ends at " .. DateTime.fromUnixTimestamp(os.time() + math.floor(seconds)):FormatLocalTime("h:mm A", "en-us")
+					paintTimer()
+				end
+				local function finished()
+					timer.state = "idle"
+					paintTimer()
+					task.spawn(function()
+						for _ = 1, 3 do
+							macSounds.play(macSounds.login, 0.8)
+							task.wait(1.1)
+						end
+					end)
+					notify({app = "timer", title = "Timer", text = "Your " .. clockText(timer.total) .. " timer is done.", onClick = function()
+						if not win.closed then
+							if win.minimized then
+								win.restore()
+							else
+								focusWindow(win)
+							end
+						end
+					end})
+				end
+				startPause.button.MouseButton1Click:Connect(function()
+					if timer.state == "idle" then
+						local seconds = (tonumber(fields.h.Text) or 0) * 3600 + (tonumber(fields.m.Text) or 0) * 60 + (tonumber(fields.s.Text) or 0)
+						startTimer(seconds)
+					elseif timer.state == "running" then
+						timer.left, timer.state = timer.endsAt - os.clock(), "paused"
+						endsLabel.Text = "Paused"
+						paintTimer()
+					else
+						startTimer(timer.left)
+						timer.total = math.max(timer.total, timer.left)
+					end
+				end)
+				cancel.button.MouseButton1Click:Connect(function()
+					if timer.state ~= "idle" then
+						timer.state = "idle"
+						paintTimer()
+					end
+				end)
+
+				-- ---- Stopwatch ----
+				local watchPage = pages.stopwatch
+				local watchLabel = macLabel(watchPage, "00:00.00", 54, Enum.FontWeight.Light, white, {
+					FontFace = mono, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 40), Size = UDim2.fromOffset(340, 70),
+					TextXAlignment = Enum.TextXAlignment.Center,
+				})
+				local laps = macNew("ScrollingFrame", {
+					BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(28, 128), Size = UDim2.new(1, -56, 1, -244),
+					CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 4,
+					ScrollBarImageColor3 = GREY, ScrollingDirection = Enum.ScrollingDirection.Y, Parent = watchPage,
+				})
+				macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Parent = laps})
+				local lapButton = roundButton(watchPage, "Lap", GREY, -110)
+				local runButton = roundButton(watchPage, "Start", GREEN, 110)
+				local watch = {running = false, base = 0, started = 0, laps = {}, lastLap = 0}
+				local function elapsed()
+					return watch.base + (if watch.running then os.clock() - watch.started else 0)
+				end
+				local function paintWatch()
+					runButton.set(if watch.running then "Stop" else "Start", if watch.running then RED else GREEN)
+					lapButton.set(if watch.running or elapsed() == 0 then "Lap" else "Reset", GREY)
+				end
+				runButton.button.MouseButton1Click:Connect(function()
+					if watch.running then
+						watch.base, watch.running = elapsed(), false
+					else
+						watch.started, watch.running = os.clock(), true
+					end
+					paintWatch()
+				end)
+				lapButton.button.MouseButton1Click:Connect(function()
+					if watch.running then
+						local now = elapsed()
+						local number = #watch.laps + 1
+						table.insert(watch.laps, now - watch.lastLap)
+						local row = macNew("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, -6, 0, 34), LayoutOrder = -number, Parent = laps})
+						macLabel(row, "Lap " .. number, 14, Enum.FontWeight.Regular, white, {Size = UDim2.fromScale(0.5, 1)})
+						macLabel(row, clockText(now - watch.lastLap, true), 14, Enum.FontWeight.Regular, white, {
+							FontFace = mono, AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(1, 0), Size = UDim2.fromScale(0.5, 1),
+							TextXAlignment = Enum.TextXAlignment.Right,
+						})
+						macNew("Frame", {
+							BackgroundColor3 = white, BackgroundTransparency = 0.88, BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 1),
+							Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 1), Parent = row,
+						})
+						watch.lastLap = now
+					else
+						watch.base, watch.lastLap = 0, 0
+						table.clear(watch.laps)
+						for _, child in ipairs(laps:GetChildren()) do
+							if child:IsA("Frame") then
+								child:Destroy()
+							end
+						end
+					end
+					paintWatch()
+				end)
+
+				-- Every frame: the ring, the time left, the stopwatch
+				table.insert(win.cleanup, RunService.Heartbeat:Connect(function()
+					if timer.state ~= "idle" then
+						local left = timeLeft()
+						if timer.state == "running" and left <= 0 then
+							finished()
+							return
+						end
+						remainingLabel.Text = clockText(math.ceil(left))
+						local fraction = math.clamp(left / timer.total, 0, 1)
+						for i, bar in ipairs(bars) do
+							bar.BackgroundColor3 = if (i - 0.5) / RING_BARS <= fraction then ORANGE else TRACK
+						end
+					end
+					if watch.running then
+						watchLabel.Text = clockText(elapsed(), true)
+					end
+				end))
+
+				function win.handle(request)
+					if request and tonumber(request.seconds) then
+						showPage("timer")
+						startTimer(tonumber(request.seconds))
+					end
+				end
+				paintTimer()
+				paintWatch()
+				showPage("timer")
+				win.handle(args)
+			end,
+		})
+	end
+
+	-- ---------- Chat ----------
+	-- The game's chat in a window: the server, Roblox's Global chat
+	-- (everyone playing this game, in any server), team chat and private
+	-- whispers. It all goes through Roblox's own chat (TextChatService, or the
+	-- old chat system in games that still use it), so Roblox's filter and
+	-- rules apply as usual, and Roblox's chat window is left as the game set
+	-- it. "/w name message" (a username or a display name) whispers. Messages
+	-- are collected from the moment the desktop starts, so opening Chat shows
+	-- what's been said.
+	local chatStore = nil
+	local openChat -- (the Chat window's "show this channel")
+	local function getChatStore()
+		if chatStore then
+			return chatStore
+		end
+		local TextChatService = game:GetService("TextChatService")
+		local legacy = TextChatService.ChatVersion == Enum.ChatVersion.LegacyChatService
+		local store = {channels = {}, order = {}, listeners = {}, legacy = legacy, muted = {}}
+		-- Whether the game has switched off typing in its chat (it can still be read)
+		function store.typingOff()
+			local config = if legacy then nil else TextChatService:FindFirstChildOfClass("ChatInputBarConfiguration")
+			return config ~= nil and not config.Enabled
+		end
+		chatStore = store
+		local function changed(channel, message)
+			for _, fn in ipairs(table.clone(store.listeners)) do
+				task.spawn(fn, channel, message)
+			end
+		end
+		local function stripTags(text)
+			return (tostring(text or ""):gsub("<[^>]->", ""))
+		end
+		-- One channel's entry: {key, name, kind ("server"/"team"/"whisper"/
+		-- "other"), textChannel?, partner?, messages, unread, lastActivity}
+		local function channelFor(key, make)
+			local channel = store.channels[key]
+			if not channel and make then
+				channel = make()
+				channel.key, channel.messages, channel.unread, channel.lastActivity = key, {}, 0, 0
+				store.channels[key] = channel
+				table.insert(store.order, channel)
+				changed(channel, nil)
+			end
+			return channel
+		end
+		local function partnerOf(textChannel)
+			for _, source in ipairs(textChannel:GetChildren()) do
+				if source:IsA("TextSource") and source.UserId ~= player.UserId then
+					return Players:GetPlayerByUserId(source.UserId), source.UserId
+				end
+			end
+			return nil, nil
+		end
+		local function describe(textChannel)
+			local name = textChannel.Name
+			if name == "RBXGeneral" then
+				return {name = "Server", kind = "server", textChannel = textChannel}
+			elseif name:match("^RBXTeam") then
+				return {name = "Team", kind = "team", textChannel = textChannel}
+			elseif name:match("^RBXWhisper") then
+				local partner, userId = partnerOf(textChannel)
+				return {name = if partner then partner.DisplayName else "Whisper", kind = "whisper", textChannel = textChannel, partner = partner, partnerId = userId}
+			end
+			return {name = (name:gsub("^RBX", "")), kind = "other", textChannel = textChannel}
+		end
+		store.server = nil
+		-- A message into a channel (`entry`: {id, text, from (Player or nil),
+		-- fromName, mine, system, time, pending})
+		function store.add(channel, entry)
+			if entry.id then
+				for _, existing in ipairs(channel.messages) do
+					if existing.id == entry.id then
+						existing.text, existing.pending = entry.text, entry.pending
+						changed(channel, existing)
+						return existing
+					end
+				end
+			end
+			table.insert(channel.messages, entry)
+			if #channel.messages > 200 then
+				table.remove(channel.messages, 1)
+			end
+			channel.lastActivity = os.clock()
+			if not entry.mine and not entry.system and store.viewing ~= channel then
+				channel.unread += 1
+			end
+			changed(channel, entry)
+			return entry
+		end
+		-- System notes go to whichever channel is open (or the server)
+		function store.note(text)
+			local channel = store.viewing or store.server
+			if channel then
+				store.add(channel, {text = text, system = true, time = DateTime.now()})
+			end
+		end
+
+		if legacy then
+			-- The old chat: events in ReplicatedStorage
+			local events = game:GetService("ReplicatedStorage"):FindFirstChild("DefaultChatSystemChatEvents")
+			store.server = channelFor("All", function()
+				return {name = "Server", kind = "server"}
+			end)
+			if events then
+				local filtered = events:FindFirstChild("OnMessageDoneFiltering")
+				if filtered then
+					connect(filtered.OnClientEvent, function(data)
+						if type(data) ~= "table" then
+							return
+						end
+						local channelName = tostring(data.OriginalChannel or "All")
+						local channel = store.server
+						if channelName ~= "All" then
+							channel = channelFor(channelName, function()
+								local whisper = channelName:match("^To ") ~= nil
+								return {name = if whisper then channelName:gsub("^To ", "") else channelName, kind = if whisper then "whisper" else "other"}
+							end)
+						end
+						local from = Players:FindFirstChild(tostring(data.FromSpeaker or ""))
+						store.add(channel, {
+							text = tostring(data.Message or ""), from = from, fromName = if from then from.DisplayName else tostring(data.FromSpeaker or ""),
+							mine = from == player, time = DateTime.now(),
+						})
+					end)
+				end
+				local system = events:FindFirstChild("OnNewSystemMessage")
+				if system then
+					connect(system.OnClientEvent, function(data)
+						if type(data) == "table" and data.Message then
+							store.note(tostring(data.Message))
+						end
+					end)
+				end
+			end
+			function store.send(channel, text)
+				local request = events and events:FindFirstChild("SayMessageRequest")
+				if not request then
+					return false, "This game's chat can't be reached."
+				end
+				request:FireServer(text, if channel.kind == "other" then channel.key else "All")
+				return true
+			end
+		else
+			local folder = TextChatService:WaitForChild("TextChannels", 10)
+			local function register(textChannel)
+				if not textChannel:IsA("TextChannel") or textChannel.Name == "RBXSystem" then
+					return
+				end
+				local channel = channelFor(textChannel, function()
+					return describe(textChannel)
+				end)
+				if textChannel.Name == "RBXGeneral" then
+					store.server = channel
+				end
+				-- A whisper's other person may arrive a moment later
+				if channel.kind == "whisper" then
+					connect(textChannel.ChildAdded, function()
+						local fresh = describe(textChannel)
+						channel.name, channel.partner, channel.partnerId = fresh.name, fresh.partner, fresh.partnerId
+						changed(channel, nil)
+					end)
+				end
+			end
+			store.register = register
+			if folder then
+				for _, textChannel in ipairs(folder:GetChildren()) do
+					register(textChannel)
+				end
+				connect(folder.ChildAdded, register)
+				connect(folder.ChildRemoved, function(textChannel)
+					local channel = store.channels[textChannel]
+					if channel then
+						store.channels[textChannel] = nil
+						local i = table.find(store.order, channel)
+						if i then
+							table.remove(store.order, i)
+						end
+						changed(channel, nil)
+					end
+				end)
+			end
+			connect(TextChatService.MessageReceived, function(message)
+				local textChannel = message.TextChannel
+				if not textChannel then
+					return
+				end
+				local source = message.TextSource
+				if textChannel.Name == "RBXSystem" or not source then
+					local text = stripTags(message.Text)
+					if text ~= "" then
+						store.note(text)
+					end
+					return
+				end
+				register(textChannel)
+				local channel = store.channels[textChannel]
+				if not channel or store.muted[source.UserId] then
+					return
+				end
+				local from = Players:GetPlayerByUserId(source.UserId)
+				local entry = store.add(channel, {
+					id = message.MessageId, text = message.Text, from = from,
+					fromName = if from then from.DisplayName else stripTags(message.PrefixText):gsub(":%s*$", ""),
+					mine = source.UserId == player.UserId, time = message.Timestamp or DateTime.now(),
+				})
+				-- A whisper while Chat isn't in front gets a banner
+				if channel.kind == "whisper" and not entry.mine and store.viewing ~= channel then
+					notify({app = "chat", title = (if from then from.DisplayName else "Whisper") .. " (whisper)", text = stripTags(message.Text), onClick = function()
+						openApp("chat")
+						if openChat then
+							openChat(channel)
+						end
+					end})
+				end
+			end)
+			-- Roblox's Global chat, when Roblox has it on for this game and
+			-- account. It isn't a TextChannel: it has its own messages and
+			-- sending, which is what Roblox's own Global tab uses.
+			local function addGlobal()
+				if not store.global then
+					store.global = channelFor("RBXGlobal", function()
+						return {name = "Global", kind = "global"}
+					end)
+				end
+			end
+			local hasGlobal = false
+			pcall(function()
+				hasGlobal = TextChatService:HasAllocatedUniverseChatContext("global")
+			end)
+			if hasGlobal then
+				addGlobal()
+			end
+			pcall(function()
+				connect(TextChatService.UniverseChatChannelAllocated, function(context)
+					if context == "global" then
+						addGlobal()
+					end
+				end)
+				connect(TextChatService.UniverseChatMessageReceived, function(message)
+					addGlobal()
+					local userId = message.TextSource and message.TextSource.UserId
+					if userId and store.muted[userId] then
+						return
+					end
+					-- (usually someone in another server, so the name comes from the message)
+					local from = userId and Players:GetPlayerByUserId(userId)
+					store.add(store.global, {
+						id = message.MessageId, text = message.Text, from = from,
+						fromName = if from then from.DisplayName else (stripTags(message.PrefixText):gsub(":%s*$", "")),
+						mine = userId == player.UserId, time = message.Timestamp or DateTime.now(),
+					})
+				end)
+			end)
+
+			function store.send(channel, text)
+				local ok, result
+				if channel.kind == "global" then
+					ok, result = pcall(TextChatService.SendUniverseChatMessageAsync, TextChatService, text, "")
+				else
+					local textChannel = channel.textChannel
+					if not textChannel then
+						return false, "That channel has gone."
+					end
+					ok, result = pcall(textChannel.SendAsync, textChannel, text)
+				end
+				if not ok then
+					return false, tostring(result)
+				end
+				-- Shown straight away; Roblox's copy replaces it when it arrives. If
+				-- it never does (some games turn chat off), it's marked undelivered.
+				if typeof(result) == "Instance" and result:IsA("TextChatMessage") and result.MessageId ~= "" then
+					local entry = store.add(channel, {id = result.MessageId, text = result.Text, from = player, fromName = player.DisplayName, mine = true, pending = true, time = DateTime.now()})
+					task.delay(8, function()
+						if entry.pending then
+							entry.pending, entry.failed = false, true
+							changed(channel, entry)
+							if not store.warnedUndelivered then
+								store.warnedUndelivered = true
+								store.note("Your message wasn't delivered. " .. (if store.typingOff() then "This game has turned off typing in chat." else "The game may be blocking chat right now."))
+							end
+						end
+					end)
+				end
+				return true
+			end
+		end
+
+		-- Someone in this server by username or display name ("@" optional):
+		-- an exact match first, then the start of a name. nil and a reason if not.
+		function store.findPlayer(text)
+			local wanted = tostring(text or ""):gsub("^@", ""):lower()
+			if wanted == "" then
+				return nil, "Who to? Try /w name message."
+			end
+			for _, candidate in ipairs(Players:GetPlayers()) do
+				if candidate.Name:lower() == wanted then
+					return candidate
+				end
+			end
+			for _, candidate in ipairs(Players:GetPlayers()) do
+				if candidate.DisplayName:lower() == wanted then
+					return candidate
+				end
+			end
+			local found = nil
+			for _, candidate in ipairs(Players:GetPlayers()) do
+				if candidate.Name:lower():sub(1, #wanted) == wanted or candidate.DisplayName:lower():sub(1, #wanted) == wanted then
+					if found and found ~= candidate then
+						return nil, "More than one person matches “" .. text .. "”. Type more of the name."
+					end
+					found = candidate
+				end
+			end
+			return found, if found then nil else "No one called “" .. text .. "” is in this server."
+		end
+		function store.whisperWith(target)
+			for _, channel in ipairs(store.order) do
+				if channel.kind == "whisper" and (channel.partner == target or channel.partnerId == target.UserId or channel.key == "To " .. target.Name) then
+					return channel
+				end
+			end
+			return nil
+		end
+		-- Opens (or finds) a whisper with `target`; yields. Returns the channel or nil and why.
+		function store.startWhisper(target)
+			if target == player then
+				return nil, "You can't whisper to yourself."
+			end
+			local existing = store.whisperWith(target)
+			if existing then
+				return existing
+			end
+			if legacy then
+				-- The old chat whispers by sending "/w name" through the server
+				return channelFor("To " .. target.Name, function()
+					return {name = target.DisplayName, kind = "whisper", partner = target, partnerId = target.UserId}
+				end)
+			end
+			-- Roblox's own chat opens a whisper by asking the server through this
+			-- RemoteFunction, which hands back the private channel. (Sending
+			-- "/w name" as a message would just post it for everyone to see.)
+			local remote = nil
+			pcall(function()
+				remote = game:GetService("RobloxReplicatedStorage").ExperienceChat.WhisperChat
+			end)
+			if not remote or not remote:IsA("RemoteFunction") then
+				return nil, "This game's chat doesn't have whispers."
+			end
+			local ok, textChannel = pcall(remote.InvokeServer, remote, tostring(target.UserId))
+			if not ok or typeof(textChannel) ~= "Instance" or not textChannel:IsA("TextChannel") then
+				return nil, "Roblox wouldn't open a whisper with " .. target.DisplayName .. ". Their chat settings may not allow it."
+			end
+			if store.register then
+				store.register(textChannel)
+			end
+			return store.channels[textChannel] or store.whisperWith(target)
+		end
+		return store
+	end
+	-- Start listening as soon as the desktop is up
+	task.spawn(function()
+		pcall(getChatStore)
+	end)
+
+	appBuilders.chat = function(args)
+		local store = getChatStore()
+		openWindow({
+			app = "chat", title = "Server", width = 760, height = 520, minWidth = 560, minHeight = 380,
+			sidebarWidth = 220, titleLeft = 220 + 32, background = C.window,
+			build = function(win)
+				local content, sidebar = win.content, win.sidebar
+				local viewing = nil
+				local rows = {}
+
+				-- ---- The list of channels ----
+				local list = macNew("ScrollingFrame", {
+					BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(6, 48), Size = UDim2.new(1, -12, 1, -54),
+					CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 4,
+					ScrollBarImageColor3 = C.line, ScrollBarImageTransparency = 0.6, ScrollingDirection = Enum.ScrollingDirection.Y, Parent = sidebar,
+				})
+				macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2), Parent = list})
+				-- New whisper: a list of the people here
+				local newButton = macButton(sidebar, {
+					AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, 12), Size = UDim2.fromOffset(28, 28),
+					BackgroundTransparency = 1, BackgroundColor3 = C.line,
+				})
+				macCorner(newButton, 8)
+				macImage(newButton, I.plus, 18, C.ink, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
+				newButton.MouseEnter:Connect(function()
+					newButton.BackgroundTransparency = 0.92
+				end)
+				newButton.MouseLeave:Connect(function()
+					newButton.BackgroundTransparency = 1
+				end)
+
+				local function preview(channel)
+					local last = channel.messages[#channel.messages]
+					if not last then
+						return if channel.kind == "server" then "Everyone in this server" elseif channel.kind == "global" then "Everyone playing this game" elseif channel.kind == "team" then "Your team" else "No messages yet"
+					end
+					local text = tostring(last.text):gsub("<[^>]->", ""):gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&")
+					return (if last.mine then "You: " elseif last.system or (channel.kind ~= "server" and channel.kind ~= "global") then "" else (last.fromName or "") .. ": ") .. text
+				end
+				local selectChannel
+				local function paintList()
+					for _, row in pairs(rows) do
+						row:Destroy()
+					end
+					table.clear(rows)
+					local sorted = table.clone(store.order)
+					local rank = {server = 0, global = 1, team = 2, other = 3, whisper = 4}
+					table.sort(sorted, function(a, b)
+						if rank[a.kind] ~= rank[b.kind] then
+							return rank[a.kind] < rank[b.kind]
+						end
+						return a.lastActivity > b.lastActivity
+					end)
+					for i, channel in ipairs(sorted) do
+						local on = channel == viewing
+						local row = macButton(list, {
+							Size = UDim2.new(1, -4, 0, 54), BackgroundTransparency = if on then 0 else 1, BackgroundColor3 = C.accent, LayoutOrder = i,
+						})
+						macCorner(row, 10)
+						local ink = if on then white else C.ink
+						if channel.kind == "whisper" and channel.partnerId then
+							local avatar = macNew("ImageLabel", {
+								BackgroundColor3 = Color3.fromRGB(190, 196, 206), Image = "rbxthumb://type=AvatarHeadShot&id=" .. channel.partnerId .. "&w=48&h=48",
+								Position = UDim2.fromOffset(8, 9), Size = UDim2.fromOffset(36, 36), Parent = row,
+							})
+							macCorner(avatar, UDim.new(1, 0))
+						else
+							local badge = macNew("Frame", {
+								BackgroundColor3 = if channel.kind == "team" then Color3.fromRGB(255, 159, 10) elseif channel.kind == "global" then Color3.fromRGB(10, 132, 255) else Color3.fromRGB(28, 188, 62),
+								BorderSizePixel = 0, Position = UDim2.fromOffset(8, 9), Size = UDim2.fromOffset(36, 36), Parent = row,
+							})
+							macCorner(badge, UDim.new(1, 0))
+							macLabel(badge, if channel.kind == "team" then "T" elseif channel.kind == "global" then "G" else "#", 17, Enum.FontWeight.Bold, white, {
+								Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center,
+							})
+						end
+						macLabel(row, channel.name, 14, Enum.FontWeight.SemiBold, ink, {
+							Position = UDim2.fromOffset(52, 8), Size = UDim2.new(1, -78, 0, 18), TextTruncate = Enum.TextTruncate.AtEnd,
+						})
+						macLabel(row, preview(channel), 12, Enum.FontWeight.Regular, ink, {
+							Position = UDim2.fromOffset(52, 27), Size = UDim2.new(1, -60, 0, 16), TextTruncate = Enum.TextTruncate.AtEnd,
+							TextTransparency = if on then 0.15 else 0.45,
+						})
+						if channel.unread > 0 and not on then
+							local dot = macNew("Frame", {
+								BackgroundColor3 = C.accent, BorderSizePixel = 0, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, 12),
+								Size = UDim2.fromOffset(9, 9), Parent = row,
+							})
+							macCorner(dot, UDim.new(1, 0))
+						end
+						row.MouseButton1Click:Connect(function()
+							selectChannel(channel)
+						end)
+						rows[channel] = row
+					end
+				end
+
+				-- ---- The messages ----
+				local scroller = macNew("ScrollingFrame", {
+					BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(0, 0), Size = UDim2.new(1, 0, 1, -62),
+					CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 5,
+					ScrollBarImageColor3 = C.line, ScrollBarImageTransparency = 0.6, ScrollingDirection = Enum.ScrollingDirection.Y, Parent = content,
+				})
+				local messageList = macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4), Parent = scroller})
+				macNew("UIPadding", {
+					PaddingLeft = UDim.new(0, 16), PaddingRight = UDim.new(0, 16), PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 10), Parent = scroller,
+				})
+				local emptyLabel = macLabel(content, "", 13, Enum.FontWeight.Regular, C.inkSoft, {
+					AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, -30), Size = UDim2.new(1, -60, 0, 40),
+					TextXAlignment = Enum.TextXAlignment.Center, TextWrapped = true,
+				})
+				local order = 0
+				local shown = {} -- message entry -> its label (so a pending one can be updated)
+				local function addMessage(channel, entry)
+					order += 1
+					local previous = channel.messages[table.find(channel.messages, entry) and table.find(channel.messages, entry) - 1 or 0]
+					if entry.system then
+						local label = macLabel(scroller, entry.text, 12, Enum.FontWeight.Medium, C.inkSoft, {
+							Size = UDim2.fromScale(1, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true, RichText = true,
+							TextXAlignment = Enum.TextXAlignment.Center, LayoutOrder = order,
+						})
+						shown[entry] = label
+						return
+					end
+					-- A name (and picture) above the first of a run of someone's messages
+					local first = not previous or previous.system or previous.mine ~= entry.mine or previous.fromName ~= entry.fromName
+					local row = macNew("Frame", {
+						BackgroundTransparency = 1, Size = UDim2.fromScale(1, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = order, Parent = scroller,
+					})
+					macNew("UIListLayout", {
+						SortOrder = Enum.SortOrder.LayoutOrder, HorizontalAlignment = if entry.mine then Enum.HorizontalAlignment.Right else Enum.HorizontalAlignment.Left,
+						Padding = UDim.new(0, 2), Parent = row,
+					})
+					if first and not entry.mine and channel.kind ~= "whisper" then
+						macLabel(row, entry.fromName or "", 11, Enum.FontWeight.Medium, C.inkSoft, {
+							Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 1,
+						}).Position = UDim2.fromOffset(12, 0)
+					end
+					local bubble = macNew("Frame", {
+						BackgroundColor3 = if entry.failed then Color3.fromRGB(255, 69, 58) elseif entry.mine then C.accent else C.surface,
+						BackgroundTransparency = if entry.pending then 0.35 else 0,
+						BorderSizePixel = 0, Size = UDim2.fromOffset(0, 0), AutomaticSize = Enum.AutomaticSize.XY, LayoutOrder = 2, Parent = row,
+					})
+					macCorner(bubble, 16)
+					if not entry.mine then
+						macStroke(bubble, C.line, 0.9, 1)
+					end
+					macNew("UIPadding", {
+						PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12), PaddingTop = UDim.new(0, 7), PaddingBottom = UDim.new(0, 7), Parent = bubble,
+					})
+					local label = macLabel(bubble, entry.text, 14, Enum.FontWeight.Regular, if entry.mine then white else C.ink, {
+						Size = UDim2.fromOffset(0, 0), AutomaticSize = Enum.AutomaticSize.XY, TextWrapped = true, RichText = true,
+					})
+					macNew("UISizeConstraint", {MaxSize = Vector2.new(360, math.huge), Parent = label})
+					-- Under a message Roblox never took: "Not delivered"
+					local note = macLabel(row, "Not delivered", 11, Enum.FontWeight.Medium, Color3.fromRGB(255, 69, 58), {
+						Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 3,
+						TextXAlignment = Enum.TextXAlignment.Right, Visible = entry.failed == true,
+					})
+					shown[entry] = {label = label, bubble = bubble, note = note}
+				end
+				local function nearBottom()
+					return scroller.CanvasPosition.Y >= scroller.AbsoluteCanvasSize.Y - scroller.AbsoluteWindowSize.Y - 60
+				end
+				local function toBottom()
+					task.defer(function()
+						scroller.CanvasPosition = Vector2.new(0, math.max(0, scroller.AbsoluteCanvasSize.Y - scroller.AbsoluteWindowSize.Y))
+					end)
+				end
+
+				-- ---- Typing ----
+				local inputBar = macNew("Frame", {
+					BackgroundColor3 = C.surface, BorderSizePixel = 0, AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 14, 1, -14),
+					Size = UDim2.new(1, -28, 0, 36), Parent = content,
+				})
+				macCorner(inputBar, UDim.new(1, 0))
+				macStroke(inputBar, C.line, 0.85, 1)
+				local input = macNew("TextBox", {
+					BackgroundTransparency = 1, ClearTextOnFocus = false, Text = "", PlaceholderText = "Message", PlaceholderColor3 = C.inkSoft,
+					TextColor3 = C.ink, FontFace = macFont(Enum.FontWeight.Regular), TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
+					Position = UDim2.fromOffset(16, 0), Size = UDim2.new(1, -60, 1, 0), ClipsDescendants = true, Parent = inputBar,
+				})
+				local sendButton = macButton(inputBar, {
+					AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -4, 0.5, 0), Size = UDim2.fromOffset(28, 28),
+					BackgroundTransparency = 0, BackgroundColor3 = C.accent,
+				})
+				macCorner(sendButton, UDim.new(1, 0))
+				macImage(sendButton, I.back, 16, white, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Rotation = 90})
+
+				function selectChannel(channel)
+					viewing = channel
+					store.viewing = channel
+					channel.unread = 0
+					win.setTitle(channel.name)
+					win.reopenArgs = nil
+					input.PlaceholderText = if store.typingOff() then "This game has turned off typing in chat"
+						elseif channel.kind == "whisper" then "Whisper to " .. channel.name
+						elseif channel.kind == "global" then "Message everyone playing this game"
+						elseif channel.kind == "team" then "Message your team"
+						else "Message everyone here  ·  /w name to whisper"
+					for _, child in ipairs(scroller:GetChildren()) do
+						if child:IsA("GuiObject") then
+							child:Destroy()
+						end
+					end
+					table.clear(shown)
+					order = 0
+					for _, entry in ipairs(channel.messages) do
+						addMessage(channel, entry)
+					end
+					emptyLabel.Text = if #channel.messages == 0 then (if channel.kind == "whisper" then "Only you and " .. channel.name .. " see these messages." elseif channel.kind == "global" then "Global is Roblox's chat with everyone playing this game, in every server. Messages show up here as they're sent." else "Messages in this server show up here as they're sent.") else ""
+					paintList()
+					toBottom()
+				end
+				openChat = selectChannel
+
+				local function send()
+					local text = input.Text:match("^%s*(.-)%s*$")
+					if text == "" or not viewing then
+						return
+					end
+					input.Text = ""
+					task.spawn(function()
+						local command, rest = text:match("^/(%S+)%s*(.*)$")
+						command = command and command:lower()
+						if command == "w" or command == "whisper" then
+							local name, message = rest:match("^(%S+)%s*(.*)$")
+							local target, problem = store.findPlayer(name or "")
+							if not target then
+								store.note(problem)
+								return
+							end
+							store.note("Starting a whisper with " .. target.DisplayName .. "…")
+							local channel, why = store.startWhisper(target)
+							if not channel then
+								store.note(why)
+								return
+							end
+							if openChat == selectChannel and not win.closed then
+								selectChannel(channel)
+							end
+							if message ~= "" then
+								local ok, err = store.send(channel, if store.legacy then "/w " .. target.Name .. " " .. message else message)
+								if not ok then
+									store.note("Couldn't send: " .. tostring(err))
+								end
+							end
+							return
+						end
+						-- Roblox's other built-in commands, done here (sent as messages they'd
+						-- just be posted). The old chat system handles them itself.
+						if command and not store.legacy then
+							if command == "e" or command == "emote" then
+								local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+								local ok, played = pcall(function()
+									return humanoid and humanoid:PlayEmote(rest)
+								end)
+								if not (ok and played) then
+									store.note("You can't use the emote “" .. rest .. "”.")
+								end
+								return
+							elseif command == "t" or command == "team" then
+								for _, channel in ipairs(store.order) do
+									if channel.kind == "team" then
+										selectChannel(channel)
+										return
+									end
+								end
+								store.note("This game has no team chat.")
+								return
+							elseif command == "mute" or command == "m" or command == "unmute" or command == "um" then
+								local target, problem = store.findPlayer(rest)
+								if not target then
+									store.note(problem)
+									return
+								end
+								local mute = command == "mute" or command == "m"
+								store.muted[target.UserId] = mute or nil
+								store.note((if mute then "Muted " else "Unmuted ") .. target.DisplayName .. ". " .. (if mute then "Their messages won't show here." else ""))
+								return
+							elseif command == "clear" or command == "cls" then
+								table.clear(viewing.messages)
+								selectChannel(viewing)
+								return
+							elseif command == "help" or command == "?" then
+								store.note("/w name message: whisper (a username or display name)  ·  /t: team chat  ·  /e name: emote  ·  /mute name, /unmute name  ·  /clear")
+								return
+							end
+						end
+						-- Anything else (a game's own commands too, like admin ones) goes to this channel as is
+						local ok, err = store.send(viewing, if store.legacy and viewing.kind == "whisper" and viewing.partner then "/w " .. viewing.partner.Name .. " " .. text else text)
+						if not ok then
+							store.note("Couldn't send: " .. tostring(err))
+						end
+					end)
+				end
+				input.FocusLost:Connect(function(enterPressed)
+					if enterPressed then
+						send()
+						task.defer(function()
+							if not win.closed then
+								input:CaptureFocus()
+							end
+						end)
+					end
+				end)
+				sendButton.MouseButton1Click:Connect(send)
+
+				-- The people here, to whisper to
+				local picker = nil
+				newButton.MouseButton1Click:Connect(function()
+					if picker then
+						picker:Destroy()
+						picker = nil
+						return
+					end
+					picker = macNew("Frame", {
+						BackgroundColor3 = C.menu, BorderSizePixel = 0, Position = UDim2.fromOffset(sidebar.Size.X.Offset - 40, 44),
+						Size = UDim2.fromOffset(240, 0), AutomaticSize = Enum.AutomaticSize.Y, ZIndex = 20, Parent = win.body,
+					})
+					macCorner(picker, 12)
+					macStroke(picker, C.line, 0.85, 1)
+					macNew("UIPadding", {PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), Parent = picker})
+					macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Parent = picker})
+					macLabel(picker, "Whisper to…", 12, Enum.FontWeight.SemiBold, C.inkSoft, {Size = UDim2.new(1, 0, 0, 24), LayoutOrder = 0, ZIndex = 21})
+					local others = {}
+					for _, other in ipairs(Players:GetPlayers()) do
+						if other ~= player then
+							table.insert(others, other)
+						end
+					end
+					table.sort(others, function(a, b)
+						return a.DisplayName:lower() < b.DisplayName:lower()
+					end)
+					if #others == 0 then
+						macLabel(picker, "No one else is here.", 13, Enum.FontWeight.Regular, C.ink, {Size = UDim2.new(1, 0, 0, 28), LayoutOrder = 1, ZIndex = 21})
+					end
+					for i, other in ipairs(others) do
+						local row = macButton(picker, {Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = C.accent, LayoutOrder = i, ZIndex = 21})
+						macCorner(row, 8)
+						local avatar = macNew("ImageLabel", {
+							BackgroundColor3 = Color3.fromRGB(190, 196, 206), Image = "rbxthumb://type=AvatarHeadShot&id=" .. other.UserId .. "&w=48&h=48",
+							Position = UDim2.fromOffset(6, 5), Size = UDim2.fromOffset(28, 28), ZIndex = 22, Parent = row,
+						})
+						macCorner(avatar, UDim.new(1, 0))
+						local name = macLabel(row, other.DisplayName, 13, Enum.FontWeight.Medium, C.ink, {
+							Position = UDim2.fromOffset(42, 3), Size = UDim2.new(1, -48, 0, 18), TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 22,
+						})
+						local handle = macLabel(row, "@" .. other.Name, 11, Enum.FontWeight.Regular, C.inkSoft, {
+							Position = UDim2.fromOffset(42, 20), Size = UDim2.new(1, -48, 0, 14), TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 22,
+						})
+						row.MouseEnter:Connect(function()
+							row.BackgroundTransparency = 0
+							name.TextColor3, handle.TextColor3 = white, white
+						end)
+						row.MouseLeave:Connect(function()
+							row.BackgroundTransparency = 1
+							name.TextColor3, handle.TextColor3 = C.ink, C.inkSoft
+						end)
+						row.MouseButton1Click:Connect(function()
+							if picker then
+								picker:Destroy()
+								picker = nil
+							end
+							input.Text = "/w " .. other.Name .. " "
+							input:CaptureFocus()
+							input.CursorPosition = #input.Text + 1
+						end)
+					end
+				end)
+
+				-- Keep up with new messages and channels
+				local function onChange(channel, entry)
+					if win.closed then
+						return
+					end
+					if channel == viewing and entry then
+						local existing = shown[entry]
+						if existing and type(existing) == "table" and existing.label then
+							existing.label.Text = entry.text
+							existing.bubble.BackgroundTransparency = if entry.pending then 0.35 else 0
+							if entry.failed then
+								existing.bubble.BackgroundColor3 = Color3.fromRGB(255, 69, 58)
+								existing.note.Visible = true
+							end
+						elseif not existing then
+							local stick = nearBottom()
+							emptyLabel.Text = ""
+							addMessage(channel, entry)
+							if stick or entry.mine then
+								toBottom()
+							end
+						end
+					end
+					if not viewing and store.server then
+						selectChannel(store.server)
+					else
+						paintList()
+					end
+				end
+				table.insert(store.listeners, onChange)
+				table.insert(win.cleanup, function()
+					local i = table.find(store.listeners, onChange)
+					if i then
+						table.remove(store.listeners, i)
+					end
+					if store.viewing == viewing then
+						store.viewing = nil
+					end
+					if openChat == selectChannel then
+						openChat = nil
+					end
+				end)
+
+				local first = store.server or store.order[1]
+				if first then
+					selectChannel(first)
+				else
+					emptyLabel.Text = "This game has no chat."
+				end
+			end,
+		})
+	end
+
 	-- About This Mac (also the About pane in System Settings)
 	local function buildAbout(parent)
 		local viewport = workspace.CurrentCamera.ViewportSize
@@ -8559,7 +10827,8 @@ local function createMacDesktop(session)
 		end
 		local appWords = {
 			finder = "files folders workspace", notes = "text write", music = "songs mp3 audio",
-			terminal = "console shell command luau", settings = "preferences system", youtube = "video videos shorts live stream watch",
+			terminal = "console shell command luau", settings = "preferences system", youtube = "video videos shorts live stream watch", timer = "clock stopwatch countdown alarm",
+			chat = "messages roblox whisper talk",
 		}
 		for _, app in ipairs(MAC_APPS) do
 			table.insert(spotlightItems, {title = app.name, kind = "Application", keywords = appWords[app.id], tile = app, action = function()
@@ -9313,8 +11582,8 @@ local function createMacDesktop(session)
 		local function refreshPanels()
 			local typing = box.Text:match("%S") ~= nil
 			local newMode = if ask.busy then "busy"
-				elseif #ask.transcript > 0 and (open.hasKey or not typing) then "answer"
-				else "search"
+				elseif #ask.transcript > 0 and not typing then "answer"
+				else "search" -- (typing searches, even in a conversation)
 			if newMode ~= mode then
 				local old = mode
 				mode = newMode
@@ -9430,13 +11699,8 @@ local function createMacDesktop(session)
 			end
 			table.clear(rows)
 			open.selected = 1
-			-- In a conversation, what you type is a follow-up: Enter asks it
-			if #ask.transcript > 0 and open.hasKey then
-				local text = box.Text:match("^%s*(.-)%s*$")
-				open.results = if text ~= "" then {{title = text, kind = "Ask a follow-up", ask = true}} else {}
-				refreshPanels()
-				return
-			end
+			-- (In a conversation the Ask row reads "Ask a follow-up", and clearing
+			-- the field brings the conversation back)
 			open.results = search(box.Text, open.hasKey)
 			for i, item in ipairs(open.results) do
 				local row = macButton(panel, {
@@ -9851,17 +12115,18 @@ local function createMacDesktop(session)
 			end
 			local TOOLS = [==[[
 {"name":"get_desktop_state","description":"What's on the screen now: the open windows (front first, with the ids window_action takes), the focused one, Light or Dark appearance, the background, Wi-Fi and ping, what Music is playing, the time and the screen size.","input_schema":{"type":"object","properties":{}}},
-{"name":"open_app","description":"Opens an app, or brings it to the front if it's already open. trash opens the Trash in Finder; about opens About This Mac.","input_schema":{"type":"object","properties":{"app":{"type":"string","enum":["finder","notes","terminal","music","youtube","settings","trash","about"]},"settings_pane":{"type":"string","enum":["Wi-Fi","Battery","General","Appearance","Wallpaper","Ask","About"],"description":"For settings: which pane to show."}},"required":["app"]}},
+{"name":"open_app","description":"Opens an app, or brings it to the front if it's already open. trash opens the Trash in Finder; about opens About This Mac.","input_schema":{"type":"object","properties":{"app":{"type":"string","enum":["finder","notes","chat","terminal","music","youtube","timer","settings","trash","about"]},"settings_pane":{"type":"string","enum":["Wi-Fi","Battery","General","Appearance","Wallpaper","Ask","About"],"description":"For settings: which pane to show."}},"required":["app"]}},
 {"name":"window_action","description":"Focuses, closes, minimizes, restores (un-minimizes) or zooms a window. Window ids come from get_desktop_state.","input_schema":{"type":"object","properties":{"window_id":{"type":"integer"},"action":{"type":"string","enum":["focus","close","minimize","restore","zoom"]}},"required":["window_id","action"]}},
 {"name":"list_folder","description":"Lists a folder in the workspace (what Finder shows). Paths are relative to the workspace with forward slashes; an empty path is the workspace itself.","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
 {"name":"search_files","description":"Finds files and folders in the workspace (a few levels deep) whose names contain the text.","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
 {"name":"read_file","description":"Reads a text file in the workspace (up to 30,000 characters).","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
 {"name":"write_file","description":"Writes a text file in the workspace, making it (and its folders) if needed. overwrite replaces what's in the file, so only overwrite an existing file when the user asked for that; append adds to the end.","input_schema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content","mode"]}},
 {"name":"open_file","description":"Opens a file or folder in the app that shows it: text in Notes, images in Preview, audio in Music, folders in Finder.","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
-{"name":"music","description":"Controls the Music app, opening it if needed: play (a song whose name contains song, or carry on), pause, next, previous, or status. Returns what's playing and every song.","input_schema":{"type":"object","properties":{"command":{"type":"string","enum":["play","pause","next","previous","status"]},"song":{"type":"string","description":"For play: part of the song's name."}},"required":["command"]}},
+{"name":"music","description":"Controls the Music app, opening it if needed: play (a song or a whole category whose name contains song, or carry on), pause, next, previous, or status. Returns what's playing, the categories and every song.","input_schema":{"type":"object","properties":{"command":{"type":"string","enum":["play","pause","next","previous","status"]},"song":{"type":"string","description":"For play: part of a song's name, or a category's (like lofi) to play all of it."}},"required":["command"]}},
 {"name":"change_setting","description":"Changes a setting. appearance: light or dark. background: wallpaper (the Tahoe wallpaper) or scene (the live 3D game world behind the desktop). wifi: on or off (off shows Ethernet). startup_screen: on or off (the Apple logo screen when macOS loads).","input_schema":{"type":"object","properties":{"setting":{"type":"string","enum":["appearance","background","wifi","startup_screen"]},"value":{"type":"string","enum":["light","dark","wallpaper","scene","on","off"]}},"required":["setting","value"]}},
 {"name":"system_action","description":"Locks the screen, or shows the user the confirmation for Sleep, Restart or Shut Down (they can cancel). If it goes ahead, that's the end of your turn.","input_schema":{"type":"object","properties":{"action":{"type":"string","enum":["lock_screen","sleep","restart","shut_down"]}},"required":["action"]}},
 {"name":"copy_to_clipboard","description":"Puts text on the user's clipboard.","input_schema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
+{"name":"start_timer","description":"Starts a countdown in the Timer app. When it's done the user hears a chime and sees a banner.","input_schema":{"type":"object","properties":{"seconds":{"type":"integer","description":"How long, in seconds (1 to 86399)."}},"required":["seconds"]}},
 {"name":"youtube","description":"Opens the YouTube app on a search or a YouTube link. With play true it plays the top result (or the link). kind picks videos, Shorts or live streams. Watching needs the YouTube helper running on the user's PC; if it isn't, the app shows how to start it.","input_schema":{"type":"object","properties":{"query":{"type":"string","description":"What to search for, or a YouTube link."},"kind":{"type":"string","enum":["video","shorts","live"]},"play":{"type":"boolean"}},"required":["query"]}}
 ]]==]
 			-- What the panel says while each tool runs
@@ -9870,7 +12135,7 @@ local function createMacDesktop(session)
 				list_folder = "Looking through files…", search_files = "Searching files…", read_file = "Reading a file…",
 				write_file = "Writing a file…", open_file = "Opening a file…", music = "Using Music…",
 				change_setting = "Changing a setting…", system_action = "Waiting for you…", copy_to_clipboard = "Copying…",
-				youtube = "Opening YouTube…",
+				youtube = "Opening YouTube…", start_timer = "Setting a timer…",
 			}
 
 			local function systemPrompt(useTools, useWeb)
@@ -9880,14 +12145,14 @@ local function createMacDesktop(session)
 						.. macGameName() .. "\". The user opened you from Spotlight's Ask. It's " .. now .. ". The user is "
 						.. player.DisplayName .. " (@" .. player.Name .. ").",
 					"",
-					if useTools then "You can see and use this macOS with your tools: open apps (Finder, Notes, Terminal, Music, YouTube, System Settings), play YouTube videos, Shorts and live streams, arrange windows, list, search, read, write and open files in the executor's workspace folder (what Finder shows), play music, change settings and copy text. When the user asks you to do something on the computer, do it with the tools, then say briefly what you did. For questions you can answer yourself, just answer."
+					if useTools then "You can see and use this macOS with your tools: open apps (Finder, Notes, Chat, Terminal, Music, YouTube, Timer, System Settings), play YouTube videos, Shorts and live streams, set timers, arrange windows, list, search, read, write and open files in the executor's workspace folder (what Finder shows), play music, change settings and copy text. When the user asks you to do something on the computer, do it with the tools, then say briefly what you did. For questions you can answer yourself, just answer."
 						else "The user has turned off your access to the desktop, so you can only answer.",
 					"",
 					if useWeb then "You can search the web for anything current or that you're unsure of; the card shows the sites you cite." else "You can't search the web.",
 					"",
 					"Your reply shows in a card under the Spotlight bar. Start with a direct answer in a short paragraph. When a list helps, follow it with a short \"# \" heading and a few \"- \" bullets that each start with a **bold** term. **Bold**, `code` and links work (links show underlined but can't be clicked); tables and images don't. Keep it brief: the card is small.",
 					"",
-					"Good to know: Notes saves to coolui_assets/Notes.txt. Songs are the audio files in coolui_music. Sleep, Restart and Shut Down always ask the user first. You can't see the 3D game itself, only this desktop.",
+					"Good to know: Notes saves to coolui_assets/Notes.txt. Songs are the audio files in coolui_music, sorted into categories: each folder in it is one (they can nest), with an info.json for its title, image and description. Sleep, Restart and Shut Down always ask the user first. You can't see the 3D game itself, only this desktop.",
 				}, "\n")
 			end
 
@@ -10098,8 +12363,11 @@ local function createMacDesktop(session)
 					if not status then
 						error(problem, 0)
 					end
-					local songs = if #status.songs > 0 then table.concat(status.songs, ", ") else "none (put mp3 files in coolui_music)"
+					local songs = if #status.songs > 0 then table.concat(status.songs, ", ") else "none (put mp3 files in coolui_music or its category folders)"
 					local now = if status.track then (if status.playing then "Playing \"" else "Paused on \"") .. status.track .. "\"" else "Not playing"
+					if status.categories and #status.categories > 0 then
+						songs = songs .. "\nCategories: " .. table.concat(status.categories, ", ")
+					end
 					local line = if command == "pause" then "Paused Music"
 						elseif command == "status" then "Checked Music"
 						elseif status.track then "Playing “" .. status.track .. "”"
@@ -10149,6 +12417,15 @@ local function createMacDesktop(session)
 				elseif name == "copy_to_clipboard" then
 					setclipboard(tostring(input.text or ""))
 					return "Copied.", "Copied to the clipboard"
+				elseif name == "start_timer" then
+					local seconds = math.floor(tonumber(input.seconds) or 0)
+					if seconds < 1 or seconds > 86399 then
+						error("Give between 1 and 86399 seconds", 0)
+					end
+					openApp("timer", {seconds = seconds})
+					local h, m, sec = seconds // 3600, seconds // 60 % 60, seconds % 60
+					local label = (if h > 0 then h .. "h " else "") .. (if m > 0 then m .. "m " else "") .. (if sec > 0 then sec .. "s" else "")
+					return "Started a " .. label:match("^%s*(.-)%s*$") .. " timer.", "Set a " .. label:match("^%s*(.-)%s*$") .. " timer"
 				elseif name == "youtube" then
 					local query = tostring(input.query or "")
 					if not query:match("%S") then
