@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lyricsync"
+version = "1.0.0"
+description = "Turn an .mp3 and a Roblox audio id into a timed Roblox lyrics JSON file"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["faster-whisper>=1.1.0"]
+
+[project.optional-dependencies]
+cuda = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12>=9,<10"]
+separate = ["demucs>=4.0.1"]
+
+[project.scripts]
+lyricsync = "lyricsync.cli:main"
+
+[tool.setuptools]
+packages = ["lyricsync"]

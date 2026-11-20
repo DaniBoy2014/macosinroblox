@@ -1,0 +1,12 @@
+# Core: local speech-to-text, free, no API key, no account.
+faster-whisper>=1.1.0
+
+# Windows/Linux CUDA runtime for CTranslate2. Harmless to install without a GPU;
+# lyricsync falls back to CPU automatically.
+nvidia-cublas-cu12; platform_system != "Darwin"
+nvidia-cudnn-cu12>=9,<10; platform_system != "Darwin"
+
+# Optional but strongly recommended for real music - isolates the vocal track
+# before transcription. Pulls in torch (~2.5 GB), so install it deliberately:
+#   python -m lyricsync setup --demucs
+# demucs>=4.0.1

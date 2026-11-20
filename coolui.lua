@@ -7219,11 +7219,14 @@ local function createMacDesktop(session)
 
 				local okList, entries = pcall(macListFolder, path)
 				entries = if okList then entries else {}
-				local pictures = {}
+				local pictures, files = {}, {}
 				for _, entry in ipairs(entries) do
 					table.insert(seen, entry.path)
-					if not entry.folder and MAC_IMAGE_EXTENSIONS[macExtension(entry.name)] then
-						pictures[entry.name:lower()] = entry.name
+					if not entry.folder then
+						files[entry.name:lower()] = entry.name
+						if MAC_IMAGE_EXTENSIONS[macExtension(entry.name)] then
+							pictures[entry.name:lower()] = entry.name
+						end
 					end
 				end
 				-- (a picture file that isn't there falls back to cover.png or cover.jpg)
@@ -7246,6 +7249,18 @@ local function createMacDesktop(session)
 						local bare = key:gsub("%.%w+$", "")
 						local detail = details[key] or details[bare] or {}
 						local songVolume = tonumber(detail.volume)
+						-- Its lyrics: info.json's "lyrics", or a file named like it (Lyric
+						-- Studio writes "<song>.lyrics.json")
+						local lyrics = nil
+						if type(detail.lyrics) == "string" and detail.lyrics:match("%S") then
+							local relative = detail.lyrics:match("^%s*(.-)%s*$"):gsub("\\", "/"):gsub("^%./", "")
+							lyrics = if fileExists(path .. "/" .. relative) then path .. "/" .. relative elseif fileExists(relative) then relative else nil
+						end
+						if not lyrics then
+							local found = files[bare .. ".lyrics.json"] or (if bare ~= "info" then files[bare .. ".json"] else nil)
+								or files[bare .. ".lrc"] or files[bare .. ".lyrics.txt"] or files[bare .. ".txt"]
+							lyrics = if found then path .. "/" .. found else nil
+						end
 						table.insert(node.songs, {
 							path = entry.path, file = entry.name, category = node,
 							title = textOf(detail.title) or (entry.name:gsub("%.%w+$", "")),
@@ -7253,6 +7268,7 @@ local function createMacDesktop(session)
 							image = detail.image or pictures[bare .. ".png"] or pictures[bare .. ".jpg"] or pictures[bare .. ".jpeg"],
 							volume = if songVolume then math.clamp(songVolume, 0, 2) else nil,
 							order = order[key] or order[bare] or math.huge,
+							lyrics = lyrics,
 						})
 					end
 				end
@@ -7322,6 +7338,85 @@ local function createMacDesktop(session)
 			return string.format("%d:%02d", seconds // 60, seconds % 60)
 		end
 
+		-- A song's lyrics file, read into {synced, lines = {{text, start, finish,
+		-- gap}}, credit}. Understands Lyric Studio's / lyricsync's JSON (the
+		-- Roblox lyrics document: "Lyrics" entries with Line, TimeStart and
+		-- TimeEnd, blank GAP lines and the CERTIFICATION credit), .lrc files
+		-- ([01:23.45] a line) and plain text (unsynced). Returns nil and why if
+		-- it can't be read.
+		local lyricsCache = {} -- path -> {raw, lyrics}
+		local function readLyrics(path)
+			local okRead, raw = pcall(readfile, path)
+			if not okRead or type(raw) ~= "string" then
+				return nil, "The lyrics file couldn't be read."
+			end
+			local cached = lyricsCache[path]
+			if cached and cached.raw == raw then
+				return cached.lyrics
+			end
+			local lines, credit, synced = {}, nil, true
+			local extension = macExtension(path)
+			if extension == "json" then
+				local ok, document = pcall(HttpService.JSONDecode, HttpService, raw)
+				if not ok or type(document) ~= "table" then
+					return nil, "The lyrics file isn't valid JSON."
+				end
+				local entries = if type(document.Lyrics) == "table" then document.Lyrics elseif type(document.lyrics) == "table" then document.lyrics else document
+				synced = document.Unsynced ~= true
+				for _, entry in ipairs(entries) do
+					if type(entry) == "string" then
+						table.insert(lines, {text = entry})
+					elseif type(entry) == "table" then
+						local text = entry.Line or entry.line or entry.text
+						if type(text) == "string" then
+							if entry.Id == "CERTIFICATION" then
+								credit = text:gsub("\n", "  ·  ")
+							else
+								table.insert(lines, {
+									text = text, start = tonumber(entry.TimeStart or entry.start or entry.time),
+									finish = tonumber(entry.TimeEnd or entry.finish),
+								})
+							end
+						end
+					end
+				end
+			elseif extension == "lrc" then
+				for line in raw:gmatch("[^\r\n]+") do
+					local text = line:gsub("%[[^%]]*%]", ""):match("^%s*(.-)%s*$")
+					for minutes, seconds in line:gmatch("%[(%d+):(%d+%.?%d*)%]") do
+						table.insert(lines, {text = text, start = tonumber(minutes) * 60 + tonumber(seconds)})
+					end
+				end
+				table.sort(lines, function(a, b)
+					return a.start < b.start
+				end)
+			else
+				-- Plain text: a line each (# comments and [Chorus] markers skipped)
+				synced = false
+				for line in (raw .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+					if not line:match("^%s*#") and not line:match("^%s*%[[^%]]*%]%s*$") then
+						local text = line:match("^%s*(.-)%s*$")
+						if text ~= "" or (#lines > 0 and lines[#lines].text ~= "") then
+							table.insert(lines, {text = text})
+						end
+					end
+				end
+				while #lines > 0 and lines[#lines].text == "" do
+					table.remove(lines)
+				end
+			end
+			for i, line in ipairs(lines) do
+				line.gap = not line.text:match("%S")
+				if not line.start then
+					synced = false
+				end
+				line.finish = line.finish or (lines[i + 1] and lines[i + 1].start) or math.huge
+			end
+			local lyrics = {synced = synced and #lines > 0, lines = lines, credit = credit}
+			lyricsCache[path] = {raw = raw, lyrics = lyrics}
+			return lyrics
+		end
+
 		appBuilders.music = function(args)
 			local sidebarWidth = 214
 			openWindow({
@@ -7342,7 +7437,7 @@ local function createMacDesktop(session)
 					local listed = {} -- the songs on the page showing (Play with nothing queued plays these)
 					local listedShuffle = false
 					local songRows = {}
-					local showPage, paintTree
+					local showPage, paintTree, refreshLyrics
 
 					local function findNode(path)
 						path = path:gsub("\\", "/"):gsub("/+$", ""):lower()
@@ -7424,8 +7519,19 @@ local function createMacDesktop(session)
 					local playButton, playIcon = barButton(I.play, 21, x0 + 52)
 					local nextButton = barButton(I.skipForward, 17, x0 + 88)
 					local lcdX = x0 + 118
+					-- Lyrics (the speech bubble at the right end)
+					local lyricsButton = macButton(body, {
+						AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -14, 0, 26), Size = UDim2.fromOffset(32, 32),
+						BackgroundColor3 = C.line, ZIndex = 3,
+					})
+					macCorner(lyricsButton, 8)
+					local lyricsIcon = macImage(lyricsButton, I.chat, 17, C.ink, {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5)})
+					local lyricsOpen = false
+					hover(lyricsButton, function()
+						return lyricsOpen
+					end)
 					local lcd = macNew("Frame", {
-						Position = UDim2.fromOffset(lcdX, 5), Size = UDim2.new(1, -(lcdX + 18), 0, 42), BackgroundColor3 = C.line,
+						Position = UDim2.fromOffset(lcdX, 5), Size = UDim2.new(1, -(lcdX + 58), 0, 42), BackgroundColor3 = C.line,
 						BackgroundTransparency = 0.955, BorderSizePixel = 0, ZIndex = 3, Parent = body,
 					})
 					macCorner(lcd, 9)
@@ -7506,6 +7612,9 @@ local function createMacDesktop(session)
 						sound:Play()
 						paintPlayer()
 						paintSongRows()
+						if refreshLyrics then
+							refreshLyrics()
+						end
 						return true
 					end
 
@@ -7782,6 +7891,203 @@ local function createMacDesktop(session)
 						PaddingLeft = UDim.new(0, 22), PaddingRight = UDim.new(0, 22), PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 22), Parent = scroller,
 					})
 
+					-- ---- Lyrics: over the page, following the song ----
+					-- The song's cover on the left, its lines on the right: the one
+					-- being sung lights up and scrolls into place, and clicking a line
+					-- jumps there. (The lyrics are a file next to the song.)
+					local black = Color3.new(0, 0, 0)
+					local lyricsPanel = macNew("Frame", {
+						Position = UDim2.fromOffset(8, 4), Size = UDim2.new(1, -16, 1, -12), BackgroundColor3 = white,
+						BorderSizePixel = 0, Visible = false, ClipsDescendants = true, Parent = content,
+					})
+					macCorner(lyricsPanel, 14)
+					local lyricsGradient = macNew("UIGradient", {Rotation = 90, Parent = lyricsPanel})
+					local lyricsInfo = macNew("Frame", {
+						BackgroundTransparency = 1, AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 30, 0.5, 0),
+						Size = UDim2.fromOffset(210, 300), Parent = lyricsPanel,
+					})
+					local lyricsList = macNew("ScrollingFrame", {
+						BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(268, 0), Size = UDim2.new(1, -290, 1, 0),
+						CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 0, ScrollBarImageTransparency = 1,
+						ScrollingDirection = Enum.ScrollingDirection.Y, Parent = lyricsPanel,
+					})
+					macNew("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 16), Parent = lyricsList})
+					macNew("UIPadding", {
+						PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12), PaddingTop = UDim.new(0, 120), PaddingBottom = UDim.new(0, 280), Parent = lyricsList,
+					})
+					local lyricsMessage = macLabel(lyricsPanel, "", 17, Enum.FontWeight.Medium, white, {
+						AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 130, 0.5, 0), Size = UDim2.new(1, -330, 0, 0),
+						AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Center,
+						RichText = true, Visible = false,
+					})
+					-- (lines ahead, lines already sung, and the line being sung)
+					local LINE_AHEAD, LINE_SUNG, LINE_NOW = 0.5, 0.62, 0
+					local shownLyrics = {lyrics = nil, rows = {}, active = 0, song = nil}
+
+					-- Narrow windows: just the lines
+					local function layoutLyrics()
+						local wide = lyricsPanel.AbsoluteSize.X / getScale() >= 600
+						lyricsInfo.Visible = wide
+						lyricsList.Position = UDim2.fromOffset(if wide then 268 else 10, 0)
+						lyricsList.Size = UDim2.new(1, if wide then -290 else -20, 1, 0)
+						lyricsMessage.Position = UDim2.new(0.5, if wide then 130 else 0, 0.5, 0)
+						lyricsMessage.Size = UDim2.new(1, if wide then -330 else -60, 0, 0)
+					end
+					lyricsPanel:GetPropertyChangedSignal("AbsoluteSize"):Connect(layoutLyrics)
+
+					local function paintLyricsInfo()
+						local node = if current and current.category and current.category.parent then current.category else nil
+						local color = if node then node.color else PINK
+						lyricsGradient.Color = ColorSequence.new(color:Lerp(black, 0.3), color:Lerp(black, 0.74))
+						lyricsInfo:ClearAllChildren()
+						makeCover(lyricsInfo, node, 200, 12, {Position = UDim2.fromOffset(0, 0)}, current)
+						macLabel(lyricsInfo, if current then current.title else "Not Playing", 18, Enum.FontWeight.Bold, white, {
+							Position = UDim2.fromOffset(0, 214), Size = UDim2.new(1, 0, 0, 24), TextTruncate = Enum.TextTruncate.AtEnd,
+						})
+						macLabel(lyricsInfo, if current then (current.artist or (if node then node.title else "")) else "", 14, Enum.FontWeight.Medium, white, {
+							Position = UDim2.fromOffset(0, 240), Size = UDim2.new(1, 0, 0, 20), TextTruncate = Enum.TextTruncate.AtEnd, TextTransparency = 0.35,
+						})
+					end
+
+					local function clearLyrics()
+						for _, child in ipairs(lyricsList:GetChildren()) do
+							if child:IsA("GuiObject") then
+								child:Destroy()
+							end
+						end
+						table.clear(shownLyrics.rows)
+						shownLyrics.lyrics = nil
+						shownLyrics.active = 0
+					end
+
+					local function buildLyrics(lyrics)
+						clearLyrics()
+						shownLyrics.lyrics = lyrics
+						if not lyrics.synced then
+							macLabel(lyricsList, "These lyrics aren't synced to the song", 12, Enum.FontWeight.Medium, white, {
+								Size = UDim2.new(1, 0, 0, 18), TextTransparency = 0.45, LayoutOrder = 0,
+							})
+						end
+						for i, line in ipairs(lyrics.lines) do
+							local row = macButton(lyricsList, {
+								Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = i,
+								Text = if line.gap then (if lyrics.synced then "•  •  •" else "") else line.text,
+								TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, FontFace = macFont(Enum.FontWeight.Bold),
+								TextSize = if line.gap then (if lyrics.synced then 20 else 6) else 24, TextColor3 = white,
+								TextTransparency = if lyrics.synced then LINE_AHEAD else 0.08,
+							})
+							row.MouseButton1Click:Connect(function()
+								if lyrics.synced and line.start and current then
+									sound.TimePosition = line.start
+									if not sound.IsPlaying then
+										sound:Resume()
+									end
+								end
+							end)
+							shownLyrics.rows[i] = row
+						end
+						if lyrics.credit then
+							macLabel(lyricsList, lyrics.credit, 12, Enum.FontWeight.Medium, white, {
+								Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
+								TextTransparency = 0.45, LayoutOrder = #lyrics.lines + 1,
+							})
+						end
+						lyricsList.CanvasPosition = Vector2.zero
+					end
+
+					-- Shows the playing song's lyrics (or why there are none)
+					function refreshLyrics()
+						if not lyricsOpen then
+							return
+						end
+						if shownLyrics.song ~= current then
+							shownLyrics.song = current
+							paintLyricsInfo()
+						end
+						local message, lyrics = nil, nil
+						if not current then
+							message = "Play a song to see its lyrics here."
+						elseif not current.lyrics then
+							local bare = (current.file or current.title):gsub("%.%w+$", "")
+							message = "<b>No lyrics for this song</b>\n\n<font size=\"14\">Put a “" .. bare .. ".lyrics.json” (Lyric Studio makes these), a .lrc or a .txt next to the song.</font>"
+						else
+							local problem
+							lyrics, problem = readLyrics(current.lyrics)
+							if not lyrics then
+								message = "<b>These lyrics can't be shown</b>\n\n<font size=\"14\">" .. problem .. "</font>"
+							elseif #lyrics.lines == 0 then
+								message = "<b>The lyrics file is empty</b>"
+							end
+						end
+						lyricsMessage.Visible = message ~= nil
+						lyricsList.Visible = message == nil
+						if message then
+							lyricsMessage.Text = message
+							clearLyrics()
+						elseif shownLyrics.lyrics ~= lyrics then
+							-- (readLyrics hands back the same table while the file is unchanged)
+							buildLyrics(lyrics)
+						end
+					end
+
+					local function setLyricsOpen(open)
+						lyricsOpen = open
+						lyricsPanel.Visible = open
+						scroller.Visible = not open
+						lyricsButton.BackgroundColor3 = if open then C.accent else C.line
+						lyricsButton.BackgroundTransparency = if open then 0.84 else 1
+						lyricsIcon.ImageColor3 = if open then C.accent else C.ink
+						if open then
+							shownLyrics.song = false -- (repaint the cover side)
+							layoutLyrics()
+							refreshLyrics()
+						end
+					end
+					lyricsButton.MouseButton1Click:Connect(function()
+						setLyricsOpen(not lyricsOpen)
+					end)
+
+					-- The line being sung: lit, and scrolled to a third of the way down
+					local follow = RunService.Heartbeat:Connect(function()
+						local lyrics = shownLyrics.lyrics
+						if not lyricsOpen or not lyrics or not lyrics.synced then
+							return
+						end
+						local position = sound.TimePosition + 0.15
+						local active = 0
+						for i, line in ipairs(lyrics.lines) do
+							if line.start <= position then
+								active = i
+							else
+								break
+							end
+						end
+						if active == shownLyrics.active then
+							return
+						end
+						shownLyrics.active = active
+						local fade = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+						for i, row in ipairs(shownLyrics.rows) do
+							local target = if i == active then LINE_NOW elseif i < active then LINE_SUNG else LINE_AHEAD
+							if row.TextTransparency ~= target then
+								TweenService:Create(row, fade, {TextTransparency = target}):Play()
+							end
+						end
+						local row = shownLyrics.rows[active]
+						local scale = getScale()
+						local goal = 0
+						if row then
+							goal = (row.AbsolutePosition.Y - lyricsList.AbsolutePosition.Y) / scale + lyricsList.CanvasPosition.Y
+								- lyricsList.AbsoluteSize.Y / scale * 0.3
+						end
+						TweenService:Create(lyricsList, TweenInfo.new(0.6, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+							CanvasPosition = Vector2.new(0, math.max(0, goal)),
+						}):Play()
+					end)
+					table.insert(win.cleanup, function()
+						follow:Disconnect()
+					end)
+
 					local function countText(node)
 						local songs, categories = #songsUnder(node), 0
 						eachCategory(node, function()
@@ -8006,6 +8312,9 @@ local function createMacDesktop(session)
 					end
 
 					function showPage(target, keepScroll)
+						if lyricsOpen and not keepScroll then
+							setLyricsOpen(false)
+						end
 						local node = nil
 						if target.kind == "category" then
 							node = findNode(target.path)
@@ -8129,6 +8438,7 @@ local function createMacDesktop(session)
 							task.wait(2.5)
 							if not win.closed and reload() then
 								showPage(page, true)
+								refreshLyrics()
 							end
 						end
 					end)

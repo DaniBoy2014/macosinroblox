@@ -57,8 +57,11 @@ screen with Liquid Glass, then a desktop:
   sidebar shows the tree, each category has a page with its cover, Play,
   Shuffle and its songs, and changes to the folders show up by themselves.
   Every start and Restart checks this repo's `music/` folder and downloads
-  new songs and categories, with a banner saying what arrived. Ask can play a
-  song or a whole category ("play some lofi")
+  new songs and categories, with a banner saying what arrived. The lyrics
+  button (top right) shows a song's lyrics, lit line by line as they're sung;
+  click a line to jump there. Lyric Studio (see below) makes the lyrics and
+  adds songs to your own Music. Ask can play a song or a whole category
+  ("play some lofi")
 - Timer: a countdown with a ring that empties as it runs (it chimes and shows
   a banner when it's done) and a stopwatch with laps. Ask can start timers
 - YouTube: search, Home, Shorts and Live tabs, and real playback of videos
@@ -86,6 +89,7 @@ assets/sounds/startup_chime.wav   the startup chime (startup screen)
 assets/sounds/volume_mount.wav    the log-in sound
 music/                            the music library everyone gets (see below)
   lofi/info.json, fun/info.json, dance/info.json
+lyricstudio/                      Lyric Studio: syncs lyrics and adds songs to your Music (runs on your PC)
 youtube_helper.py                 the YouTube helper (runs on your PC)
 ```
 
@@ -151,6 +155,7 @@ coolui_music/
     cover.png         found by itself if info.json doesn't name a picture
     rainy day.mp3
     rainy day.png     a picture named like a song is that song's cover
+    rainy day.lyrics.json   its lyrics (Lyric Studio makes these)
     chill/            a category inside a category
       info.json
       coffee.mp3
@@ -188,15 +193,68 @@ folder without one is still a category (named after the folder):
 - `genre`, `year`: shown under the title.
 - `shuffle`: Play shuffles this category.
 - `volume`: 0 to 1 (up to 2 for quiet files), for every song in the category.
-- `songs`: a song's title, artist, picture and volume, by file name. It can
-  also be a list, `[{"file": "rainy day.mp3", "title": "Rainy Day"}, …]`,
-  which then sets the order (otherwise it's by file name).
+- `songs`: a song's title, artist, picture, volume and `lyrics` file, by
+  file name. It can also be a list, `[{"file": "rainy day.mp3", "title":
+  "Rainy Day"}, …]`, which then sets the order (otherwise it's by file name).
 
 New Category (in the sidebar) makes a folder with a ready-to-fill `info.json`
 inside the category you're looking at and opens it in Notes. The info button
 on a category's page opens its `info.json`, and if the file isn't valid JSON
 the page says so. Play on a category plays everything in it, its
 subcategories included.
+
+### Lyrics
+
+A song's lyrics are a file next to it, named like it:
+
+- `rainy day.lyrics.json` (or `rainy day.json`): the Roblox lyrics JSON that
+  Lyric Studio and lyricsync write: `{"Lyrics": [{"Line": "…", "TimeStart":
+  1.07, "TimeEnd": 5.4}, …]}`. Blank lines are instrumental breaks, shown as
+  • • •, and the `CERTIFICATION` entry is shown as the credits at the end.
+- `rainy day.lrc`: `[01:23.45] a line`, the usual synced lyrics format.
+- `rainy day.txt`: plain lines, shown unsynced.
+
+`"lyrics": "file name"` in the song's `info.json` entry points somewhere
+else. The lyrics button at the top right of Music shows the playing song's
+lyrics over the page, with its cover. The line being sung lights up and
+scrolls into place, and clicking a line jumps the song there. Lyrics files in
+the repo's `music/` folder are downloaded at start-up like everything else.
+
+## Lyric Studio (adding songs with lyrics)
+
+`lyricstudio/` is a program for your PC that turns a song into synced lyrics
+and adds both to Music. It's lyricsync (Whisper speech-to-text that times
+every line) with a window around it. Its own README has the details; the
+short version:
+
+1. Install Python 3.9 or newer, then run `lyricstudio/setup.bat` once.
+2. Optional: a free Groq API key makes syncing take seconds instead of
+   minutes. Put it in `%USERPROFILE%\.lyricsync\groq_key.txt` (outside the
+   repo). A `.ROBLOSECURITY` cookie for downloading gated Roblox audio goes in
+   `%USERPROFILE%\.lyricsync\roblosecurity.txt`. Never put either in the repo
+   folder.
+3. Run `python lyricstudio/lyricstudio.py`. Put in a Roblox music id and press
+   Download (or Load Audio... for a file of your own), then Auto-Sync. Fix
+   any lines in the editor and check them with Preview.
+4. Press **Add to macOS**, pick a category (or type a new one, like
+   `lofi/chill`), and check the title and artist. It goes into `coolui_music`
+   in Real's workspace, and Music shows it within a few seconds.
+
+It copies the audio, saves the lyrics as `<title>.lyrics.json`, adds the
+Roblox thumbnail as the cover, and records the title and artist in the
+category's `info.json`. It only ever adds to your own PC: songs everyone gets
+come from this repo's `music/` folder, which only the repo's owner can
+change. From the command line it's one step:
+
+```bat
+cd lyricstudio
+python -m lyricsync song.mp3 --id 6910191685 --user YourName --macos lofi --title "Rainy Day" --artist "Someone"
+python -m lyricsync macos song.mp3 --category dance --lyrics songs/song/song.json
+python -m lyricsync macos
+```
+
+(The last one lists your categories. If your executor isn't Real, point it at
+its workspace once with `python -m lyricsync macos --workspace PATH`.)
 
 ## The YouTube helper
 

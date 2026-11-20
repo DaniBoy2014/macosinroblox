@@ -1,0 +1,20 @@
+# Secrets: never commit these (keep them in ~/.lyricsync instead)
+.groq_key.txt
+.roblosecurity.txt
+groq_key.txt
+roblosecurity.txt
+
+# Audio and everything made from it
+*.mp3
+*.ogg
+*.wav
+*.flac
+*.m4a
+downloads/
+songs/
+song.json
+song.lyrics.txt
+
+# Python
+__pycache__/
+*.egg-info/
